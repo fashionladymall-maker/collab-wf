@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 60 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 61 轮 · 组织消息（COMPOSE）
 
 ## 版本
 - 工具：collab-wf 1.6.6
@@ -23,8 +23,8 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [executor] 执行端待办 T60-1：v2.2 落地前独立审查的实际表现（审查结论或超时、是否写出 review_adapter.json、是否需要执行端在场），用 --note 写出
+- 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.6.zip`
+- `artifacts/collab-wf-1.6.6-d3fc14b.zip`
 - `artifacts/collab-wf-dev-v2.2.zip`
