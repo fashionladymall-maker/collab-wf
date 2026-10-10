@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 55 轮 · 执行与取证（EXECUTE）
+第 56 轮 · 等待用户决定（AWAITING_USER）
 
 ## 版本
 - 工具：collab-wf 1.6.5
@@ -8,9 +8,9 @@
 - 仓库指纹：9961c0dea749b84f（7 个文件）
 
 ## 最近一轮
-- 第 54 轮验收通过（2026-10-10T15:55:21+00:00）
-- 本方最新消息：`turns/turn-055.md`
-- Claude 最新回复：`replies/reply-055.md`
+- 第 55 轮验收通过（2026-10-10T16:06:17+00:00）
+- 本方最新消息：`turns/turn-056.md`
+- Claude 最新回复：`replies/reply-056.md`
 
 ## 目标
 - 进度 4 / 7
@@ -23,8 +23,9 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- 无
+- [executor] 需要你批准才能继续：以下内容需要用户批准后才会执行：
+- 版本包 workflow/policy.json：改动了白名单或目标定义，且扩大了自动执行的范围（生效前需要用户批准）：auto_new_conversation 新开启；landed_confirm_polls 有变化（不认识的键按扩大处理）；landed_poll_s 有变化（不认识的键按扩大处理）
 
 ## 最新产物
 - `artifacts/collab-wf-1.6.5.zip`
-- `artifacts/collab-wf-dev-v1.9.zip`
+- `artifacts/collab-wf-dev-v2.0.zip`
