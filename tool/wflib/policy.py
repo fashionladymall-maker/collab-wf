@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -106,6 +107,80 @@ def classify(cmd: str, pol: dict) -> dict:
     return {"cmd": cmd, "auto": not reasons, "reasons": reasons, "categories": cats, "manual": manual}
 
 
+# 1.6.1：不扩大权限的白名单与目标变更由驱动器自动批准（用户第 35 轮：把“需要执行端做的事”降到零）。
+# 判定：新内容给驱动器的能力不多于已批准的旧内容。四道底线在 floor.py，与这里无关；扩大权限的变更照旧停下等用户。
+NEUTRAL_KEYS = {"_说明", "first_poll_after_s", "poll_interval_s", "send_unknown_wait", "page_screenshots", "stale_reply_polls"}
+UPPER_LIMITS = ("max_rounds_per_day", "max_consecutive_failed_rounds", "max_rounds_without_goal_progress",
+                "command_timeout_s", "max_leaf_refusals")
+ZERO_IS_UNLIMITED = ("max_conversation_turns", "max_conversation_chars")
+GRANTS = {"auto_apply": True, "auto_self_update": False}   # 键 → 缺省值
+MUST_KEEP = ("stop", "diff_stop", "gates")
+MAY_SHRINK = ("allow", "pipe_filters")
+
+
+def widening(old: dict, new: dict) -> list:
+    """新白名单比旧的多给了哪些能力；空列表表示没有扩大（收紧或只改了时间类参数）。"""
+    old, new = old or {}, new or {}
+    why = []
+    for k in MAY_SHRINK:
+        dft = DEFAULT_PIPE_FILTERS if k == "pipe_filters" else []
+        extra = [x for x in new.get(k, dft) if x not in old.get(k, dft)]
+        if extra:
+            why.append(f"{k} 新增：" + "、".join(str(x) for x in extra[:3]))
+    for k in MUST_KEEP:
+        keep = {json.dumps(x, sort_keys=True, ensure_ascii=False) for x in new.get(k, [])}
+        gone = [x for x in old.get(k, []) if json.dumps(x, sort_keys=True, ensure_ascii=False) not in keep]
+        if gone:
+            why.append(f"{k} 去掉了 {len(gone)} 项")
+    for k in UPPER_LIMITS:
+        o, n = old.get(k), new.get(k)
+        if n != o and not (isinstance(o, (int, float)) and isinstance(n, (int, float)) and n <= o):
+            why.append(f"{k}：{o} → {n}")
+    for k in ZERO_IS_UNLIMITED:
+        inf = lambda v: float("inf") if not v else v   # noqa: E731  0 或缺省表示不限
+        if inf(new.get(k)) > inf(old.get(k)):
+            why.append(f"{k}：{old.get(k)} → {new.get(k)}")
+    for k, dft in GRANTS.items():
+        if new.get(k, dft) is True and old.get(k, dft) is not True:
+            why.append(f"{k} 新开启")
+    known = NEUTRAL_KEYS | set(UPPER_LIMITS) | set(ZERO_IS_UNLIMITED) | set(GRANTS) | set(MUST_KEEP) | set(MAY_SHRINK)
+    for k in sorted((set(old) | set(new)) - known):
+        if old.get(k) != new.get(k):
+            why.append(f"{k} 有变化（不认识的键按扩大处理）")
+    return why
+
+
+def goals_widening(new: dict, pol: dict) -> list:
+    """目标的检查命令由驱动器直接运行：只有每条都在已批准的白名单内可以自动执行，才不算扩大。"""
+    from .goals import validate
+    why = list(validate(new or {}))
+    for x in (new or {}).get("goals", []):
+        if x.get("kind") == "exec" and x.get("check") and not classify(x["check"], pol or {})["auto"]:
+            why.append(f"{x.get('id')} 的检查命令不在已批准的白名单内：{x['check'][:80]}")
+    return why
+
+
+def change_widens(inst: Instance, kind: str, new: dict, pol: dict) -> list:
+    """kind 为 policy 或 goals。当前内容未获批准时，任何改动都按扩大处理（没有可比的基准）。"""
+    if not status(inst, kind)["approved"]:
+        return [f"当前的 {kind}.json 未获批准，没有可比的基准"]
+    if new is None:
+        return [f"新的 {kind}.json 不是有效的 JSON"]
+    return widening(read_json(inst.wf / "policy.json"), new) if kind == "policy" else goals_widening(new, pol)
+
+
+def auto_approve(inst: Instance, kind: str, why: str) -> dict:
+    """1.6.1：驱动器自动批准不扩大权限的变更（change_widens 为空时才调用）。记录与用户批准分开标明。"""
+    p = inst.wf / f"{kind}.json"
+    a = approvals(inst)
+    rec = {"sha256": sha256(p), "ts": now_iso(), "note": f"驱动器自动批准（不扩大权限）：{why}", "by": "driver"}
+    a.setdefault("history", []).append({"kind": kind, **rec})
+    a[kind] = rec
+    write_json(approvals_path(inst), a)
+    inst.event("approve", kind=kind, sha=rec["sha256"][:12], note=rec["note"], by="driver")
+    return rec
+
+
 def release_findings(inst: Instance, src: Path, pol: dict) -> list:
     """检查版本包相对当前仓库新增的内容：命中停止规则，或改动了白名单与目标定义，都需要用户。"""
     out = []
@@ -116,7 +191,10 @@ def release_findings(inst: Instance, src: Path, pol: dict) -> list:
         rel = str(f.relative_to(src))
         if rel in ("workflow/policy.json", "workflow/goals.json"):
             if sha256(f) != sha256(inst.root / rel):
-                out.append({"file": rel, "why": "改动了白名单或目标定义（生效前需要用户批准）"})
+                wid = change_widens(inst, rel.split("/")[-1][:-5], read_json(f), pol)   # 1.6.1：不扩大权限的改动自动批准
+                if wid:
+                    out.append({"file": rel, "why": "改动了白名单或目标定义，且扩大了自动执行的范围（生效前需要用户批准）："
+                                + "；".join(wid[:4])})
             continue
         if f.suffix not in CODE_SUFFIXES and not f.name.startswith(".env"):
             continue

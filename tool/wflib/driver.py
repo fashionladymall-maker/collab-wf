@@ -385,8 +385,14 @@ def h_compose(ctx):
         b.update(date=today, rounds=0)
     limit = int(ctx.pol.get("max_rounds_per_day", 20))
     if b["rounds"] >= limit:
-        return _anomaly(ctx, {"source": "budget", "kind": "daily_limit"},
-                        f"今日自动发送已达 {limit} 轮（policy.max_rounds_per_day），为防止失控已停下")
+        # 1.6.1：上限不变，但不再停下等人：等到第二天（UTC 零点）自动继续（用户第 35 轮：把“需要执行端做的事”降到零）
+        tomorrow = (now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        decide(inst, "budget", "今日自动轮次已达上限，等到明天继续", f"policy.max_rounds_per_day = {limit}", "",
+               f"等待到 {tomorrow.isoformat(timespec='minutes')}")
+        machine.go(inst, "SEND", by="driver", reason="待发")
+        machine.go(inst, "QUOTA_WAIT", by="driver", reason=f"今日自动轮次已达上限（{limit}），明天继续",
+                   until=tomorrow.isoformat(), wait_reason="每日轮次上限")
+        return "wait", f"今日自动轮次已达上限（{limit}），等待到 {tomorrow.isoformat(timespec='minutes')}"
     machine.go(inst, "SEND", by="driver", reason="消息已通过发送前检查")
     return "progress", f"消息已就绪（{out['kind']}，档位 {out['effort']}）"
 
@@ -729,6 +735,58 @@ def _clear_turn(inst):
     inst.save()
 
 
+def _save_dirty(ctx) -> list:
+    """1.6.1（第 34 轮 AP-2）：落地前工作区有未提交的改动时，存成一个单独的提交并记入回报，不再阻塞等人。
+    改动里有疑似密钥时不存、什么都不做，由 apply_zip 照旧报 AP-2。返回存下的文件。"""
+    inst = ctx.inst
+    if not (inst.root / ".git").exists():
+        return []
+    rows = release._dirty(inst.root, inst.protect())
+    files = [r[3:].strip().strip('"').split(" -> ")[-1] for r in rows]
+    if not files:
+        return []
+    from . import sync
+    hits = []
+    for rel in files:
+        p = inst.root / rel
+        if p.is_file():
+            try:
+                hits += sync._scan_text(rel, p.read_text(encoding="utf-8"))
+            except UnicodeDecodeError:
+                continue
+    if hits:
+        decide(inst, "apply", "工作区改动含疑似密钥，不自动保存", "；".join(hits[:3]), "", "停下等人")
+        return []
+    from .core import git_identity
+    git(["add", "-A", "--"] + files, inst.root)
+    git(git_identity() + ["commit", "-q", "-m", f"wf: 落地前保存工作区里未经交付的改动（{len(files)} 个文件）"], inst.root)
+    head = git(["rev-parse", "--short", "HEAD"], inst.root).stdout.strip()
+    detail = "、".join(files[:8]) + (f" 等 {len(files)} 个" if len(files) > 8 else "")
+    inst.event("auto", rule="APPLY_DIRTY", action="save", detail=detail, commit=head, by="driver")
+    decide(inst, "apply", "落地前自动保存工作区改动", detail, head, "已提交，继续落地")
+    ops.add_note(inst, "deviation", f"[APPLY_DIRTY] 落地前工作区有未经交付的改动，已自动存成提交 {head}：{detail}。"
+                 "仓库指纹会包含这些文件", by="driver")
+    return files
+
+
+def _auto_approve_neutral(ctx, before: dict, version) -> None:
+    """1.6.1：版本包改动了白名单或目标、但没有扩大权限（评审时已判定）时，落地后由驱动器自动批准。"""
+    inst = ctx.inst
+    for kind in ("policy", "goals"):
+        b = before.get(kind) or {}
+        if not b.get("approved") or policy.sha256(inst.wf / f"{kind}.json") == b.get("sha"):
+            continue
+        # 评审时已对版本包里的同一份内容判定过；这里只确认确实没有扩大
+        new = read_json(inst.wf / f"{kind}.json")
+        if new is None:
+            continue
+        wid = policy.widening(ctx.pol, new) if kind == "policy" else policy.goals_widening(new, ctx.pol)
+        if wid:
+            continue
+        policy.auto_approve(inst, kind, f"随 {version} 落地；没有新增命令、没有放宽上限")
+        decide(inst, "approve", f"自动批准 {kind}.json（不扩大权限）", f"随 {version} 落地", f"workflow/{kind}.json", "已批准")
+
+
 def h_apply(ctx):
     inst, st = ctx.inst, ctx.st
     path = st.get("release_path")
@@ -739,7 +797,11 @@ def h_apply(ctx):
     prev = inst.version()
     base = _run_gates(ctx, gates, "baseline") if gates else {}
     try:
+        before = {k: {"approved": policy.status(inst, k)["approved"], "sha": policy.sha256(inst.wf / f"{k}.json")}
+                  for k in ("policy", "goals")}
+        _save_dirty(ctx)   # 1.6.1：工作区里未经交付的改动先存成一个提交（含疑似密钥时不存，照旧停下）
         r = release.apply_zip(inst, Path(path), by="driver")
+        _auto_approve_neutral(ctx, before, r.get("version"))
     except WfError as e:
         res = _anomaly(ctx, {"source": "apply", "text": str(e)}, str(e).splitlines()[0])
         return _to_report(ctx) if res[0] == "report" else res

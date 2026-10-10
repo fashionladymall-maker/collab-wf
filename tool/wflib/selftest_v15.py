@@ -773,6 +773,95 @@ def _t_v160_sync(_ok):
             sync.cfg, sync.SYNC_DIR, anomaly.call = orig
 
 
+def _t_v161_neutral(_ok):
+    from . import driver, policy
+    from .core import Instance
+    old = {"allow": ["^a ", "^b "], "max_rounds_per_day": 24, "max_conversation_turns": 20, "stop": [{"pattern": "x"}]}
+    w = policy.widening
+    _ok("1.6.1 白名单变更：收紧或只改时间类参数不算扩大；新增命令、放宽上限、去掉停止规则、新开自动安装、不认识的键都算",
+        w(old, {**old, "allow": ["^a "]}) == [] and w(old, {**old, "max_rounds_per_day": 10, "poll_interval_s": 30}) == []
+        and w(old, {**old, "max_conversation_turns": 10}) == []
+        and all(w(old, x) for x in ({**old, "allow": ["^a ", "^b ", "^rm "]}, {**old, "max_rounds_per_day": 30},
+                                    {**old, "max_conversation_turns": 0}, {**old, "stop": []},
+                                    {**old, "auto_self_update": True}, {**old, "foo": 1})),
+        str([w(old, {**old, "foo": 1}), w(old, {**old, "max_conversation_turns": 0})]))
+    pol = {"allow": [r"^wf (doctor|self-check)( |$)"]}
+    g = lambda chk: {"goals": [{"id": "G1", "title": "t", "kind": "exec", "check": chk, "pass": {"exit": 0},
+                                "means": "m", "on_fail": "f"}]}
+    _ok("1.6.1 目标变更：检查命令都在已批准的白名单内才不算扩大（目标的检查命令由驱动器直接运行）",
+        policy.goals_widening(g("wf doctor"), pol) == [] and policy.goals_widening(g("python3 x.py"), pol) != []
+        and policy.goals_widening({"goals": []}, pol) != [])
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "workflow").mkdir()
+        (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"v161-nt-{os.getpid()}"}), encoding="utf-8")
+        (root / "workflow" / "policy.json").write_text(json.dumps(old), encoding="utf-8")
+        inst = Instance(root)
+        inst.state.update(state="APPLY", turn=1)
+        inst.save()
+        policy.approve(inst, "policy", "测试")
+        src = root / "src"
+        (src / "workflow").mkdir(parents=True)
+        (src / "workflow" / "policy.json").write_text(json.dumps({**old, "allow": ["^a "]}), encoding="utf-8")
+        f1 = policy.release_findings(inst, src, old)
+        (src / "workflow" / "policy.json").write_text(json.dumps({**old, "allow": ["^a ", "^rm "]}), encoding="utf-8")
+        f2 = policy.release_findings(inst, src, old)
+        ctx = driver.Ctx(inst, old, time.time() + 60)
+        before = {"policy": {"approved": True, "sha": policy.sha256(root / "workflow" / "policy.json")}, "goals": {}}
+        (root / "workflow" / "policy.json").write_text(json.dumps({**old, "allow": ["^a "]}), encoding="utf-8")
+        driver._auto_approve_neutral(ctx, before, "v0.2")
+        s1 = policy.status(inst, "policy")
+        before = {"policy": {"approved": True, "sha": policy.sha256(root / "workflow" / "policy.json")}, "goals": {}}
+        (root / "workflow" / "policy.json").write_text(json.dumps({**old, "allow": ["^a ", "^rm "]}), encoding="utf-8")
+        driver._auto_approve_neutral(ctx, before, "v0.3")
+        s2 = policy.status(inst, "policy")
+        evs = [json.loads(l) for l in inst.events_path.read_text(encoding="utf-8").splitlines()]
+    _ok("1.6.1 不扩大权限的白名单变更：评审不再停下，落地后由驱动器自动批准并记明；扩大的照旧停下、不自动批准",
+        f1 == [] and len(f2) == 1 and "扩大" in f2[0]["why"] and s1["approved"] and not s2["approved"]
+        and any(e.get("type") == "approve" and e.get("by") == "driver" for e in evs), f"{f1} {f2} {s1} {s2}")
+
+
+def _t_v161_unattended(_ok):
+    import subprocess
+    from datetime import timedelta
+    from . import driver, policy
+    from .core import Instance, now
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "workflow").mkdir()
+        (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"v161-un-{os.getpid()}"}), encoding="utf-8")
+        (root / "a.txt").write_text("a\n", encoding="utf-8")
+        g = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "init", "-q"], cwd=root)
+        subprocess.run(["git", "add", "-A"], cwd=root)
+        subprocess.run(g + ["commit", "-qm", "release v0.1"], cwd=root)
+        inst = Instance(root)
+        inst.state.update(state="APPLY", turn=1)
+        inst.save()
+        ctx = driver.Ctx(inst, {}, time.time() + 60)
+        (root / "notes.md").write_text("执行端手写的说明\n", encoding="utf-8")
+        saved = driver._save_dirty(ctx)
+        clean = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True).stdout.strip()
+        msg = subprocess.run(["git", "log", "-1", "--format=%s"], cwd=root, capture_output=True, text=True).stdout
+        (root / "cfg.py").write_text("api_key = " + "abcdefghijklmnop1234\n", encoding="utf-8")   # 拆开写：本文件也会被同步扫描
+        saved2 = driver._save_dirty(ctx)
+        left = subprocess.run(["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True).stdout
+        _ok("1.6.1 落地前工作区有改动：存成单独的提交并记入回报，不再阻塞（第 34 轮 AP-2）；含疑似密钥时不存，照旧停下",
+            saved == ["notes.md"] and "未经交付" in msg and not any(l.endswith("notes.md") for l in clean.splitlines())
+            and saved2 == [] and "cfg.py" in left, f"{saved} {clean!r} {msg!r} {saved2} {left!r}")
+        out = root / "workflow" / "outbox" / "turn-001.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("【任务 · 第 1 轮 · v0.1】档位：high\n\n内容\n", encoding="utf-8")
+        inst.state.update(state="COMPOSE", outgoing={"turn": 1, "file": str(out), "kind": "task", "effort": "high"},
+                          budget={"date": now().strftime("%Y-%m-%d"), "rounds": 5})
+        inst.save()
+        r = driver.h_compose(driver.Ctx(inst, {"max_rounds_per_day": 5}, time.time() + 60))
+        tomorrow = (now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        st = inst.state
+        _ok("1.6.1 每日轮次上限：上限不变，但不再停下等人，等到第二天自动继续",
+            r[0] == "wait" and st["state"] == "QUOTA_WAIT" and str(st.get("until", "")).startswith(tomorrow), f"{r} {st.get('until')}")
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -785,7 +874,8 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.5.6 驱动器心跳", _t_v156_heartbeat), ("1.5.7 系统通知", _t_v157_notify),
          ("1.5.8 等回复与审查文档", _t_v158_linger), ("1.5.8 自动安装工具版本", _t_v158_auto_update),
          ("1.5.9 底线集中与行为检查", _t_v159_floor), ("1.5.9 执行端待办信号", _t_v159_inbox),
-         ("1.6.0 项目上下文同步", _t_v160_sync)]
+         ("1.6.0 项目上下文同步", _t_v160_sync),
+         ("1.6.1 不扩大权限的变更自动批准", _t_v161_neutral), ("1.6.1 无人值守的两处停顿", _t_v161_unattended)]
 
 
 def run_v15(_ok) -> None:
