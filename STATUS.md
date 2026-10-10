@@ -23,7 +23,6 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [executor] 执行端待办 T59-1：按 docs/AUDIT.md 第 4 节做一次性自查（4 项），用 --note 写出每一项的结果
 - [executor] 执行端待办 T59-3：按已确认结论 36 实现独立审查程序并在 transport.json 配好 review；直接用示例 diff 调用它，验证 pass、block 与超时三种输出，用 --note 写出结果（若执行端 2 确认是 Claude 系列则不做，写明原因）
 
 ## 最新产物
