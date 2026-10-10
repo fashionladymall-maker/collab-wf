@@ -1,6 +1,6 @@
 # collab-wf 项目状态（自动同步）
 
-> 由执行端自动同步到本仓库。生成时间：2026-10-10 20:31:32 +0800
+> 本文件由执行端自动同步到本仓库；新鲜度看本仓库的 commit 记录。
 > 目的是让 Claude 能随时按链接读到项目的最新版本与进度。
 
 ## 版本
@@ -9,10 +9,10 @@
 - 仓库指纹：`仓库指纹 78832752ea25b87b（4 个文件）`
 
 ## 当前进度
-- 第 **27** 轮 · **WAIT_REPLY**
-- 最近验收：turn-026：c1 pass、c2 pass
-- 我方最新发出：`turns/turn-027.md`
-- Claude 最新回复：`replies/reply-026.md`
+- 第 **28** 轮 · **SEND**
+- 最近验收：turn-027：c1 pass、c2 pass、c3 pass、c4 pass、c5 pass
+- 我方最新发出：`turns/turn-028.md`
+- Claude 最新回复：`replies/reply-027.md`
 
 ## 目录
 - `turns/` —— 我方每轮发给 Claude 的消息
