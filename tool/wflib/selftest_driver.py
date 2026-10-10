@@ -259,6 +259,55 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     rc, o = _wf(env, c, "run")
     _ok("开新对话并批准后继续发送", _state(c)["state"] == "WAIT_REPLY" and (_state(c).get("conv") or {}).get("turns") == 1, o)
 
+    # B2. 1.6.4：policy 开启 auto_new_conversation 时，对话到上限由驱动器自己开新对话（适配器 conv_new），不再停下等人
+    cnw = tmp / "t-conv_new"
+    cnw.write_text(f"#!/bin/sh\nexec {__import__('shlex').quote(sys.executable)} {__import__('shlex').quote(str(tmp / 'ft.py'))} conv_new \"$@\"\n")
+    cnw.chmod(0o755)
+    (local / "transport.json").write_text(json.dumps({**tcfg, "conv_new": str(cnw)}))
+
+    def _manual(root, turn):
+        bad = []
+        for line in (root / "workflow" / "events.jsonl").read_text(encoding="utf-8").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("turn") == turn and e.get("by") not in ("driver", "wf") \
+                    and not (e.get("type") == "note" and e.get("kind") == "info"):
+                bad.append(f"{e.get('type')} by={e.get('by')}")
+        return bad
+
+    a2 = setup("ctxauto", {**base_pol, "max_conversation_turns": 1, "auto_new_conversation": True})
+    _wf(env, a2, "kick", "--message", str(task))
+    _wf(env, a2, "run")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"], "发布：无\n之后：回报\n验收 1：c1 exit=0"), encoding="utf-8")
+    rc, o = _wf(env, a2, "run")
+    s2 = _state(a2)
+    t2 = s2.get("turn") or 0
+    sent2 = sorted((fake / "inbox").glob("*-ctxauto-*.md"))
+    last2 = sent2[-1].read_text(encoding="utf-8") if sent2 else ""
+    _ok("1.6.4 对话到上限且开启 auto_new_conversation：驱动器调用 conv_new、计数归零、发出续接消息（附本轮回报），这一轮没有人工事件",
+        s2["state"] == "WAIT_REPLY" and (s2.get("conv") or {}).get("by") == "driver" and (s2.get("conv") or {}).get("turns") == 1
+        and len(sent2) == 2 and "项目续接" in last2 and "【回报 · 第" in last2 and not _manual(a2, t2)
+        and (a2 / "workflow" / "outbox" / f"turn-{t2:03d}-report.md").exists(), o + str(_manual(a2, t2)))
+
+    # B3. 1.6.4：conv_new 失败时退回原来的做法：停下等人、写明原因，计数与本轮回报都不变
+    (fake / "conv_new_fail").write_text("1")
+    a3 = setup("ctxfail", {**base_pol, "max_conversation_turns": 1, "auto_new_conversation": True})
+    _wf(env, a3, "kick", "--message", str(task))
+    _wf(env, a3, "run")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"], "发布：无\n之后：回报\n验收 1：c1 exit=0"), encoding="utf-8")
+    rc, o = _wf(env, a3, "run")
+    s3 = _state(a3)
+    rep3 = a3 / "workflow" / "outbox" / f"turn-{(s3.get('turn') or 0):03d}.md"
+    _ok("1.6.4 conv_new 失败：退回停下等人（CONTEXT_FULL）并写明原因，计数与本轮回报不变",
+        rc == 20 and s3["state"] == "AWAITING_USER" and "CONTEXT_FULL" in o and "自动开新对话未成功" in o
+        and (s3.get("conv") or {}).get("turns") == 1 and not s3.get("conv_switch")
+        and rep3.exists() and rep3.read_text(encoding="utf-8").startswith("【回报"), o)
+    (local / "transport.json").write_text(json.dumps(tcfg))
+
     # C. 独立审查适配器认为应阻止 → 停下等用户
     rv = tmp / "t-review"
     rv.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：发现问题"]}\'\n')
@@ -293,7 +342,14 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
                     + json.dumps({"ts": "2099-01-01T00:10:00+00:00", "action": "done"}) + "\n")
     (local / "transport.json").write_text(json.dumps({**tcfg, "log": str(blog)}))
     rc, o = _wf(env, tmp, "transport", "test")
-    _ok("适配器一致性检查：poll 对不存在的轮次返回 none、幂等、quota 格式、动作日志合规", rc == 0 and "✗" not in o, o)
+    _ok("适配器一致性检查：poll 对不存在的轮次返回 none 或 no_ref、幂等、quota 格式、动作日志合规", rc == 0 and "✗" not in o, o)
+    (local / "transport.json").write_text(json.dumps(tcfg))
+
+    # E1. 1.6.4：空 ref 的 poll 返回 no_ref 也算合规（TRANSPORT.md 1.5.1 的约定；此前一致性检查误判为 ✗）
+    (local / "transport.json").write_text(json.dumps({**tcfg, "log": str(blog),
+                                                      "env": {**(tcfg.get("env") or {}), "FAKE_NO_REF": "1"}}))
+    rc, o = _wf(env, tmp, "transport", "test")
+    _ok("1.6.4 适配器一致性检查：空 ref 的 poll 返回 no_ref 视为合规", rc == 0 and "✓ poll 对不存在的轮次返回 none 或 no_ref" in o, o)
     (local / "transport.json").write_text(json.dumps(tcfg))
 
     # E2. 会改变工作流状态的 wf 命令：驱动器不执行，用户批准后也只跳过（F21）
@@ -497,7 +553,7 @@ def run_v14(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     (local / "transport.json").write_text(json.dumps({"module": "adapters.example_echo", "timeout_s": 30,
                                                       "env": {"ECHO_DIR": str(echo)}}))
     rc, o = _wf(env, tmp, "transport", "test")
-    _ok("模块方式适配器：一致性检查通过（无需三个可执行壳）", "✓ 适配器模块可找到" in o and "✓ poll 对不存在的轮次返回 none" in o, o)
+    _ok("模块方式适配器：一致性检查通过（无需三个可执行壳）", "✓ 适配器模块可找到" in o and "✓ poll 对不存在的轮次返回 none 或 no_ref" in o, o)
     q = tmp / "modrun"
     _wf(env, tmp, "init", "--name", "modrun", "--root", str(q))
     (q / "workflow" / "policy.json").write_text(json.dumps({"allow": [r"^echo "], "first_poll_after_s": 0, "poll_interval_s": 0}))

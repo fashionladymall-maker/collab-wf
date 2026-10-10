@@ -126,3 +126,14 @@ poll 返回 status=done 时，适配器应在 JSON 中同时给出 reply_parent�
 - 动作日志：每条回复结束都要写一条终态（done），只下载文件不写 done，会让 bridge-check 的 R1/R3 把下一次发送误判为重叠或无结果（第 46 轮核对日志第 30–160 行时发现）。
 - poll 收到空的 --ref 且没有 --since 时，返回 {"status": "no_ref"} 并写日志，不要返回 none：none 表示“查了，没有”，空 ref 是“没法查”（第 44 轮的假阴性）。
 - 结果不明之后，wf 不会自动重发。确认没有送达、需要重发时，由用户运行 wf resend（决定码加原话）。
+
+## 附：1.6.4 新增的 conv_new 动作（可选）
+
+policy.json 的 auto_new_conversation 为 true 时，wf 在对话达到上限时调用 `conv_new --note <说明>`（模块方式为 `python -m <模块> conv_new …`；可执行程序方式在 transport.json 写 `"conv_new": "<程序路径>"`）。
+
+- 成功：新建对话、写全 settings 并回读核对、把适配器的默认对话切到新对话，最后一行输出 `{"ok": true, "conv": "<新对话 id>", "settings_ok": true}`，退出码 0。
+- 任何一步不成立：输出 `{"ok": false, "error": "…"}`，退出码非 0，默认对话保持不变。
+- 动作日志记 conv_new。新对话的首条消息怎么发（例如不带 effort）由适配器处理。
+- 切换成功后，wf 不再把上一轮（旧对话）的 ref 作为 --prev-ref 交给适配器。
+
+一致性检查（wf transport test）：对空 ref 的 poll，返回 none 或 no_ref 都算合规（1.6.4 起；此前只认 none，与上面 1.5.1 的约定矛盾）。

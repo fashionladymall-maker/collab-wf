@@ -170,7 +170,7 @@ def _last_turn_summary(inst: Instance) -> str:
     return "\n".join(lines)
 
 
-def bootstrap(inst: Instance, reason: str) -> dict:
+def bootstrap(inst: Instance, reason: str, by: str = "executor") -> dict:
     """生成开新对话所需的全部材料：说明消息 + 仓库 zip（git archive，只含已提交文件，不含数据与密钥）。"""
     if not (inst.root / ".git").exists():
         raise WfError("项目还没有 git 版本库，无法打包。")
@@ -202,7 +202,7 @@ def bootstrap(inst: Instance, reason: str) -> dict:
     mpath.write_text(text, encoding="utf-8")
     short = _bootstrap_short(inst, reason, ver, head, s, fp, last, stamp)   # 1.6.3：短消息 + 公开仓库链接
     inst.event("bootstrap", file=mpath.name, zip=zpath.name, tool_zip=tool_zip.name, reason=reason,
-               short=short.name if short else None, by="executor")
+               short=short.name if short else None, by=by)   # 1.6.4：驱动器生成时记 by=driver
     return {"message": mpath, "zip": zpath, "tool_zip": tool_zip, "chars": len(text), "short": short}
 
 

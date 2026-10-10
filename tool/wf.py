@@ -176,7 +176,8 @@ def _transport_test() -> int:
     with _tf.TemporaryDirectory() as td:
         t0 = _time.time()
         r = anomaly.call("poll", ["--project", "__wf_probe__", "--turn", "999999", "--ref", "", "--out", td], timeout=60)
-        ok("poll 对不存在的轮次返回 none（不能报告完成或生成中）", r["code"] == 0 and r["data"].get("status") == "none",
+        # 1.6.4：空 ref 返回 no_ref 是 TRANSPORT.md 1.5.1 的约定（“没法查”不是“查了没有”），此前这里误判为不合规
+        ok("poll 对不存在的轮次返回 none 或 no_ref（不能报告完成或生成中）", r["code"] == 0 and r["data"].get("status") in ("none", "no_ref"),
            f"退出码 {r['code']}，输出 {r['raw'][:160]}")
         ok("poll 在 60 秒内返回", _time.time() - t0 < 60)
         r2 = anomaly.call("poll", ["--project", "__wf_probe__", "--turn", "999999", "--ref", "", "--out", td], timeout=60)

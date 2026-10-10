@@ -113,7 +113,7 @@ NEUTRAL_KEYS = {"_说明", "first_poll_after_s", "poll_interval_s", "send_unknow
 UPPER_LIMITS = ("max_rounds_per_day", "max_consecutive_failed_rounds", "max_rounds_without_goal_progress",
                 "command_timeout_s", "max_leaf_refusals")
 ZERO_IS_UNLIMITED = ("max_conversation_turns", "max_conversation_chars")
-GRANTS = {"auto_apply": True, "auto_self_update": False}   # 键 → 缺省值
+GRANTS = {"auto_apply": True, "auto_self_update": False, "auto_new_conversation": False}   # 键 → 缺省值（1.6.4：自动开新对话也是授权）
 MUST_KEEP = ("stop", "diff_stop", "gates")
 MAY_SHRINK = ("allow", "pipe_filters")
 

@@ -5,6 +5,7 @@
   replies/<k>.files     （可选）该回复交付的文件路径，每行一个
   next_send_code        （可选）下一次发送返回的退出码（用后删除），例如 3 表示额度用尽
   status.json           记录每轮的发送与轮询次数
+  conv_new_fail         （可选）下一次 conv_new 失败（用后删除）；环境变量 FAKE_NO_REF 设置时，空 ref 的 poll 返回 no_ref（1.6.4）
 """
 import json
 import os
@@ -48,6 +49,9 @@ def main():
         print(json.dumps({"ref": f"r-{turn}"}))
         return
     if op == "poll":
+        if os.environ.get("FAKE_NO_REF") and arg("--ref") == "":
+            print(json.dumps({"status": "no_ref"}))
+            return
         turn = f'{arg("--project")}:{arg("--turn")}'
         t = s["turns"].get(turn)
         if not t:
@@ -73,6 +77,16 @@ def main():
                     files.append(str(dst))
         print(json.dumps({"status": "done", "reply_file": str(reply), "files": files,
                           "tools": [{"name": "bash_tool", "summary": "测试"}]}))
+        return
+    if op == "conv_new":
+        ctl = D / "conv_new_fail"
+        if ctl.exists():
+            ctl.unlink()
+            print(json.dumps({"ok": False, "error": "测试：建对话失败"}))
+            sys.exit(4)
+        s["convs"] = s.get("convs", 0) + 1
+        save(s)
+        print(json.dumps({"ok": True, "conv": f"conv-{s['convs']}", "settings_ok": True}))
         return
     if op == "quota":
         Path(arg("--out")).write_text(json.dumps({"ts": "2026-01-01T00:00:00+00:00", "limits": [

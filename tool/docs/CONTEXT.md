@@ -42,3 +42,5 @@ Claude 无法测量自己的上下文占用，所以只用上面这些可观测�
 2. wf conv new --note "原因"（先做这一步：它把新对话的起点记为下一轮）。
 3. 发送说明消息，档位用 max。
 4. 收到回复后照常推进；驱动器之前因 conversation_full 停下的，用 wf approve 放行。
+
+1.6.4 起，policy.json 的 auto_new_conversation 为 true 时，以上四步由驱动器完成（DRIVER.md 第 22 节），通道适配器需要实现 conv_new；没有开启或没有成功时，照旧按这四步做。

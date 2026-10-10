@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 52 轮 · 阻塞（BLOCKED）
+第 54 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
-- 工具：collab-wf 1.6.3
-- 项目：v1.8；871dbd3 (HEAD -> main, tag: v1.8) release v1.8
-- 仓库指纹：dcc69d749bae6fa6（7 个文件）
+- 工具：collab-wf 1.6.4
+- 项目：v1.9；709d302 (HEAD -> main, tag: v1.9) release v1.9
+- 仓库指纹：9961c0dea749b84f（7 个文件）
 
 ## 最近一轮
-- 第 51 轮验收通过（2026-10-10T15:15:20+00:00）
-- 本方最新消息：`turns/turn-052.md`
-- Claude 最新回复：`replies/reply-051.md`
+- 第 53 轮验收通过（2026-10-10T15:41:02+00:00）
+- 本方最新消息：`turns/turn-054.md`
+- Claude 最新回复：`replies/reply-053.md`
 
 ## 目标
 - 进度 4 / 7
@@ -23,8 +23,8 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [executor] 流程阻塞，需要人处理：[SEND_NOT_LANDED] 适配器报告已接受，但 wf 独立核对发现消息始终没有出现在会话中。为避免重复发送，停下由人确认通道状态。 适配器曾报告已接受，但连续 5 次轮询都看不到这条消息出现在会话中（缺口 11/§3）
+- 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.3-0bc9afa.zip`
-- `artifacts/collab-wf-dev-v1.8.zip`
+- `artifacts/collab-wf-1.6.4.zip`
+- `artifacts/collab-wf-dev-v1.9.zip`

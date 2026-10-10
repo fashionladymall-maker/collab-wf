@@ -333,6 +333,68 @@ def _compose_text(ctx):
     return None, None, None
 
 
+def _newconv_message(b: dict, original: str, sync_status: str) -> tuple:
+    """1.6.4：选开新对话的第一条消息，并把本轮原本要发出的消息原样附在后面。返回 (正文, 档位, "短消息" 或 "长消息")。
+    短消息只给公开仓库的链接，所以只在这次同步已推送、或内容没变时用；否则用长消息（自带 WORKFLOW、PROJECT 全文与文件清单）。"""
+    use_short = bool(b.get("short")) and sync_status in ("pushed", "unchanged")
+    text = Path(b["short"] if use_short else b["message"]).read_text(encoding="utf-8")
+    m = re.search(r"档位：(low|medium|high|xhigh|max)", text[:400])
+    if original.strip():
+        text = text.rstrip("\n") + "\n\n===== 附：本轮原本要发出的消息（原样）=====\n\n" + original
+    return text, (m.group(1) if m else "max"), ("短消息" if use_short else "长消息")
+
+
+def _new_conversation(ctx, out, why, b) -> tuple:
+    """1.6.4：对话达到上限时由驱动器开新对话。返回 (新的待发消息, "") 或 (None, 没成功的原因)。
+    顺序：续接消息先通过发送前检查 → 记下意图 → 适配器 conv_new（新建对话、写全 settings 并回读核对、把默认对话切过去）
+    → 计数归零、事件记 by=driver → 续接消息作为本轮消息照常发送。任何一步不成立都不切换，由调用方退回原来的做法：停下等人。
+    适配器调用超时属于结果不明（可能已经建好），保留意图、不再自动重试，避免重复建对话。"""
+    inst, st = ctx.inst, ctx.st
+    turn = st["turn"]
+    pend = st.get("conv_switch") or {}
+    if pend.get("turn") == turn and pend.get("status") == "pending":
+        return None, "上次自动开新对话的调用中途中断，结果不明（可能已经建好了一个新对话）；为避免重复建对话，不再自动重试"
+    if not b:
+        return None, "恢复包没有生成"
+    sync_status = ""
+    if b.get("short"):
+        from . import sync
+        sync_status = str(((sync.record(inst) or {}).get("last") or {}).get("status") or "")
+    src = Path(out["file"]) if out and out.get("file") else None
+    original = src.read_text(encoding="utf-8") if src and src.is_file() else ""
+    text, effort, which = _newconv_message(b, original, sync_status)
+    draft = inst.outbox / f"turn-{turn:03d}-newconv.md"
+    draft.write_text(text, encoding="utf-8")
+    chk = ops.check_outgoing(draft, "task")
+    if chk["secrets"] or chk["problems"]:
+        return None, "续接消息没有通过发送前检查：" + "；".join((chk["secrets"] + chk["problems"])[:3])
+    st["conv_switch"] = {"turn": turn, "status": "pending", "ts": now_iso()}
+    inst.save()
+    r = anomaly.call("conv_new", ["--note", f"collab-wf {inst.name} 第 {turn} 轮：{why}"])
+    data = r.get("data") or {}
+    if r["code"] != 0 or data.get("ok") is not True:
+        if r.get("kind") != "timeout":   # 明确失败：按约定默认对话保持不变，意图作废；超时则结果不明，保留意图
+            st.pop("conv_switch", None)
+        inst.save()
+        return None, f"适配器 conv_new 退出码 {r['code']}：{(data.get('error') or r.get('raw') or '')[:200]}"
+    target = inst.outbox / f"turn-{turn:03d}.md"
+    if src and src.is_file() and src.resolve() == target.resolve():
+        os.replace(target, inst.outbox / f"turn-{turn:03d}-report.md")   # 本轮回报原件留档；全文已附在续接消息里
+    os.replace(draft, target)   # 同步与对话记录按 turn-NNN.md 取“实际发出的消息”
+    old = dict(st.get("conv") or {})
+    st["conv"] = {"since_turn": turn, "since": now_iso(), "chars": 0, "turns": 0, "by": "driver", "conv": data.get("conv"),
+                  "previous": {k: old.get(k) for k in ("since_turn", "since", "chars", "turns")}}
+    st.pop("conv_switch", None)
+    st.pop("send_ref", None)   # 上一轮的 ref 属于旧对话，不再作为 --prev-ref 交给适配器
+    new_out = st["outgoing"] = {"turn": turn, "file": str(target), "kind": "task", "effort": effort}
+    inst.event("conv_new", note=f"驱动器自动开新对话（{which}" + ("，附本轮原本要发出的消息）" if original.strip() else "）"),
+               conv=data.get("conv"), by="driver")
+    decide(inst, "context", "自动开新对话", why,
+           f"新对话 {data.get('conv') or '（适配器未给出 id）'}；续接消息 {target.name}（{which}）", "计数已归零，续接消息作为本轮消息发送")
+    inst.save()
+    return new_out, ""
+
+
 def h_compose(ctx):
     inst, st = ctx.inst, ctx.st
     out = st.get("outgoing")
@@ -364,15 +426,25 @@ def h_compose(ctx):
     mt, mc = int(ctx.pol.get("max_conversation_turns", 0)), int(ctx.pol.get("max_conversation_chars", 0))
     if (mt and c.get("turns", 0) >= mt) or (mc and c.get("chars", 0) >= mc):
         why = f"当前对话已 {c.get('turns', 0)} 轮、约 {c.get('chars', 0)} 字符，达到上限（policy：{mt} 轮 / {mc} 字符）"
+        b = None
         try:
             from .admin import bootstrap
-            b = bootstrap(inst, why)
+            b = bootstrap(inst, why, by="driver")   # 1.6.4：驱动器生成的恢复包记 by=driver（此前记 executor，M1 判据会把它算成人工动作）
             ev = f"{b['message'].name}，{b['zip'].name}" + (f"；短消息 {b['short'].name}（只发这一条即可）" if b.get("short") else "")
         except WfError as e:
             ev = f"恢复包生成失败：{e}"
-        decide(inst, "context", "停下，建议开新对话", why, ev, "等待用户")
-        return _anomaly(ctx, {"source": "context", "kind": "conversation_full"},
-                        why + f"。恢复包已在 workflow/outbox/（{ev}）：用户开新对话、上传 zip、发送说明消息后运行 wf conv new --note …，再 wf approve")
+        new_out, fail = None, ""
+        if ctx.pol.get("auto_new_conversation") is True:
+            # 1.6.4（collab-wf-dev 第 44 轮，执行端按用户的决策顺位决定）：驱动器自己开新对话，不再停下等人
+            new_out, fail = _new_conversation(ctx, out, why, b)
+        if not new_out:
+            decide(inst, "context", "停下，建议开新对话", why + (f"；自动开新对话未成功：{fail}" if fail else ""), ev, "等待用户")
+            return _anomaly(ctx, {"source": "context", "kind": "conversation_full"},
+                            why + (f"。自动开新对话未成功：{fail}" if fail else "")
+                            + f"。恢复包已在 workflow/outbox/（{ev}）：用户开新对话、上传 zip、发送说明消息后运行 wf conv new --note …，再 wf approve")
+        out = new_out
+    if st.pop("conv_switch", None) is not None:   # 1.6.4：对话已不在上限（自动或手动开了新对话），中断留下的意图作废
+        inst.save()
     hold = read_json(GLOBAL_QUOTA, {}) or {}
     if hold.get("until") and parse_iso(hold["until"]) and now() < parse_iso(hold["until"]):
         machine.go(inst, "SEND", by="driver", reason="待发")

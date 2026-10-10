@@ -117,7 +117,7 @@ wf report                                   # 下一轮
 需要开新对话时（对话太长、持续报错、回复明显对不上上下文）：
 
 1. `wf bootstrap --reason "原因"`：生成说明消息（含本文件与 PROJECT.md 全文、工作流当前位置与下一个计划节点）、项目仓库 zip（只含已提交文件，不含数据与密钥）、collab-wf 工具本身的 zip。
-2. 执行端把桥接工具指向新对话，先运行 `wf conv new --note …`（它把新对话的起点记为下一轮），再在新对话中上传两个 zip 并发送说明消息，档位用 max。通道不能上传附件时，Claude 按说明消息末尾的文件清单点名读取。何时开新对话、怎样接上，见 CONTEXT.md。
+2. 执行端把桥接工具指向新对话，先运行 `wf conv new --note …`（它把新对话的起点记为下一轮），再在新对话中上传两个 zip 并发送说明消息，档位用 max。通道不能上传附件时，Claude 按说明消息末尾的文件清单点名读取。何时开新对话、怎样接上，见 CONTEXT.md。policy.json 的 auto_new_conversation 为 true 时，这一步由驱动器完成（DRIVER.md 第 22 节）。
 3. Claude 第一轮只做三件事：复述版本、阶段与待用户决策；确认 zip 与 PROJECT.md 一致；给出下一轮指令。
 4. PROJECT.md 与事实不符时，以 git 历史与 evidence/ 中的原文为准，由 Claude 修正后发布新版本。
 

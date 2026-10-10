@@ -1,5 +1,15 @@
 # CHANGELOG（collab-wf）
 
+## 1.6.4 — 2026-10-10
+
+对话达到上限时由驱动器自己开新对话（collab-wf-dev 第 44 轮：执行端按用户的决策顺位决定做；这是此前唯一固定需要人的停顿）。
+- policy.json 新增 auto_new_conversation（默认关闭；开启属于授权，按扩大权限处理，需要批准）。开启后，对话达到上限时驱动器生成恢复包，选短消息（同步已推送或内容没变时）或长消息，把本轮原本要发的消息原样附在后面，调用适配器的 conv_new 新建对话并切换，计数归零，续接消息作为本轮消息发送。事件与决策都记 by=driver。
+- 任何一步不成立都不切换，退回原来的做法（停下等人），详情写明原因；conv_new 超时属于结果不明，不再自动重试，避免重复建对话。
+- 驱动器生成恢复包时，bootstrap 事件改记 by=driver（此前记 executor，M1 判据会把它算成人工动作）。
+- 修正（collab-wf-dev 第 50 轮执行端报告）：wf transport test 对空 ref 的 poll 只认 none，与 TRANSPORT.md 1.5.1 的约定（返回 no_ref）矛盾；改为 none 或 no_ref 都算合规。
+- 文档：DRIVER.md 第 22 节、TRANSPORT.md 附录（conv_new 接口）；CONTEXT.md、WORKFLOW.md、DESIGN.md 与 anomalies.json 的 CONTEXT_FULL 说明补充。
+- 自检新增 4 项（自动开新对话成功与失败两条路径、空 ref 返回 no_ref、授权判定与消息选择）；两处旧断言随检查项的新名称更新，判定不变；原有检查没有删改。本版不改 floor.py。
+
 ## 1.6.3 — 2026-10-10
 
 开新对话改用“短消息 + 公开仓库链接”（用户第 31 轮：“以后都用这个仓库做这个项目的上下文”）。

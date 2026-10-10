@@ -922,6 +922,26 @@ def _t_v163_bootstrap_short(_ok):
         and b2.get("short") is None and long_ok, short[:300])
 
 
+def _t_v164_newconv(_ok):
+    from . import driver, policy
+    old = {"allow": ["^a "], "auto_apply": True}
+    on = {**old, "auto_new_conversation": True}
+    w_on, w_off = policy.widening(old, on), policy.widening(on, old)
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "long.md").write_text("【项目续接 · 新对话】档位：max\n长消息 v1.0\n", encoding="utf-8")
+        (d / "short.md").write_text("【项目续接 · 新对话】档位：high\n短消息 v1.0\n", encoding="utf-8")
+        b = {"message": d / "long.md", "short": d / "short.md"}
+        t1, e1, w1 = driver._newconv_message(b, "【回报 · 第 9 轮 · v1.0】档位：medium\n", "pushed")
+        t2, e2, w2 = driver._newconv_message(b, "", "failed")
+        t3, e3, w3 = driver._newconv_message({"message": d / "long.md", "short": None}, "", "")
+    _ok("1.6.4 开新对话：开启 auto_new_conversation 算扩大权限（要批准）、关闭不算；同步成功才用短消息，否则用长消息；本轮原本要发的消息原样附在后面",
+        any("auto_new_conversation" in x for x in w_on) and w_off == []
+        and w1 == "短消息" and e1 == "high" and "短消息 v1.0" in t1 and "【回报 · 第 9 轮" in t1
+        and w2 == "长消息" and e2 == "max" and "附：" not in t2 and w3 == "长消息",
+        str([w_on, w_off, w1, e1, w2, e2, w3]))
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -937,7 +957,8 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.0 项目上下文同步", _t_v160_sync),
          ("1.6.1 不扩大权限的变更自动批准", _t_v161_neutral), ("1.6.1 无人值守的两处停顿", _t_v161_unattended),
          ("1.6.2 适配器调用的程序路径", _t_v162_program_ops),
-         ("1.6.3 开新对话的短消息", _t_v163_bootstrap_short)]
+         ("1.6.3 开新对话的短消息", _t_v163_bootstrap_short),
+         ("1.6.4 驱动器自己开新对话", _t_v164_newconv)]
 
 
 def run_v15(_ok) -> None:
