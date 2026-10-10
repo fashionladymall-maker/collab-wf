@@ -9,10 +9,10 @@
 - 仓库指纹：`仓库指纹 3551230e49517eba（6 个文件）`
 
 ## 当前进度
-- 第 **31** 轮 · **WAIT_REPLY**
+- 第 **31** 轮 · **EXECUTE**
 - 最近验收：turn-030：c1 pass、c2 pass
 - 我方最新发出：`turns/turn-031.md`
-- Claude 最新回复：`replies/reply-030.md`
+- Claude 最新回复：`replies/reply-031.md`
 
 ## 目录
 - `turns/` —— 我方每轮发给 Claude 的消息
@@ -21,5 +21,5 @@
 - `artifacts/` —— 最新工具包与项目包（可匿名下载）
 
 ## 最新产物
-- `artifacts/collab-wf-1.5.9.zip`
+- `artifacts/collab-wf-1.6.0.zip`
 - `artifacts/collab-wf-dev-v1.0.zip`
