@@ -4,7 +4,7 @@
 
 ## 版本
 - 工具：collab-wf 1.6.5
-- 项目：v2.0；fffb0eb (HEAD -> main, tag: v2.0) release v2.0
+- 项目：v2.0；35fc773 (HEAD -> main) Mark executor watchdog and wake integration complete
 - 仓库指纹：f7a603aa5b35b818（7 个文件）
 
 ## 最近一轮
