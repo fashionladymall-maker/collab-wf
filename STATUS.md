@@ -4,8 +4,8 @@
 
 ## 版本
 - 工具：collab-wf 1.6.0
-- 项目：v1.3；ade0903 (HEAD -> main, tag: v1.3) release v1.3
-- 仓库指纹：3b4468c811a96ea2（7 个文件）
+- 项目：v1.3；6ec2857 (HEAD -> main) docs: VISION.md 记录用户裁定（不同意第一版公开化方案）；.gitignore 忽略 .workbuddy-ai/
+- 仓库指纹：2d407489ebf88c00（7 个文件）
 
 ## 最近一轮
 - 第 34 轮验收通过（2026-10-10T13:24:29+00:00）

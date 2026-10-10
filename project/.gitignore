@@ -6,3 +6,8 @@ workflow/evidence/
 workflow/outbox/
 workflow/approvals.json
 workflow/goals_state.json
+
+# 执行端 AI 代理在项目目录里留下的工作区数据（本机数据，不进版本库）
+# 2026-10-10 21:25 实测：每小时巡检的自动化把工作目录当成项目目录，在这里建了 .workbuddy-ai/，
+# 而它不在 DEFAULT_PROTECT 里 —— 下一次 APPLY 会被 AP-2「工作区有未提交的改动」拦下。
+.workbuddy-ai/
