@@ -200,8 +200,54 @@ def bootstrap(inst: Instance, reason: str) -> dict:
             .replace("{tool_manifest}", fidelity.tool_manifest_text(WF_HOME, inst.root)))
     mpath = inst.outbox / f"bootstrap-{stamp}.md"
     mpath.write_text(text, encoding="utf-8")
-    inst.event("bootstrap", file=mpath.name, zip=zpath.name, tool_zip=tool_zip.name, reason=reason, by="executor")
-    return {"message": mpath, "zip": zpath, "tool_zip": tool_zip, "chars": len(text)}
+    short = _bootstrap_short(inst, reason, ver, head, s, fp, last, stamp)   # 1.6.3：短消息 + 公开仓库链接
+    inst.event("bootstrap", file=mpath.name, zip=zpath.name, tool_zip=tool_zip.name, reason=reason,
+               short=short.name if short else None, by="executor")
+    return {"message": mpath, "zip": zpath, "tool_zip": tool_zip, "chars": len(text), "short": short}
+
+
+def _bootstrap_short(inst: Instance, reason: str, ver: str, head: str, s: dict, fp: dict, last: str, stamp: str):
+    """1.6.3：项目开启了同步、并在 transport.json 写了 sync_repo（owner/仓库）时，另外生成一条短的续接消息：
+    项目上下文在公开仓库里（用户第 31 轮：“以后都用这个仓库做这个项目的上下文”），新对话按链接读取，不需要附件。
+    生成前先同步一次，保证链接里是最新内容。没有开启同步时返回 None，长消息照旧。"""
+    from . import sync
+    c = sync.cfg()
+    repo = str(c.get("sync_repo") or "").strip().strip("/")
+    if not repo or not sync.enabled(inst):
+        return None
+    try:
+        sync.run(inst)
+    except Exception:   # noqa: BLE001  同步失败不妨碍生成消息；仓库里是上一次同步的内容
+        pass
+    raw = f"https://raw.githubusercontent.com/{repo}/{c.get('sync_branch') or 'main'}"
+    sent = []
+    if inst.turns_path.exists():
+        for line in inst.turns_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if '"sent"' in line:
+                try:
+                    r = __import__("json").loads(line)
+                except ValueError:
+                    continue
+                if r.get("status") == "sent" and isinstance(r.get("turn"), int):
+                    sent.append(r["turn"])
+    replies = sorted(d.name.split("-", 1)[1] for d in inst.evidence.glob("turn-*") if (d / "reply.md").is_file()) \
+        if inst.evidence.exists() else []
+    lines = [f"【项目续接 · 新对话】档位：high", "",
+             f"上一个对话因 {reason} 结束。项目上下文在公开仓库 {repo}，请直接按链接读取，不需要附件：", "",
+             f"1. 进度总览：{raw}/STATUS.md",
+             f"2. 项目状态与计划：{raw}/project/PROJECT.md 、{raw}/project/VISION.md",
+             f"3. 协作规则：{raw}/tool/docs/WORKFLOW.md ；【驱动指令】格式：{raw}/tool/docs/DRIVER.md 第 5 节",
+             (f"4. 最近一轮：我方消息 {raw}/turns/turn-{max(sent):03d}.md" if sent else "4. 最近一轮：我方消息（无）")
+             + (f" ；你的回复 {raw}/replies/reply-{replies[-1]}.md" if replies else ""),
+             f"5. 工具源码：{raw}/tool/ 下按路径读取（例如 tool/wflib/driver.py）；版本包在 artifacts/", "",
+             f"当前：工具 collab-wf {tool_version()}，项目 {ver}（提交 {head}），仓库指纹 {fp['digest']}（{fp['count']} 个文件）；"
+             f"工作流 {s['state']}（{s['name']}），第 {s['turn']} 轮。", "",
+             "最近一轮的回报清单与验收结论：", last, "",
+             "本轮请只做三件事：复述当前版本、阶段、待用户决策与工具边界；按仓库内容核对仓库指纹；给出下一轮指令。"
+             "本轮不要交付新版本。raw 链接偶尔有几分钟的缓存，内容对不上时稍后重读。"]
+    p = inst.outbox / f"bootstrap-{stamp}-short.md"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
 
 
 def _tool_zip(outdir: Path) -> Path:

@@ -885,6 +885,43 @@ def _t_v162_program_ops(_ok):
         and seen[2][1:4] == ["-m", "my_adapter", "review"] and seen[3][0] == "/opt/x/gh_sync.py", str(seen))
 
 
+def _t_v163_bootstrap_short(_ok):
+    import subprocess
+    from . import admin, sync
+    from .core import Instance
+    orig = (sync.cfg, sync.run)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "workflow").mkdir()
+        (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"v163-bs-{os.getpid()}"}), encoding="utf-8")
+        (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+        (root / ".gitignore").write_text("workflow/\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=root)
+        subprocess.run(["git", "add", "-A"], cwd=root)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "release v0.1"], cwd=root)
+        (root / "workflow" / "turns.jsonl").write_text(json.dumps({"turn": 7, "status": "sent"}) + "\n", encoding="utf-8")
+        (root / "workflow" / "evidence" / "turn-007").mkdir(parents=True)
+        (root / "workflow" / "evidence" / "turn-007" / "reply.md").write_text("回复\n", encoding="utf-8")
+        inst = Instance(root)
+        inst.state.update(state="COMPOSE", turn=8)
+        inst.save()
+        calls = []
+        try:
+            sync.run = lambda i, **k: calls.append(i.name) or {"status": "pushed"}
+            sync.cfg = lambda: {"sync": "/x/gh_sync.py", "sync_projects": [inst.name], "sync_repo": "me/repo"}
+            b1 = admin.bootstrap(inst, "测试")
+            short = b1["short"].read_text(encoding="utf-8") if b1.get("short") else ""
+            sync.cfg = lambda: {}
+            b2 = admin.bootstrap(inst, "测试")
+            long_ok = b1["message"].exists() and b2["message"].exists()
+        finally:
+            sync.cfg, sync.run = orig
+    _ok("1.6.3 开新对话的短消息：开启同步并写了 sync_repo 时先同步、再生成带 raw 链接的短消息；没开启时照旧只有长消息",
+        bool(b1.get("short")) and calls == [inst.name] and "https://raw.githubusercontent.com/me/repo/main/STATUS.md" in short
+        and "turns/turn-007.md" in short and "replies/reply-007.md" in short and len(short) < 4000
+        and b2.get("short") is None and long_ok, short[:300])
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -899,7 +936,8 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.5.9 底线集中与行为检查", _t_v159_floor), ("1.5.9 执行端待办信号", _t_v159_inbox),
          ("1.6.0 项目上下文同步", _t_v160_sync),
          ("1.6.1 不扩大权限的变更自动批准", _t_v161_neutral), ("1.6.1 无人值守的两处停顿", _t_v161_unattended),
-         ("1.6.2 适配器调用的程序路径", _t_v162_program_ops)]
+         ("1.6.2 适配器调用的程序路径", _t_v162_program_ops),
+         ("1.6.3 开新对话的短消息", _t_v163_bootstrap_short)]
 
 
 def run_v15(_ok) -> None:

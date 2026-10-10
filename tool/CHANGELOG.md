@@ -1,5 +1,12 @@
 # CHANGELOG（collab-wf）
 
+## 1.6.3 — 2026-10-10
+
+开新对话改用“短消息 + 公开仓库链接”（用户第 31 轮：“以后都用这个仓库做这个项目的上下文”）。
+- transport.json 写了 sync_repo 且项目开启同步时，wf bootstrap（以及对话体量达到上限时自动生成的恢复包）先同步一次，再生成 bootstrap-<时间>-short.md：STATUS、PROJECT、VISION、WORKFLOW、DRIVER、最近一轮双方消息与工具源码的 raw 链接，加上当前版本、指纹与最近一轮的验收结论。长消息与 zip 照旧生成，作为后备。
+- 对话体量达到上限时的提示里写明短消息的文件名。
+- 文档：SYNC.md 新增第 7 节。自检新增 1 项；原有检查没有删改。
+
 ## 1.6.2 — 2026-10-10
 
 修正（collab-wf-dev 第 36 轮执行端报告）：通道是模块方式时，anomaly.call 把所有动作都交给通道适配器，而通道适配器只有 send/poll/quota，wf sync 必然失败（“未知动作：sync”），与 docs/SYNC.md 的说明矛盾。

@@ -367,7 +367,7 @@ def h_compose(ctx):
         try:
             from .admin import bootstrap
             b = bootstrap(inst, why)
-            ev = f"{b['message'].name}，{b['zip'].name}"
+            ev = f"{b['message'].name}，{b['zip'].name}" + (f"；短消息 {b['short'].name}（只发这一条即可）" if b.get("short") else "")
         except WfError as e:
             ev = f"恢复包生成失败：{e}"
         decide(inst, "context", "停下，建议开新对话", why, ev, "等待用户")

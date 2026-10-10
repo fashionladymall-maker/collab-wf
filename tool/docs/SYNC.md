@@ -50,7 +50,11 @@ sync --project <名称> --turn <轮次> --dir <暂存目录>
 - 失败时退出码非 0；工具记下失败次数，连续 3 次在 wf ask 与 inbox 中提示执行端。
 - 环境变量 WF_ADAPTER_TIMEOUT_S 给出时间上限。
 
-## 7. 边界
+## 7. 开新对话的短消息（1.6.3）
+
+transport.json 再写 "sync_repo": "owner/仓库"（可选 "sync_branch"，默认 main）时，wf bootstrap 与对话体量达到上限时生成恢复包的同时，先同步一次，再在 outbox 里生成 bootstrap-<时间>-short.md：一条短消息，列出 STATUS、PROJECT.md、VISION.md、WORKFLOW.md、DRIVER.md、最近一轮双方消息与工具源码的 raw 链接，以及当前版本、指纹与最近一轮的验收结论。开新对话时只发这一条即可；长消息与 zip 照旧生成，作为后备。
+
+## 8. 边界
 
 - 公开仓库的历史会保留已推送的内容。扫描是最后一道闸，不是唯一的一道：密钥本来就不应出现在消息与已提交文件里（WORKFLOW.md 第 12 节）。
 - 同步失败或暂停不影响工作流推进。
