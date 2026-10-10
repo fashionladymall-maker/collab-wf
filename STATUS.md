@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 40 轮 · 等待 Claude（WAIT_REPLY）
+第 41 轮 · 等待用户决定（AWAITING_USER）
 
 ## 版本
 - 工具：collab-wf 1.6.3
@@ -8,9 +8,9 @@
 - 仓库指纹：269936100986efd5（7 个文件）
 
 ## 最近一轮
-- 第 39 轮验收通过（2026-10-10T14:08:37+00:00）
+- 第 40 轮验收通过（2026-10-10T14:13:12+00:00）
 - 本方最新消息：`turns/turn-040.md`
-- Claude 最新回复：`replies/reply-039.md`
+- Claude 最新回复：`replies/reply-040.md`
 
 ## 目标
 - 进度 4 / 7
@@ -23,8 +23,8 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- 无
+- [executor] 需要你批准才能继续：[CONTEXT_FULL] 当前对话的体量达到上限，继续会降低回复质量。恢复包已生成，需要用户开新对话。 当前对话已 20 轮、约 199923 字符，达到上限（policy：20 轮 / 0 字符）。恢复包已在 workflow/outbox/（bootstrap-20261010-221315.md，collab-wf-dev-v1.5-03703c1.zip）：用户开新对话、上传 zip、
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.3.zip`
+- `artifacts/collab-wf-1.6.3-0bc9afa.zip`
 - `artifacts/collab-wf-dev-v1.5.zip`
