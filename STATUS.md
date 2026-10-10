@@ -4,15 +4,15 @@
 > 目的是让 Claude 能随时按链接读到项目的最新版本与进度。
 
 ## 版本
-- 工具：**collab-wf 1.5.9（wf-v1.5.9）  安装位置：/Users/admin/.workbuddy-ai/tools/collab-wf**
-- 项目：`8631541 (HEAD -> main, tag: v1.0) release v1.0`
-- 仓库指纹：`仓库指纹 3551230e49517eba（6 个文件）`
+- 工具：**collab-wf 1.6.0（wf-v1.6.0）  安装位置：/Users/admin/.workbuddy-ai/tools/collab-wf**
+- 项目：`bf1bf0b (HEAD -> main, tag: v1.1) release v1.1`
+- 仓库指纹：`仓库指纹 161bf2d72a2ff4c6（6 个文件）`
 
 ## 当前进度
-- 第 **31** 轮 · **EXECUTE**
-- 最近验收：turn-030：c1 pass、c2 pass
-- 我方最新发出：`turns/turn-031.md`
-- Claude 最新回复：`replies/reply-031.md`
+- 第 **33** 轮 · **SEND**
+- 最近验收：turn-032：c1 pass、c2 pass
+- 我方最新发出：`turns/turn-033.md`
+- Claude 最新回复：`replies/reply-032.md`
 
 ## 目录
 - `turns/` —— 我方每轮发给 Claude 的消息
@@ -22,4 +22,4 @@
 
 ## 最新产物
 - `artifacts/collab-wf-1.6.0.zip`
-- `artifacts/collab-wf-dev-v1.0.zip`
+- `artifacts/collab-wf-dev-v1.1.zip`
