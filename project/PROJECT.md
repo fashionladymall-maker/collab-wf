@@ -91,10 +91,10 @@ v2.0（2026-10-10）—— 阶段：1.6.4、1.6.5 已由驱动器自动安装；
 - [x] 1.6.4 安装：第 54 轮由驱动器构建（204/204）并自动安装，58 个文件核验一致；版本包 sha256 与 Claude 侧相同（8c8703085899）
 - [ ] v2.0：policy 开启 auto_new_conversation、landed_confirm_polls 45 与 landed_poll_s 60（扩大权限：评审时 wf approve、落地后 wf policy approve，都由执行端 --by executor --reason 代决）
 - [x] 1.6.5（第 56 轮由驱动器构建 209/209 并自动安装，60 个文件核验一致）：卡死与错误进 inbox（结论 32）；发送前与上一条回复落地至少间隔 min_send_gap_s（W42）；SEND_NOT_LANDED 的恢复（wf resend 覆盖“已 finalize 但没落地”）与非底线事项的执行端代决（--by executor --reason，底线事项仍只认用户原话）（W43）
-- [ ] 执行端：独立看门狗改为运行 wf watchdog --write；非底线的决定改用 --by executor --reason 记录
+- [x] 执行端（2026-10-11）：独立看门狗 wrapper 委托 wf watchdog --write；唤醒通道对可由执行端处理的批准使用 --by executor --reason，保留 tool floor 路由；状态与去重测试通过，尚待真实新待决项端到端回归
 - [ ] 待排期：落地核对改为按时间计（landed_timeout_s），不再依赖轮询次数乘间隔
 - [ ] 1.6.4：① 对话达到上限时由驱动器开新对话（bootstrap → 确认同步已推送 → 适配器 conv_new → 记 conv_new by=driver → 发短说明消息作为本轮消息）；policy 开关 auto_new_conversation。② transport test 与 selftest_driver 的空 ref 断言改为认 no_ref（wf.py:179、selftest_driver.py:296/500 三处旧断言一并改）
-- [ ] 执行端：唤醒通道自行设计实现（已确认结论 30a），Claude 不参与
+- [x] 执行端（2026-10-11）：事件驱动唤醒由执行端实现；按活进程及实时网关发现目标，注册表缺 URL/空闲心跳冻结漏投已修；`wf ask` 投递前复核，真实投递记录见 wake.log
 - [ ] 可选（只加不改，VISION.md 第三节）：wf demo、pyproject.toml、wf run --loop 与 systemd / cron 配置
 - [ ] 执行端：按 docs/REVIEW.md 实现另一个模型系列审查程序（用户第 19 轮已批准开启）
 - [ ] W22 余项：OUTGOING_STRUCTURE 的提示语不再写死“工具缺陷”并回显实际首行（先读 anomalies.json）
