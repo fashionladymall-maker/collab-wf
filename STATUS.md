@@ -5,14 +5,14 @@
 
 ## 版本
 - 工具：**collab-wf 1.5.9（wf-v1.5.9）  安装位置：/Users/admin/.workbuddy-ai/tools/collab-wf**
-- 项目：`68d15e6 (HEAD -> main, tag: v0.9) release v0.9`
-- 仓库指纹：`仓库指纹 3bf65e461368ea9e（5 个文件）`
+- 项目：`8631541 (HEAD -> main, tag: v1.0) release v1.0`
+- 仓库指纹：`仓库指纹 3551230e49517eba（6 个文件）`
 
 ## 当前进度
-- 第 **30** 轮 · **WAIT_REPLY**
-- 最近验收：turn-029：c1 pass、c2 pass
-- 我方最新发出：`turns/turn-030.md`
-- Claude 最新回复：`replies/reply-029.md`
+- 第 **31** 轮 · **SEND**
+- 最近验收：turn-030：c1 pass、c2 pass
+- 我方最新发出：`turns/turn-031.md`
+- Claude 最新回复：`replies/reply-030.md`
 
 ## 目录
 - `turns/` —— 我方每轮发给 Claude 的消息
@@ -22,4 +22,4 @@
 
 ## 最新产物
 - `artifacts/collab-wf-1.5.9.zip`
-- `artifacts/collab-wf-dev-v0.9.zip`
+- `artifacts/collab-wf-dev-v1.0.zip`
