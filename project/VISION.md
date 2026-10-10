@@ -51,7 +51,7 @@
 | 两半协作 | Claude 做设计与编码；执行端（WorkBuddy 里的 AI 代理）做部署、执行与验收。驱动器推进例行步骤；用户只做资金、密钥、合规、平台、通道类决定与最终验收。执行端是两半之一，不是可选项 |
 | 对话通道 | c.aimonkey.plus 网页通道。适配器（aimonkey）在 ~/.workbuddy-ai/adapter/，在工具目录之外、由执行端维护，因为它是自用通道 |
 | 运行环境 | 用户的 macOS；launchd 定时器每 60 秒运行 wf tick；Python 3.13.12 绝对路径；工具在 ~/.workbuddy-ai/tools/collab-wf，项目在 ~/.workbuddy-ai/projects/collab-wf-dev |
-| 执行端的唤醒 | WorkBuddy 定时自动化每小时巡检 local/inbox.json 与最新回复中的“给执行端：”段落；用户随时发话随时响应 |
+| 执行端的唤醒 | 事件驱动：inbox 出现交给执行端的新项即唤醒本机 WorkBuddy 会话；没有可用会话时退回每小时一次的定时自动化兜底；写给执行端的事由驱动指令“执行端 N：”登记成待办；用户随时发话随时响应 |
 | 公开仓库 | 一个仓库 fashionladymall-maker/collab-wf，就是项目上下文；wf sync 推送 STATUS、项目文件、工具源码、双方消息与版本包 |
 | 用词 | 执行端、WorkBuddy、aimonkey 照常使用 |
 
