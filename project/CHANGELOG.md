@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## v1.2 — 2026-10-10
+- M1 判据：m1_check.py 的无人值守改为按历史最长连续计；goals.json 的 G3 分 3、6、8、10 四级；policy.json 的 max_rounds_without_goal_progress 由 8 改为 12（已确认结论 28、W34）
+- btc-quant 按用户第 33 轮决定删除，PROJECT.md 移除其待决事项
+
 ## v1.1 — 2026-10-10
 - 1.6.0（项目上下文同步）由驱动器自己构建并自动安装（第 31 轮，193/193），这是第一次无人安装工具版本，M1 的 G4 达成；goals.json 第 31 轮批准
 - m1_check.py：执行端的说明类备注不再算人工动作

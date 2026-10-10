@@ -24,7 +24,7 @@
   "auto_self_update": true,
   "max_rounds_per_day": 24,
   "max_consecutive_failed_rounds": 3,
-  "max_rounds_without_goal_progress": 8,
+  "max_rounds_without_goal_progress": 12,
   "command_timeout_s": 1800,
   "first_poll_after_s": 120,
   "poll_interval_s": 120,
