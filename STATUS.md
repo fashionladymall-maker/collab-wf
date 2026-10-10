@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 51 轮 · 发送（SEND）
+第 52 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.6.3
-- 项目：v1.7；1270265 (HEAD -> main, tag: v1.7) release v1.7
-- 仓库指纹：6a98508768686f43（7 个文件）
+- 项目：v1.8；871dbd3 (HEAD -> main, tag: v1.8) release v1.8
+- 仓库指纹：dcc69d749bae6fa6（7 个文件）
 
 ## 最近一轮
-- 第 49 轮验收通过（2026-10-10T14:57:50+00:00）
-- 本方最新消息：`turns/turn-050.md`
-- Claude 最新回复：`replies/reply-049.md`
+- 第 51 轮验收通过（2026-10-10T15:15:20+00:00）
+- 本方最新消息：`turns/turn-052.md`
+- Claude 最新回复：`replies/reply-051.md`
 
 ## 目标
 - 进度 4 / 7
@@ -27,4 +27,4 @@
 
 ## 最新产物
 - `artifacts/collab-wf-1.6.3-0bc9afa.zip`
-- `artifacts/collab-wf-dev-v1.7.zip`
+- `artifacts/collab-wf-dev-v1.8.zip`
