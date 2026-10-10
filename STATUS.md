@@ -9,10 +9,10 @@
 - 仓库指纹：`仓库指纹 3bf65e461368ea9e（5 个文件）`
 
 ## 当前进度
-- 第 **29** 轮 · **WAIT_REPLY**
-- 最近验收：turn-028：c1 pass、c2 pass、c3 pass
-- 我方最新发出：`turns/turn-029.md`
-- Claude 最新回复：`replies/reply-028.md`
+- 第 **30** 轮 · **WAIT_REPLY**
+- 最近验收：turn-029：c1 pass、c2 pass
+- 我方最新发出：`turns/turn-030.md`
+- Claude 最新回复：`replies/reply-029.md`
 
 ## 目录
 - `turns/` —— 我方每轮发给 Claude 的消息
