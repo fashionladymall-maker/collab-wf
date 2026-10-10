@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## v1.3 — 2026-10-10
+- VISION.md 由 Claude 接管：公开化的定位、7 个关键决定、1.7.0 至 2.0.0 的路线图与每版验收判据、需要负责人决定的三件事
+- PROJECT.md：已确认结论 29；“下一步”按路线图重排（原 1.7.0、1.8.0 的几项改为待排期）；待用户决策新增 License、API 密钥、仓库安排；新增 W35
+
 ## v1.2 — 2026-10-10
 - M1 判据：m1_check.py 的无人值守改为按历史最长连续计；goals.json 的 G3 分 3、6、8、10 四级；policy.json 的 max_rounds_without_goal_progress 由 8 改为 12（已确认结论 28、W34）
 - btc-quant 按用户第 33 轮决定删除，PROJECT.md 移除其待决事项

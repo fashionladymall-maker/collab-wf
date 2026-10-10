@@ -1,0 +1,40 @@
+{
+  "budget": "large",
+  "roles": {
+    "design": {
+      "effort": "max",
+      "doc": "方案设计、架构、跨模块改动"
+    },
+    "build": {
+      "effort": "high",
+      "doc": "常规实现与改动"
+    },
+    "fix": {
+      "effort": "high",
+      "doc": "上一轮有失败，第一次修复"
+    },
+    "escalate": {
+      "effort": "max",
+      "doc": "同一问题连续失败，升级处理"
+    },
+    "checkpoint": {
+      "effort": "medium",
+      "doc": "计划节点到期、例行回报（全部通过）"
+    },
+    "continue": {
+      "effort": "same",
+      "doc": "回复中断后请 Claude 从断点继续，沿用上一轮档位"
+    },
+    "probe": {
+      "effort": "low",
+      "doc": "通道探测、确认收到"
+    }
+  },
+  "budgets": {
+    "unlimited": "max",
+    "large": "max",
+    "medium": "xhigh",
+    "small": "high"
+  },
+  "cap_when_quota_above_pct": 85
+}

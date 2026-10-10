@@ -1,0 +1,8 @@
+# collab-wf 实例数据（本机运行状态，不进版本库）
+workflow/state.json
+workflow/*.jsonl
+workflow/usage.json
+workflow/evidence/
+workflow/outbox/
+workflow/approvals.json
+workflow/goals_state.json

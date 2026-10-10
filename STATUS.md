@@ -1,25 +1,30 @@
-# collab-wf 项目状态（自动同步）
+# collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-> 本文件由执行端自动同步到本仓库；新鲜度看本仓库的 commit 记录。
-> 目的是让 Claude 能随时按链接读到项目的最新版本与进度。
+第 35 轮 · 发送（SEND）
 
 ## 版本
-- 工具：**collab-wf 1.6.0（wf-v1.6.0）  安装位置：/Users/admin/.workbuddy-ai/tools/collab-wf**
-- 项目：`f0ba377 (HEAD -> main, tag: v1.2) release v1.2`
-- 仓库指纹：`仓库指纹 9657388c1e45a417（7 个文件）`
+- 工具：collab-wf 1.6.0
+- 项目：v1.3；ade0903 (HEAD -> main, tag: v1.3) release v1.3
+- 仓库指纹：3b4468c811a96ea2（7 个文件）
 
-## 当前进度
-- 第 **34** 轮 · **SEND**
-- 最近验收：turn-033：c1 pass、c2 fail
-- 我方最新发出：`turns/turn-034.md`
-- Claude 最新回复：`replies/reply-033.md`
+## 最近一轮
+- 第 34 轮验收通过（2026-10-10T13:24:29+00:00）
+- 本方最新消息：`turns/turn-034.md`
+- Claude 最新回复：`replies/reply-034.md`
 
-## 目录
-- `turns/` —— 我方每轮发给 Claude 的消息
-- `replies/` —— Claude 的回复
-- `project/` —— 项目文件（PROJECT.md、CHANGELOG.md、policy.json）
-- `artifacts/` —— 最新工具包与项目包（可匿名下载）
+## 目标
+- 进度 3 / 7
+- ✓ G1 工具文件与版本清单完全一致：通过
+- ✓ G2 体检健康：驱动器心跳正常、没有错误项：通过
+- ○ G3a 历史上出现过连续 3 轮无人工动作：退出码 1，期望 0；输出不含“M1 无人值守：通过”
+- ○ G3b 历史上出现过连续 6 轮无人工动作：退出码 1，期望 0；输出不含“M1 无人值守：通过”
+- ○ G3c 历史上出现过连续 8 轮无人工动作：退出码 1，期望 0；输出不含“M1 无人值守：通过”
+- ○ G3d 历史上出现过连续 10 轮无人工动作：退出码 1，期望 0；输出不含“M1 无人值守：通过”
+- ✓ G4 工具版本由驱动器自己构建并装上：通过
+
+## 待办
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.6.0.zip`
-- `artifacts/collab-wf-dev-v1.2.zip`
+- `artifacts/collab-wf-dev-v1.3.zip`

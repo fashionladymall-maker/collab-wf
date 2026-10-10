@@ -1,0 +1,106 @@
+{
+  "_说明": "里程碑 M1“无人值守稳定运行”（collab-wf-dev v1.2）。exec 类目标由驱动器在每轮验收后运行；全部通过即进入“目标达成”并停下，交给用户验收。G3 按历史最长连续无人工动作的轮数计（m1_check.py v1.2），分 3、6、8、10 四级：达成后不会因为之后的人工动作（例如每 20 轮一次的开新对话）而失效，目标进度只增不减；相邻两级最多差 4 轮，配合 policy 的 max_rounds_without_goal_progress=12，不会在攒满之前被目标熔断误停。",
+  "goals": [
+    {
+      "id": "G1",
+      "title": "工具文件与版本清单完全一致",
+      "kind": "exec",
+      "check": "wf self-check",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "完全一致"
+        ]
+      },
+      "means": "装上的就是版本包，没有残留文件或手改",
+      "on_fail": "执行端核对工具目录，必要时 wf self-rollback 到上一个版本"
+    },
+    {
+      "id": "G2",
+      "title": "体检健康：驱动器心跳正常、没有错误项",
+      "kind": "exec",
+      "check": "wf doctor",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "✓ 驱动器心跳"
+        ],
+        "not_contains": [
+          "✗"
+        ]
+      },
+      "means": "定时器在跑、版本匹配、PROJECT.md 有效",
+      "on_fail": "按 wf doctor 的提示处理（执行端）"
+    },
+    {
+      "id": "G3a",
+      "title": "历史上出现过连续 3 轮无人工动作",
+      "kind": "exec",
+      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 3",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "M1 无人值守：通过"
+        ]
+      },
+      "means": "驱动器能独立完成连续的轮次",
+      "on_fail": "看 m1_check 列出的最近一次中断原因，交给 Claude 消除"
+    },
+    {
+      "id": "G3b",
+      "title": "历史上出现过连续 6 轮无人工动作",
+      "kind": "exec",
+      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 6",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "M1 无人值守：通过"
+        ]
+      },
+      "means": "无人值守可以持续",
+      "on_fail": "同 G3a"
+    },
+    {
+      "id": "G3c",
+      "title": "历史上出现过连续 8 轮无人工动作",
+      "kind": "exec",
+      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 8",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "M1 无人值守：通过"
+        ]
+      },
+      "means": "无人值守可以跨过大半个对话",
+      "on_fail": "同 G3a"
+    },
+    {
+      "id": "G3d",
+      "title": "历史上出现过连续 10 轮无人工动作",
+      "kind": "exec",
+      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 10",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "M1 无人值守：通过"
+        ]
+      },
+      "means": "无人值守稳定",
+      "on_fail": "同 G3a"
+    },
+    {
+      "id": "G4",
+      "title": "工具版本由驱动器自己构建并装上",
+      "kind": "exec",
+      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py auto-update",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "M1 自动安装工具版本：通过"
+        ]
+      },
+      "means": "交付到安装的整条链不需要人",
+      "on_fail": "看自动安装被拒绝的原因（底线文件、行为检查、自检），交给 Claude"
+    }
+  ]
+}

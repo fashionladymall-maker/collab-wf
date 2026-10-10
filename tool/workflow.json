@@ -1,0 +1,684 @@
+{
+  "name": "Claude × 执行端 协作工作流",
+  "schema": 1,
+  "loop": [
+    "COMPOSE",
+    "SEND",
+    "WAIT_REPLY",
+    "INTAKE",
+    "REVIEW",
+    "APPLY",
+    "EXECUTE",
+    "VERIFY"
+  ],
+  "holds": [
+    "IDLE",
+    "WAIT_SCHEDULE",
+    "AWAITING_USER",
+    "QUOTA_WAIT",
+    "BLOCKED",
+    "DONE"
+  ],
+  "global_targets": [
+    "BLOCKED",
+    "AWAITING_USER"
+  ],
+  "owners": {
+    "executor": "执行端",
+    "claude": "Claude",
+    "user": "用户",
+    "script": "脚本"
+  },
+  "states": {
+    "IDLE": {
+      "name": "空闲",
+      "owner": "executor",
+      "summary": "没有待发的消息，也没有约定的计划节点。",
+      "how": [
+        "自动推进：wf kick --message <任务文件>（驱动器负责后续）",
+        "手动：wf go COMPOSE",
+        "约定了下次检查时间：wf wait --until <时间> --reason <事由>"
+      ],
+      "entry": [
+        "上一轮验收完成，且没有后续动作"
+      ],
+      "exit": [
+        "用户下达新任务，或出现需要报告的异常"
+      ],
+      "evidence": [],
+      "next": [
+        "COMPOSE",
+        "WAIT_SCHEDULE"
+      ],
+      "problems": [
+        {
+          "id": "ID-1",
+          "symptom": "长时间空闲，但项目其实还有未完成的事",
+          "judge": "PROJECT.md 的“下一步”有未勾选项，且没有计划节点",
+          "action": "设置计划节点（wf wait），或进入 COMPOSE 向 Claude 确认下一步"
+        }
+      ]
+    },
+    "WAIT_SCHEDULE": {
+      "name": "等待计划节点",
+      "owner": "script",
+      "summary": "按约定等待到某个时间点再行动（例如每周对账）。期间项目进程照常运行。",
+      "how": [
+        "到点后：wf go COMPOSE，并执行约定的任务",
+        "需要提前行动：直接 wf go COMPOSE"
+      ],
+      "entry": [
+        "Claude 在回复中约定了下次回报时间，且本轮验收已完成（只能在进入等待后才能观察的清单项，进入后用 wf verify set 事后补记）"
+      ],
+      "exit": [
+        "到达约定时间",
+        "看板上项目进程变红，或出现其他需要提前报告的异常"
+      ],
+      "evidence": [
+        "state.json 中的 until 与 reason"
+      ],
+      "next": [
+        "COMPOSE",
+        "IDLE"
+      ],
+      "problems": [
+        {
+          "id": "WS-1",
+          "symptom": "计划时间已过但没有处理",
+          "judge": "当前时间晚于 until 超过 12 小时",
+          "action": "执行端被唤醒时先运行 wf status；看板会把逾期标红提醒用户"
+        },
+        {
+          "id": "WS-2",
+          "symptom": "等待期间项目进程异常",
+          "judge": "看板项目进程条为红色，或 wf doctor 报告进程未运行",
+          "action": "先在本机恢复进程（按项目文档），再提前进入 COMPOSE，用 high 档回报"
+        }
+      ]
+    },
+    "AWAITING_USER": {
+      "name": "等待用户决定",
+      "owner": "user",
+      "summary": "有只有用户能做的决定（资金、密钥、合规、平台、通道），或待执行命令需要用户批准。",
+      "how": [
+        "用户决定继续：wf approve --note \"决定内容\"（批准待执行的命令、或解除熔断）",
+        "用户不同意：wf pause 后接管"
+      ],
+      "entry": [
+        "评审发现需要用户批准的命令",
+        "Claude 的回复把某个决定列为前置条件"
+      ],
+      "exit": [
+        "用户的决定已用 wf resume 记录"
+      ],
+      "evidence": [
+        "事件记录中的用户决定原文"
+      ],
+      "next": [
+        "COMPOSE",
+        "REVIEW",
+        "APPLY",
+        "EXECUTE",
+        "VERIFY",
+        "IDLE",
+        "WAIT_SCHEDULE"
+      ],
+      "problems": [
+        {
+          "id": "AU-1",
+          "symptom": "用户迟迟没有决定",
+          "judge": "停留超过 24 小时",
+          "action": "不要代为决定。不依赖该决定的工作可以继续（wf resume --to …），看板顶部会持续显示待决定事项"
+        }
+      ]
+    },
+    "COMPOSE": {
+      "name": "组织消息",
+      "owner": "executor",
+      "summary": "写给 Claude 的消息：回报或新任务。每次进入本步，轮次加一。",
+      "how": [
+        "回报：wf report（根据证据自动生成三段式草稿）→ 人工检查补充",
+        "任务：按 templates/task.md 写",
+        "发送前：wf check-outgoing <文件> --kind report|task"
+      ],
+      "entry": [
+        "上一轮验收完成",
+        "用户下达新任务",
+        "需要请 Claude 从断点继续"
+      ],
+      "exit": [
+        "草稿通过 check-outgoing：无密钥、结构完整、写明版本与档位"
+      ],
+      "evidence": [
+        "workflow/outbox/turn-NNN.md",
+        "check-outgoing 结果"
+      ],
+      "max_dwell_s": 3600,
+      "next": [
+        "SEND",
+        "AWAITING_USER",
+        "IDLE"
+      ],
+      "problems": [
+        {
+          "id": "CP-1",
+          "symptom": "草稿含密钥或疑似密钥",
+          "judge": "check-outgoing 的密钥扫描命中",
+          "action": "禁止发送，删除后重新检查。如果密钥曾出现在任何聊天里，立即在交易所作废并重建"
+        },
+        {
+          "id": "CP-2",
+          "symptom": "用转述代替了原文",
+          "judge": "② 段没有终端原文，只有结论",
+          "action": "wf report 会自动嵌入证据原文；人工补充的转述放在原文之后"
+        },
+        {
+          "id": "CP-3",
+          "symptom": "消息过长",
+          "judge": "超过 40000 字符",
+          "action": "长输出只保留关键片段，并写明证据文件路径"
+        },
+        {
+          "id": "CP-4",
+          "symptom": "不确定该用哪个档位",
+          "judge": "—",
+          "action": "有任何异常用 high；方案设计和疑难问题用 max；完全无异常的例行回报用 medium"
+        }
+      ]
+    },
+    "SEND": {
+      "name": "发送",
+      "owner": "executor",
+      "summary": "通过通道把消息发给 Claude。通道操作由执行端自己的桥接工具完成。",
+      "how": [
+        "守卫：先确认上一条回复已经结束（判据由桥接工具定义，见 USAGE.md 第 4 节）",
+        "通道接受消息后立即：wf mark sent --message-file <文件> --kind <类型> --effort <档位> --model <模型>"
+      ],
+      "entry": [
+        "草稿已通过检查",
+        "上一条回复已经结束"
+      ],
+      "exit": [
+        "通道已接受消息（桥接工具拿到生成已开始的凭据）。注意：生成期间消息可能在会话中不可见，不以“可见”为准"
+      ],
+      "evidence": [
+        "消息全文（自动写入 transcript.jsonl）",
+        "发送时的额度（自动读取 usage.json）"
+      ],
+      "max_dwell_s": 900,
+      "max_attempts": 3,
+      "next": [
+        "WAIT_REPLY",
+        "QUOTA_WAIT",
+        "COMPOSE"
+      ],
+      "problems": [
+        {
+          "id": "SD-1",
+          "symptom": "提示代码执行环境被占用",
+          "judge": "先区分两种情况：上一条回复仍在生成（正常），还是没有任何生成的迹象（孤儿锁）",
+          "action": "任何情况下都不得中止进行中的生成。先等待；只有连续 10 分钟被拒、且没有任何生成迹象时，才按孤儿锁处理并记 wf fail --symptom SD-1；第 3 次失败自动进入 BLOCKED",
+          "ledger": "F04"
+        },
+        {
+          "id": "SD-2",
+          "symptom": "发送后在会话中看不到自己的消息",
+          "judge": "生成期间消息可能不落库；以桥接工具的“生成已开始”凭据为准",
+          "action": "不要据此判断消息丢失，更不要重发。有生成凭据就进入 WAIT_REPLY；既无凭据又不可见，才按一次失败记录",
+          "ledger": "F05、F14"
+        },
+        {
+          "id": "SD-3",
+          "symptom": "额度已用尽",
+          "judge": "通道返回额度错误，或 usage.json 显示 100%",
+          "action": "wf go QUOTA_WAIT --until <重置时间>。等待重置，不轮换账户"
+        },
+        {
+          "id": "SD-4",
+          "symptom": "网络错误",
+          "judge": "请求超时或连接失败，且没有生成已开始的凭据",
+          "action": "间隔加倍重试，每次记 wf fail --symptom SD-4"
+        },
+        {
+          "id": "SD-5",
+          "symptom": "上一条回复仍在生成",
+          "judge": "桥接工具的生成判据为真",
+          "action": "不要发送，也不要中止它。等它结束；如果它就是你在等的回复，回到 WAIT_REPLY（wf force WAIT_REPLY --reason …）"
+        }
+      ]
+    },
+    "WAIT_REPLY": {
+      "name": "等待 Claude",
+      "owner": "claude",
+      "summary": "Claude 正在设计、写代码、测试。一轮可能持续几分钟到半小时以上。",
+      "how": [
+        "由桥接工具等待回复结束",
+        "结束后：wf mark replied --reply-file <回复全文文件>"
+      ],
+      "entry": [
+        "消息已在会话中出现"
+      ],
+      "exit": [
+        "回复已结束：桥接工具的生成判据变为假，且会话中出现新的 Claude 消息"
+      ],
+      "evidence": [
+        "回复全文（自动写入 transcript.jsonl 与证据目录）",
+        "等待时长（wf 自动计算，为实测值）"
+      ],
+      "max_dwell_s": 2700,
+      "max_attempts": 2,
+      "next": [
+        "INTAKE",
+        "QUOTA_WAIT",
+        "COMPOSE"
+      ],
+      "problems": [
+        {
+          "id": "WR-0",
+          "symptom": "读取会话看不到消息或回复",
+          "judge": "生成判据仍为真（正在生成）",
+          "action": "继续等待。看不到不等于丢失；只有生成判据为假、且仍看不到回复时，才视为异常",
+          "ledger": "F14"
+        },
+        {
+          "id": "WR-1",
+          "symptom": "很久没有新内容",
+          "judge": "超过 45 分钟",
+          "action": "查看生成判据：仍在生成就继续等，超过 90 分钟记一次失败；两次失败进入 BLOCKED。等待期间不得中止生成"
+        },
+        {
+          "id": "WR-2",
+          "symptom": "回复中断或不完整",
+          "judge": "缺少固定块，或明显在句中结束",
+          "action": "不要整条重发原消息。进入 COMPOSE，发“上一轮在某处中断，请从断点继续”"
+        },
+        {
+          "id": "WR-3",
+          "symptom": "生成途中额度用尽",
+          "judge": "通道返回额度错误",
+          "action": "进入 QUOTA_WAIT；重置后请 Claude 从断点继续"
+        },
+        {
+          "id": "WR-4",
+          "symptom": "出现来源不明的文件",
+          "judge": "输出目录里有不属于本轮回复的文件",
+          "action": "只使用本轮回复明确交付的文件；来源不明的不下载，记入台账",
+          "ledger": "F04"
+        }
+      ]
+    },
+    "INTAKE": {
+      "name": "接收与解析",
+      "owner": "executor",
+      "summary": "解析回复的五个固定块，取回并校验交付文件。",
+      "how": [
+        "wf intake <回复全文文件>（解析【本轮结论】【本机执行】【本轮回报清单】【需要用户决定】【下一轮建议档位】）",
+        "取回交付的 zip 并校验完整性（unzip -t）"
+      ],
+      "entry": [
+        "回复已结束"
+      ],
+      "exit": [
+        "五个固定块齐全，或已确认缺失原因（例如简短确认类回复）",
+        "交付文件已下载且完整"
+      ],
+      "evidence": [
+        "evidence/turn-NNN/intake.json",
+        "文件校验输出"
+      ],
+      "max_dwell_s": 1800,
+      "next": [
+        "REVIEW",
+        "COMPOSE"
+      ],
+      "problems": [
+        {
+          "id": "IN-1",
+          "symptom": "缺少固定块",
+          "judge": "intake 报告缺块",
+          "action": "简短确认类回复可接受（wf go REVIEW）；否则进入 COMPOSE 请 Claude 补全"
+        },
+        {
+          "id": "IN-2",
+          "symptom": "交付文件下载失败或不完整",
+          "judge": "下载报错或 unzip -t 报错",
+          "action": "重试 3 次；仍失败进入 COMPOSE 报告"
+        },
+        {
+          "id": "IN-3",
+          "symptom": "交付版本跳号或回退",
+          "judge": "新版本号不是当前版本的下一个",
+          "action": "先不落地，进入 COMPOSE 询问 Claude"
+        },
+        {
+          "id": "IN-4",
+          "symptom": "回复与上一轮回报对不上",
+          "judge": "回复在回答别的问题，或引用了不存在的结果",
+          "action": "视为上下文异常：附上一轮要点原文请 Claude 确认；持续出现则按 WORKFLOW.md 第 9 节开新对话（wf bootstrap）"
+        }
+      ]
+    },
+    "REVIEW": {
+      "name": "执行前评审",
+      "owner": "executor",
+      "summary": "执行前检查每条命令的风险。资金、密钥、实盘、平台相关命令必须由用户批准。",
+      "how": [
+        "wf review（自动分级：需用户批准 / 谨慎 / 一般）",
+        "确认后：wf review --accept；需要用户批准的：wf review --accept --user-approved \"用户原话\""
+      ],
+      "entry": [
+        "intake 完成"
+      ],
+      "exit": [
+        "评审已接受：没有需要用户批准的命令，或用户已批准"
+      ],
+      "evidence": [
+        "evidence/turn-NNN/review.json"
+      ],
+      "max_dwell_s": 1800,
+      "next": [
+        "APPLY",
+        "EXECUTE",
+        "AWAITING_USER",
+        "VERIFY",
+        "IDLE",
+        "WAIT_SCHEDULE",
+        "COMPOSE"
+      ],
+      "problems": [
+        {
+          "id": "RV-1",
+          "symptom": "命令涉及资金、密钥、实盘或平台切换",
+          "judge": "review 标为“需用户批准”",
+          "action": "进入 AWAITING_USER，不得代为决定"
+        },
+        {
+          "id": "RV-2",
+          "symptom": "命令会删除文件或改写 git 历史",
+          "judge": "review 标为“谨慎”",
+          "action": "确认在 Claude 明确列出的范围内；不在范围内先问"
+        },
+        {
+          "id": "RV-3",
+          "symptom": "命令会重启长期运行的进程",
+          "judge": "review 标为“谨慎”",
+          "action": "确认是否必要（交易代码是否变化），执行后在回报中注明"
+        },
+        {
+          "id": "RV-4",
+          "symptom": "命令与回报清单对不上",
+          "judge": "清单要求的输出没有对应命令",
+          "action": "以回报清单为准补充执行，并在回报 ① 中说明"
+        }
+      ]
+    },
+    "APPLY": {
+      "name": "落地版本",
+      "owner": "script",
+      "summary": "把交付的 zip 应用到项目仓库：先校验、再复制、按清单删除、提交 git 并打标签。",
+      "how": [
+        "wf apply <zip>"
+      ],
+      "entry": [
+        "本轮有交付版本",
+        "评审已接受"
+      ],
+      "exit": [
+        "提交成功，或“没有变化”",
+        "PROJECT.md 校验通过"
+      ],
+      "evidence": [
+        "git 提交号与标签",
+        "变更文件清单（自动记录在事件中）"
+      ],
+      "max_dwell_s": 900,
+      "next": [
+        "EXECUTE",
+        "COMPOSE"
+      ],
+      "problems": [
+        {
+          "id": "AP-1",
+          "symptom": "PROJECT.md 校验未通过",
+          "judge": "wf apply 报告校验问题",
+          "action": "先校验后复制，所以仓库没有被改动。进入 COMPOSE，把校验输出原文回报给 Claude"
+        },
+        {
+          "id": "AP-2",
+          "symptom": "工作区有未提交的改动",
+          "judge": "wf apply 拒绝执行并列出文件",
+          "action": "说明改动来源；由 Claude 决定保留还是丢弃"
+        },
+        {
+          "id": "AP-3",
+          "symptom": "交易代码有变化而相关进程在运行",
+          "judge": "wf apply 给出重启提示",
+          "action": "在 EXECUTE 中按指令重启，并在回报中注明"
+        },
+        {
+          "id": "AP-4",
+          "symptom": "zip 结构异常",
+          "judge": "多个顶层目录、路径越界、缺少 PROJECT.md",
+          "action": "拒绝落地并回报"
+        }
+      ]
+    },
+    "EXECUTE": {
+      "name": "执行与取证",
+      "owner": "executor",
+      "summary": "逐条执行命令。wf exec 在项目根目录运行、自动启用 .venv，并保存命令、输出、退出码和耗时。",
+      "how": [
+        "wf exec -- <命令>（每条命令一次）",
+        "变通执行时：wf note --kind deviation \"做了什么、为什么\""
+      ],
+      "entry": [
+        "评审已接受（有版本时已落地）"
+      ],
+      "exit": [
+        "全部命令已执行，或在失败处停止并记录偏离"
+      ],
+      "evidence": [
+        "evidence/turn-NNN/cNN.json / .out / .err"
+      ],
+      "max_dwell_s": 7200,
+      "next": [
+        "VERIFY",
+        "COMPOSE",
+        "AWAITING_USER"
+      ],
+      "problems": [
+        {
+          "id": "EX-1",
+          "symptom": "命令失败",
+          "judge": "退出码非 0",
+          "action": "能用等价方式变通就变通并记偏离；不能则停止后续依赖命令，进入 VERIFY 如实标记"
+        },
+        {
+          "id": "EX-2",
+          "symptom": "平台差异（macOS 与 Linux）",
+          "judge": "同一代码在 Claude 的测试中通过、在本机失败",
+          "action": "保留原文，不自行改代码，回报给 Claude"
+        },
+        {
+          "id": "EX-3",
+          "symptom": "命令长时间没有输出",
+          "judge": "区分前台常驻程序与卡死",
+          "action": "常驻程序按指令 Ctrl+C；卡死则中断并记录"
+        },
+        {
+          "id": "EX-4",
+          "symptom": "系统拦截删除等操作",
+          "judge": "报权限或安全守卫错误",
+          "action": "用等价方式（如 mv）并记偏离",
+          "ledger": "F09"
+        }
+      ]
+    },
+    "VERIFY": {
+      "name": "验收",
+      "owner": "executor",
+      "summary": "对照回报清单逐项给出结论和证据。",
+      "how": [
+        "wf verify list",
+        "wf verify set <序号> pass|fail|deviation|skip --evidence <cNN> --note \"…\""
+      ],
+      "entry": [
+        "执行结束"
+      ],
+      "exit": [
+        "回报清单的每一项都有结论"
+      ],
+      "evidence": [
+        "evidence/turn-NNN/verify.json"
+      ],
+      "max_dwell_s": 3600,
+      "next": [
+        "COMPOSE",
+        "WAIT_SCHEDULE",
+        "IDLE",
+        "DONE"
+      ],
+      "problems": [
+        {
+          "id": "VF-1",
+          "symptom": "结果与预期不符",
+          "judge": "清单项标为 fail",
+          "action": "如实标记；回报用 high 档"
+        },
+        {
+          "id": "VF-2",
+          "symptom": "清单项暂时无法验证",
+          "judge": "时间未到、依赖外部条件",
+          "action": "标 skip 并写明原因"
+        },
+        {
+          "id": "VF-3",
+          "symptom": "发现清单之外的新异常",
+          "judge": "—",
+          "action": "wf note --kind deviation 记录；回报用 high 档"
+        },
+        {
+          "id": "VF-4",
+          "symptom": "全部通过，且 Claude 约定了下次回报时间",
+          "judge": "—",
+          "action": "wf wait --until <约定时间> --reason <事由>"
+        },
+        {
+          "id": "VF-5",
+          "symptom": "清单项只能在状态转换之后才能观察（例如进入等待后看板的显示）",
+          "judge": "该项的验收对象是转换后的状态",
+          "action": "先完成转换（如 wf wait），再在等待状态下用 wf verify set 事后补记；回报草稿照常生成"
+        }
+      ]
+    },
+    "QUOTA_WAIT": {
+      "name": "等待额度重置",
+      "owner": "script",
+      "summary": "额度用尽，等待窗口重置。标准动作是等待，不轮换账户。",
+      "how": [
+        "重置后消息未送达：wf go SEND",
+        "回复被截断：wf go COMPOSE，请 Claude 从断点继续"
+      ],
+      "entry": [
+        "发送或生成时额度用尽"
+      ],
+      "exit": [
+        "额度已重置"
+      ],
+      "evidence": [
+        "state.json 中的 until（重置时间）"
+      ],
+      "max_attempts": 2,
+      "next": [
+        "SEND",
+        "COMPOSE"
+      ],
+      "problems": [
+        {
+          "id": "QW-1",
+          "symptom": "重置后仍无法发送",
+          "judge": "通道仍报额度错误",
+          "action": "刷新额度数据确认；仍异常记 wf fail，两次后进入 BLOCKED"
+        },
+        {
+          "id": "QW-2",
+          "symptom": "等待期间发生紧急情况",
+          "judge": "项目进程中断等",
+          "action": "先在本机按项目文档处理，回报留到重置后发送"
+        }
+      ]
+    },
+    "BLOCKED": {
+      "name": "阻塞",
+      "owner": "user",
+      "summary": "某一步失败次数超限，或出现必须人工处理的情况。",
+      "how": [
+        "查原因：wf status（显示进入阻塞前的步骤、失败记录、该步的处置表）",
+        "排除后：wf unblock --to <状态> --note \"做了什么\""
+      ],
+      "entry": [
+        "某一步失败次数达到上限（自动）",
+        "手动：wf block --reason …"
+      ],
+      "exit": [
+        "原因已排除并已记录"
+      ],
+      "evidence": [
+        "失败事件与解除说明"
+      ],
+      "next": [
+        "IDLE",
+        "COMPOSE",
+        "SEND",
+        "WAIT_REPLY",
+        "INTAKE",
+        "REVIEW",
+        "APPLY",
+        "EXECUTE",
+        "VERIFY",
+        "WAIT_SCHEDULE",
+        "QUOTA_WAIT",
+        "AWAITING_USER"
+      ],
+      "problems": [
+        {
+          "id": "BL-1",
+          "symptom": "不清楚卡在哪里",
+          "judge": "—",
+          "action": "看 wf status 或看板：会显示进入阻塞前的步骤、最近的失败原因和该步的异常处置表"
+        }
+      ]
+    },
+    "DONE": {
+      "name": "目标达成",
+      "owner": "user",
+      "summary": "全部目标判据已通过（可执行判据由检查命令判定，人工判据由用户确认），而且目标定义已获用户批准。自动化停在这里。",
+      "how": [
+        "查看看板“目标”与证据",
+        "需要继续推进（例如新的目标）：更新目标并获批准后 wf kick --message <任务文件>"
+      ],
+      "entry": [
+        "验收后运行目标检查，全部通过"
+      ],
+      "exit": [
+        "用户开始新的任务"
+      ],
+      "evidence": [
+        "workflow/goals_state.json",
+        "evidence/goals/"
+      ],
+      "next": [
+        "COMPOSE",
+        "IDLE"
+      ],
+      "problems": [
+        {
+          "id": "DN-1",
+          "symptom": "达成后又发现问题",
+          "judge": "用户验收不通过",
+          "action": "用户 wf kick 附上问题描述，驱动器继续迭代"
+        }
+      ]
+    }
+  }
+}

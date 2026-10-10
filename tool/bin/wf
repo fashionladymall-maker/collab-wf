@@ -1,0 +1,3 @@
+#!/bin/sh
+# collab-wf 启动器：把 collab-wf/bin 加入 PATH 即可在任意位置使用 wf（不要用符号链接）
+exec python3 "$(dirname "$0")/../wf.py" "$@"
