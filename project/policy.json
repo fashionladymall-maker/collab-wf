@@ -1,0 +1,35 @@
+{
+  "_说明": "collab-wf-dev 的自动执行白名单（正则，匹配整条命令）。只有用户批准后才生效；任何改动都需要重新批准。内置停止底线与护栏命令不受本文件影响。",
+  "allow": [
+    "^wf (version|fingerprint|doctor|status|explain|bridge-check|goals|audit|self-check)( |$)",
+    "^(/Users/admin/\\.workbuddy-ai/binaries/python/versions/3\\.13\\.12/bin/)?python3 (build_wf_[0-9]+\\.py|workflow/evidence/turn-[0-9]+/delivered/build_wf_[0-9]+\\.py) --out workflow/outbox$",
+    "^wf self-update --auto workflow/outbox/collab-wf-[0-9]+\\.[0-9]+\\.[0-9]+\\.zip$",
+    "^git (log|status|diff|show)( |$)",
+    "^git -C /Users/admin/\\.workbuddy-ai/tools/collab-wf (log|status|diff|show|ls-tree)( |$)",
+    "^(?!.*\\.\\.)(?!.*/\\.(?!workbuddy-ai/tools/collab-wf/))(?!.*collab-wf/local/)(cat|head|tail|wc)( -n [0-9]+| -l)? (/Users/admin/\\.workbuddy-ai/tools/collab-wf/|[A-Za-z0-9_])[A-Za-z0-9_./-]*$",
+    "^(?!.*\\.\\.)(?!.*/\\.(?!workbuddy-ai/tools/collab-wf/))(?!.*collab-wf/local/)sed -n [0-9]+,[0-9]+p (/Users/admin/\\.workbuddy-ai/tools/collab-wf/|[A-Za-z0-9_])[A-Za-z0-9_./-]*$",
+    "^(?!.*\\.\\.)(?!.*/\\.(?!workbuddy-ai/tools/collab-wf/))(?!.*collab-wf/local/)grep -n( -[ABC] [0-9]+)? [^-\\s;&<>`$|\\\\'\\\"][^\\s;&<>`$|\\\\'\\\"]* (/Users/admin/\\.workbuddy-ai/tools/collab-wf/|[A-Za-z0-9_])[A-Za-z0-9_./-]*$"
+  ],
+  "pipe_filters": [
+    "head",
+    "tail",
+    "grep",
+    "wc",
+    "sort",
+    "uniq",
+    "cut"
+  ],
+  "diff_stop": [],
+  "auto_apply": true,
+  "auto_self_update": true,
+  "max_rounds_per_day": 24,
+  "max_consecutive_failed_rounds": 3,
+  "max_rounds_without_goal_progress": 8,
+  "command_timeout_s": 1800,
+  "first_poll_after_s": 120,
+  "poll_interval_s": 120,
+  "max_conversation_turns": 20,
+  "send_unknown_wait": true,
+  "max_leaf_refusals": 0,
+  "gates": []
+}
