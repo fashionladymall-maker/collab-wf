@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 58 轮 · 等待 Claude（WAIT_REPLY）
+第 59 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
-- 工具：collab-wf 1.6.5
-- 项目：v2.0；35fc773 (HEAD -> main) Mark executor watchdog and wake integration complete
-- 仓库指纹：f7a603aa5b35b818（7 个文件）
+- 工具：collab-wf 1.6.6
+- 项目：v2.1；ac15eae (HEAD -> main, tag: v2.1) release v2.1
+- 仓库指纹：232ec63bff52c2d0（7 个文件）
 
 ## 最近一轮
-- 第 57 轮验收通过（2026-10-10T16:36:04+00:00）
-- 本方最新消息：`turns/turn-058.md`
-- Claude 最新回复：`replies/reply-057.md`
+- 第 58 轮验收通过（2026-10-10T17:31:34+00:00）
+- 本方最新消息：`turns/turn-059.md`
+- Claude 最新回复：`replies/reply-058.md`
 
 ## 目标
 - 进度 4 / 7
@@ -26,5 +26,5 @@
 - 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.5.zip`
-- `artifacts/collab-wf-dev-v2.0.zip`
+- `artifacts/collab-wf-1.6.6.zip`
+- `artifacts/collab-wf-dev-v2.1.zip`

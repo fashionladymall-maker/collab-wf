@@ -114,7 +114,7 @@ def collect_inbox(projects) -> list:
             rows = [{"key": f"{inst.name}|{it['code']}", "project": inst.name, "for": route(it), "title": it["title"],
                      "why": it["why"], "action": it["command"], "code": it["code"]} for it in asks.pending(inst)]
             rows += [{"key": f"{inst.name}|{n['key']}", "project": inst.name, "for": route(n), "title": n["title"],
-                      "why": n["why"], "action": "", "code": ""} for n in asks.notices(inst)]
+                      "why": n["why"], "action": n.get("action") or "", "code": ""} for n in asks.notices(inst)]
         except Exception:   # noqa: BLE001  某个项目读不出来，不影响其他项目
             continue
         out += rows

@@ -83,6 +83,10 @@ def notices(inst: Instance) -> list:
     if s.get("stuck"):
         out.append({"key": f"stuck:{s['state']}:{s['since']}", "title": f"“{s['name']}”停留超过上限",
                     "why": "驱动器会按异常处置表处理；若一直这样，看板会显示原因"})
+    for t in (inst.state.get("executor_tasks") or []):   # 1.6.6：写给执行端的待办，做完前一直在 inbox 里
+        if not t.get("done"):
+            out.append({"key": f"task:{t['id']}", "title": f"执行端待办 {t['id']}", "why": t.get("text") or "",
+                        "action": f"做完后：wf task done {t['id']} --note \"结果\""})
     from .heartbeat import driver_health   # 1.5.6：驱动器停了要让用户知道（手写循环会静默退出）
     hb = driver_health(inst)
     if hb["status"] == "stale":

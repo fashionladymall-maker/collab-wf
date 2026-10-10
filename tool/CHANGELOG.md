@@ -1,5 +1,15 @@
 # CHANGELOG（collab-wf）
 
+## 1.6.6 — 2026-10-10
+
+执行端待办可以追踪（collab-wf-dev 第 58 轮：正文里写给执行端的事做完了却没人接上回报，流程停在空闲，看门狗也看不见）。
+- 【驱动指令】新增“执行端 N：<事项>”与“之后：等执行端”。驱动器验收后把待办登记为 T<轮次>-<序号>，进 inbox（交给执行端，超过 2 小时转给用户）。
+- 新增 wflib/tasks.py 与 wf task [list] | wf task done <编号> --note "结果"：完成结果写进回报，事件记 by=executor。
+- 有未完成的待办时，“之后：等执行端 / 空闲”改为等待，全部做完自动生成回报并发出，不再需要 wf kick；到最迟时间（policy 的 executor_task_timeout_s，默认 4 小时）照常回报并列出没做完的。
+- policy：executor_task_timeout_s、landed_confirm_polls、landed_poll_s 归为时间参数，改动不算扩大权限。
+- 文档：DRIVER.md 第 5、24 节，WORKFLOW.md 第 5 节。
+- 自检新增 3 项（解析与登记、等待后自动回报、到期照常回报）；原有检查没有删改。本版不改 floor.py。
+
 ## 1.6.5 — 2026-10-10
 
 卡死与错误都进 inbox（collab-wf-dev 用户第 53 轮：“任何一个环节卡死，我希望都有信息到 inbox”），以及第 52 轮暴露的发送缺口（W42、W43）。

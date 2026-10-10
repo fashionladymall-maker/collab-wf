@@ -1041,6 +1041,37 @@ def _t_v165_executor_decision(_ok):
         and '"by": "executor"' in ev and '"ABC"' not in ev, ev[-400:])
 
 
+def _t_v166_tasks(_ok):
+    from . import tasks
+    from .core import Instance, WfError
+    d = ops.parse_directives("发布：无\n执行端 1：把看门狗改成 wf watchdog --write\n2. 执行端 2：回报：结果\n之后：等执行端\n")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "proj"
+        (root / "workflow").mkdir(parents=True)
+        (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"v166-t-{os.getpid()}"}), encoding="utf-8")
+        (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+        inst = Instance(root)
+        inst.state.update(state="VERIFY", turn=5)
+        inst.save()
+        a1 = tasks.add(inst, 5, d["executor_tasks"])
+        a2 = tasks.add(inst, 5, d["executor_tasks"])   # 同一项不重复登记
+        t = tasks.done(inst, "t5-1", "已改好")
+        left = [x["id"] for x in tasks.open_items(inst)]
+        errs = 0
+        for tid in ("T5-1", "T9-9"):
+            try:
+                tasks.done(inst, tid, "")
+            except WfError:
+                errs += 1
+        notes = (inst.turn_dir() / "notes.jsonl").read_text(encoding="utf-8")
+        ev = (root / "workflow" / "events.jsonl").read_text(encoding="utf-8")
+    _ok("1.6.6 执行端待办：驱动指令“执行端 N：”与“之后：等执行端”能解析；登记不重复、编号 T<轮>-<序>、完成写进备注并记 by=executor",
+        d["executor_tasks"] == {"1": "把看门狗改成 wf watchdog --write", "2": "回报：结果"} and d["after"] == "executor"
+        and not d["errors"] and len(a1) == 2 and a2 == [] and t["id"] == "T5-1" and left == ["T5-2"] and errs == 2
+        and "执行端待办 T5-1 已完成" in notes and '"task_done"' in ev and '"by": "executor"' in ev,
+        json.dumps([d, left, errs], ensure_ascii=False)[:500])
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -1059,7 +1090,7 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.3 开新对话的短消息", _t_v163_bootstrap_short),
          ("1.6.4 驱动器自己开新对话", _t_v164_newconv),
          ("1.6.5 外部信号与升级", _t_v165_signals), ("1.6.5 看门狗", _t_v165_watchdog),
-         ("1.6.5 执行端代决", _t_v165_executor_decision)]
+         ("1.6.5 执行端代决", _t_v165_executor_decision), ("1.6.6 执行端待办", _t_v166_tasks)]
 
 
 def run_v15(_ok) -> None:

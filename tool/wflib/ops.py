@@ -170,12 +170,12 @@ def list_execs(inst: Instance, turn=None) -> list:
 # ---------------- 解析回复 ----------------
 
 def parse_directives(body: str) -> dict:
-    """解析【驱动指令】块。每行“键：值”，键为 发布 / 之后 / 验收 N / 指纹 / 超时 / 失败后继续。"""
+    """解析【驱动指令】块。每行“键：值”，键为 发布 / 之后 / 验收 N / 执行端 N / 指纹 / 超时 / 失败后继续。"""
     d = {"release": None, "after": None, "until": None, "wait_reason": None, "checks": {}, "fingerprint": None,
-         "timeout": None, "continue_on_error": False, "errors": []}
+         "timeout": None, "continue_on_error": False, "errors": [], "executor_tasks": {}}
     for raw in body.splitlines():
         line = fidelity.directive_line(raw)   # 1.5.0：容忍行首编号、加粗与“本轮之后”
-        m = re.match(r"^(发布|之后|验收\s*\d+|指纹|超时|失败后继续)\s*[:：]\s*(.*)$", line)
+        m = re.match(r"^(发布|之后|验收\s*\d+|执行端\s*\d+|指纹|超时|失败后继续)\s*[:：]\s*(.*)$", line)
         if not m:
             continue
         d["_keys"] = d.get("_keys", 0) + 1
@@ -193,8 +193,16 @@ def parse_directives(body: str) -> dict:
                 d["after"] = "report"
             elif val.startswith("空闲"):
                 d["after"] = "idle"
+            elif val.startswith("等执行端"):   # 1.6.6：等执行端待办做完，自动回报
+                d["after"] = "executor"
             else:
                 d["errors"].append(f"无法解析：{line}")
+        elif key.startswith("执行端"):   # 1.6.6：写给执行端的待办（第 58 轮：正文里的事做完了没人接）
+            n = int(re.sub(r"\D", "", key))
+            if val:
+                d["executor_tasks"][str(n)] = val
+            else:
+                d["errors"].append(f"执行端 {n} 没有写事项：{line}")
         elif key.startswith("验收"):
             n = int(re.sub(r"\D", "", key))
             cm = re.search(r"\bc(\d+)\b", val)

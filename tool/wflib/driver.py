@@ -296,9 +296,30 @@ def h_user(ctx):
     return "user", s.get("needs_text") or s.get("block_reason") or "等待用户"
 
 
+def _wait_executor(ctx, until):
+    """1.6.6：等执行端把待办做完；全部做完、或到了最迟时间，自动生成本轮回报。"""
+    from . import tasks as _tasks
+    inst, st = ctx.inst, ctx.st
+    left = _tasks.open_items(inst)
+    if left and until and now() < until:
+        return "wait", f"等执行端完成 {len(left)} 项待办：" + "；".join(f"{t['id']} {t['text'][:30]}" for t in left[:3])
+    st.pop("await_executor", None)
+    if left:
+        ops.add_note(inst, "deviation", "执行端待办到最迟时间仍未完成：" + "；".join(f"{t['id']}（{t['text'][:60]}）" for t in left),
+                     by="driver")
+    inst.save()
+    decide(inst, "after", "执行端待办已全部完成，自动生成回报" if not left else "执行端待办到最迟时间仍未完成，照常回报",
+           "", "", "回报")
+    return _to_report(ctx)
+
+
 def h_wait_schedule(ctx):
     st = ctx.st
     until = parse_iso(st.get("until"))
+    if st.get("await_executor") is not None:   # 1.6.6
+        if st["await_executor"] == st.get("turn"):
+            return _wait_executor(ctx, until)
+        st.pop("await_executor", None)   # 早先一轮留下的标记（中间有人 wf kick 过），作废
     if until and now() < until:
         return "wait", f"等待计划节点 {until.isoformat(timespec='minutes')}：{st.get('wait_reason') or ''}"
     reason = st.get("wait_reason") or "计划节点"
@@ -1103,8 +1124,24 @@ def h_verify(ctx):
     np_limit = int(ctx.pol.get("max_rounds_without_goal_progress", 8))
     if prog.get("approved") and st.get("rounds_no_progress", 0) >= np_limit:
         return _breaker(ctx, f"连续 {st['rounds_no_progress']} 轮目标没有进展（policy.max_rounds_without_goal_progress = {np_limit}）")
+    from . import tasks as _tasks
+    _tasks.add(inst, st["turn"], d.get("executor_tasks") or {})   # 1.6.6：写给执行端的事登记成可追踪的待办（进 inbox）
     after = d.get("after") or "report"
     if round_failed or exec_failed:
+        after = "report"
+    left = _tasks.open_items(inst)
+    if after in ("idle", "executor") and left:
+        # 1.6.6（第 58 轮）：有执行端待办时不进空闲：等它们做完自动生成回报（此前要执行端记得 wf kick，漏了就停在空闲）
+        lim = int(ctx.pol.get("executor_task_timeout_s", 0) or 0) or _tasks.TIMEOUT_S
+        until = now() + timedelta(seconds=lim)
+        _clear_turn(inst)
+        st["await_executor"] = st["turn"]
+        decide(inst, "after", f"等执行端完成 {len(left)} 项待办，做完自动回报", "Claude 的【驱动指令】列了执行端待办",
+               "；".join(t["id"] for t in left), f"最迟等到 {until.isoformat(timespec='minutes')}")
+        machine.go(inst, "WAIT_SCHEDULE", by="driver", reason="等执行端完成待办", until=until.isoformat(),
+                   wait_reason="执行端待办")
+        return "progress", f"验收通过，等执行端完成 {len(left)} 项待办（最迟 {until.isoformat(timespec='minutes')}）"
+    if after == "executor":
         after = "report"
     if after == "wait":
         until = parse_iso(d.get("until"))

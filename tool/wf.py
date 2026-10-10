@@ -65,6 +65,7 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf said --text "…" [--kind chat]   逐字记下用户的原话（看板“对话记录”里的“用户”）
   wf signal add|clear|list …         外部信号：把错误、卡死、疑难投进 inbox（--key --title [--why] [--for executor|user] [--ttl 秒]）
   wf watchdog [--write]              卡死判定（只读）；--write 写成信号并重写 inbox，由独立于驱动器的定时进程调用
+  wf task [list] | wf task done <编号> --note "结果"   执行端待办（Claude 在驱动指令里写“执行端 N：…”，做完逐项勾掉）
   wf notify test | status            系统通知：发一条测试通知 / 查看是否开启（wf tick 跑完后自动通知新的待决事项）
   wf sync [--dry-run] [--force]      项目上下文同步到执行端配置的仓库（docs/SYNC.md）
   wf snapshot <文件,…> [--max-chars N] [--out F]   按 Claude 的要求生成有界的文件包
@@ -347,6 +348,8 @@ def main(argv=None):
                                                                                  choices=["executor", "user"])
     x.add_argument("--action-text", dest="action_text", default=""); x.add_argument("--ttl", type=int, default=0)
     x = sub.add_parser("watchdog"); x.add_argument("--write", action="store_true")
+    x = sub.add_parser("task"); x.add_argument("action", nargs="?", default="list", choices=["list", "done"])
+    x.add_argument("tid", nargs="?"); x.add_argument("--note", default="")
     x = sub.add_parser("transport"); x.add_argument("action", nargs="?", default="check", choices=["check", "test"])
     sub.add_parser("effort")
     x = sub.add_parser("decisions"); x.add_argument("--n", type=int, default=40); x.add_argument("--turn", type=int)
@@ -741,6 +744,25 @@ def main(argv=None):
                     print(f"{r['key']}  [{r.get('for')}] {r.get('title')}：{r.get('why') or ''}（自 {r.get('since')}，来源 {r.get('source')}）")
                 if not rows:
                     print("没有信号")
+    elif c == "task":
+        from wflib import tasks
+        inst = _p(args)
+        if args.action == "done":
+            if not args.tid:
+                raise WfError("用法：wf task done <编号> --note \"结果\"（wf task 列出未完成的待办）")
+            t = tasks.done(inst, args.tid, args.note)
+            left = tasks.open_items(inst)
+            print(f"已完成 {t['id']}；" + (f"还有 {len(left)} 项未完成" if left else
+                                           "全部待办已完成" + ("，驱动器下次运行时自动生成回报" if inst.state.get("await_executor") is not None else "")))
+        else:
+            rows = inst.state.get("executor_tasks") or []
+            if args.json:
+                out({"tasks": rows})
+            else:
+                for t in rows:
+                    print(f"{'✓' if t.get('done') else '○'} {t['id']}  {t['text']}" + (f"  —— {t['note']}" if t.get("note") else ""))
+                if not rows:
+                    print("没有执行端待办")
     elif c == "watchdog":
         from wflib import watchdog
         from wflib.core import Instance

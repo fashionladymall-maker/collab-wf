@@ -319,6 +319,40 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _ok("1.6.5 发送间隔：上一条回复刚落地时不立即发下一条，等满 min_send_gap_s（W42）",
         sg["state"] == "SEND" and bool(sg.get("replied_at")) and bool(sg.get("retry_at")) and "等满" in o, o)
 
+    # B5. 1.6.6：写给执行端的待办可追踪：之后为空闲时不进空闲，等执行端 wf task done 后自动回报
+    et = setup("etask", base_pol)
+    _wf(env, et, "kick", "--message", str(task))
+    _wf(env, et, "run")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"],
+        "发布：无\n执行端 1：测试：把看门狗接上\n之后：空闲\n验收 1：c1 exit=0"), encoding="utf-8")
+    rc, o = _wf(env, et, "run")
+    waiting = _state(et)["state"] == "WAIT_SCHEDULE"
+    rc, oa = _wf(env, et, "--json", "ask")
+    rc6, o6 = _wf(env, et, "task", "done", "T1-1", "--note", "测试：已接上")
+    rc7, o7 = _wf(env, et, "run")
+    sent5 = sorted((fake / "inbox").glob("*-etask-*.md"))
+    last5 = sent5[-1].read_text(encoding="utf-8") if sent5 else ""
+    _ok("1.6.6 执行端待办：之后为空闲时不进空闲而是等待、待办进 inbox；wf task done 后驱动器自动生成并发出回报，回报带完成说明",
+        waiting and "task:T1-1" in oa and rc6 == 0 and _state(et)["state"] == "WAIT_REPLY"
+        and "测试：已接上" in last5 and "T1-1" in last5, o + oa + o6 + o7)
+
+    # B6. 1.6.6：执行端待办到最迟时间仍未完成：照常生成回报，并写明未完成的待办
+    et2 = setup("etask2", {**base_pol, "executor_task_timeout_s": 1})
+    _wf(env, et2, "kick", "--message", str(task))
+    _wf(env, et2, "run")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"],
+        "发布：无\n执行端 1：测试：一件没做完的事\n之后：等执行端\n验收 1：c1 exit=0"), encoding="utf-8")
+    rc, o = _wf(env, et2, "run")
+    w2 = _state(et2)["state"] == "WAIT_SCHEDULE"
+    __import__("time").sleep(1.5)
+    rc, o2 = _wf(env, et2, "run")
+    sent6 = sorted((fake / "inbox").glob("*-etask2-*.md"))
+    last6 = sent6[-1].read_text(encoding="utf-8") if sent6 else ""
+    _ok("1.6.6 执行端待办到最迟时间仍未完成：照常生成回报并写明未完成的待办",
+        w2 and _state(et2)["state"] == "WAIT_REPLY" and "仍未完成" in last6 and "T1-1" in last6, o + o2)
+
     # C. 独立审查适配器认为应阻止 → 停下等用户
     rv = tmp / "t-review"
     rv.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：发现问题"]}\'\n')

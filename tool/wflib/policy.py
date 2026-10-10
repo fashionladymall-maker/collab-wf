@@ -110,7 +110,8 @@ def classify(cmd: str, pol: dict) -> dict:
 # 1.6.1：不扩大权限的白名单与目标变更由驱动器自动批准（用户第 35 轮：把“需要执行端做的事”降到零）。
 # 判定：新内容给驱动器的能力不多于已批准的旧内容。四道底线在 floor.py，与这里无关；扩大权限的变更照旧停下等用户。
 NEUTRAL_KEYS = {"_说明", "first_poll_after_s", "poll_interval_s", "send_unknown_wait", "page_screenshots", "stale_reply_polls",
-                "min_send_gap_s"}   # 1.6.5：发送间隔只是时间参数
+                "min_send_gap_s",   # 1.6.5：发送间隔只是时间参数
+                "executor_task_timeout_s", "landed_confirm_polls", "landed_poll_s"}   # 1.6.6：同为时间参数
 UPPER_LIMITS = ("max_rounds_per_day", "max_consecutive_failed_rounds", "max_rounds_without_goal_progress",
                 "command_timeout_s", "max_leaf_refusals")
 ZERO_IS_UNLIMITED = ("max_conversation_turns", "max_conversation_chars")
