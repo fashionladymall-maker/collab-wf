@@ -31,5 +31,8 @@
   "max_conversation_turns": 20,
   "send_unknown_wait": true,
   "max_leaf_refusals": 0,
-  "gates": []
+  "gates": [],
+  "landed_confirm_polls": 45,
+  "landed_poll_s": 60,
+  "auto_new_conversation": true
 }
