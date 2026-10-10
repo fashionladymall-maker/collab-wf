@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 57 轮 · 空闲（IDLE）
+第 58 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.6.5
@@ -9,7 +9,7 @@
 
 ## 最近一轮
 - 第 57 轮验收通过（2026-10-10T16:36:04+00:00）
-- 本方最新消息：`turns/turn-057.md`
+- 本方最新消息：`turns/turn-058.md`
 - Claude 最新回复：`replies/reply-057.md`
 
 ## 目标
