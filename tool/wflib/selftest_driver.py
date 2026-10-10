@@ -99,7 +99,7 @@ def run(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _ok("白名单外的命令：停下等用户（退出码 20），并说明需要批准什么", rc == 20 and _state(p)["state"] == "AWAITING_USER"
         and "rm -rf build" in o and "不在已批准的命令白名单" in o, o)
     rc, o = _wf(env, p, "explain")
-    _ok("explain 回答卡在哪、为什么、需要谁做什么", "现在：" in o and "需要：用户" in o, o)
+    _ok("explain 回答卡在哪、为什么、需要谁做什么", "现在：" in o and "需要：执行端" in o, o)   # 1.6.5：与 inbox 路由一致（白名单外命令先交执行端）
     (fake / "next_send_code").write_text("3")
     (fake / "replies" / "3.md").write_text(_reply(["cat done.txt"], ["done.txt 内容"],
         "发布：auto-v0.3.zip\n之后：回报\n验收 1：c1 exit=0 包含 \"ok\""), encoding="utf-8")
@@ -308,6 +308,17 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
         and rep3.exists() and rep3.read_text(encoding="utf-8").startswith("【回报"), o)
     (local / "transport.json").write_text(json.dumps(tcfg))
 
+    # B4. 1.6.5（W42）：上一条回复刚落地时不立即发下一条，等满 min_send_gap_s
+    gp = setup("gap", {**base_pol, "min_send_gap_s": 3600})
+    _wf(env, gp, "kick", "--message", str(task))
+    _wf(env, gp, "run")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"], "发布：无\n之后：回报\n验收 1：c1 exit=0"), encoding="utf-8")
+    rc, o = _wf(env, gp, "run")
+    sg = _state(gp)
+    _ok("1.6.5 发送间隔：上一条回复刚落地时不立即发下一条，等满 min_send_gap_s（W42）",
+        sg["state"] == "SEND" and bool(sg.get("replied_at")) and bool(sg.get("retry_at")) and "等满" in o, o)
+
     # C. 独立审查适配器认为应阻止 → 停下等用户
     rv = tmp / "t-review"
     rv.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：发现问题"]}\'\n')
@@ -475,6 +486,19 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     (fake / "poll_never").unlink()
     _ok("独立落地核对：send 报已接受但消息始终不出现 → 连续 none 后停下（缺口 11/§3）",
         _state(nl)["state"] == "BLOCKED" and "SEND_NOT_LANDED" in (o1 + o2 + o3), o2 + o3)
+    # C2b. 1.6.5（W43）：没落地的消息用 wf resend 恢复并重发；执行端代决（--by executor --reason），如实记 by=executor
+    rc, oa = _wf(env, nl, "--json", "ask")
+    try:
+        nl_items = json.loads(oa[oa.index("{"):])["items"]
+    except (ValueError, KeyError):
+        nl_items = []
+    nl_code = next((it["code"] for it in nl_items if it["kind"] == "unblock"), "NONE")
+    rc4, o4 = _wf(env, nl, "resend", "--code", nl_code, "--by", "executor", "--reason", "测试：执行端核对过会话，这条确实没有落地")
+    rc5, o5 = _wf(env, nl, "run")
+    evn = (nl / "workflow" / "events.jsonl").read_text(encoding="utf-8")
+    _ok("1.6.5 发送后没有落地：wf resend 由执行端代决恢复本轮消息并重新发送，事件如实记 by=executor（W43）",
+        rc4 == 0 and _state(nl)["state"] == "WAIT_REPLY" and '"resend_not_landed"' in evn and '"executor_decision"' in evn
+        and '"by": "executor"' in evn, o4 + o5)
     (local / "transport.json").write_text(json.dumps(tcfg))
 
     # 手动发送登记 ref → 驱动器从 WAIT_REPLY 接管

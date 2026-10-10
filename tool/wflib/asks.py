@@ -108,6 +108,22 @@ def verify(inst: Instance, kind: str, code: str) -> dict:
     raise WfError(f"决定码“{code}”与当前待决事项不符，或已过期。当前待决事项：{cur}")
 
 
+def executor_decision(inst: Instance, kind: str, item: dict, reason: str) -> str:
+    """1.6.5（W43）：执行端代决。依据用户第 44 轮的决策顺位：原本要用户决定的事，先由执行端判断、决定并执行，
+    做不到的才交给用户。只限交给执行端的事项（notify.route）；四道底线、撤销暂停、目标达成仍只认用户原话。
+    事件如实记 by=executor（M1 判据把它算作人工动作）。返回写进记录的说明。"""
+    from . import notify, roles
+    reason = (reason or "").strip()
+    if not reason:
+        raise WfError("执行端代决需要 --reason：写明执行端为什么这样决定")
+    if notify.route(item) != "executor":
+        raise WfError("这件事必须由用户决定（四道底线、撤销暂停或目标达成），执行端不能代决：请转告用户，用 --said 记下用户原话")
+    inst.event("executor_decision", kind=kind, code=item["code"], reason=reason[:500], title=item["title"], by="executor")
+    roles.decide(inst, "executor", f"{item['title']}（决定码 {item['code']}）", f"执行端代决：{reason[:300]}", "", "已执行",
+                 by="executor")
+    return f"执行端代决：{reason}"
+
+
 def render(inst: Instance, it: dict) -> str:
     s = machine.status(inst)
     alt = "；或回复：" + "、".join(f"「{r}」" for r in it["reply"][1:]) if len(it["reply"]) > 1 else ""

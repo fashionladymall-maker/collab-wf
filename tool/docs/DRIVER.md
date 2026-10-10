@@ -247,3 +247,26 @@ collab-wf-dev 第 44 轮，执行端按用户的决策顺位（“交由人工�
 - 失败：恢复包没有生成、续接消息没通过检查、conv_new 失败，都不切换，退回原来的做法（CONTEXT_FULL，停下等人），详情写明原因。conv_new 调用超时属于结果不明（可能已经建好），保留意图、不再自动重试，避免重复建对话；之后人工开了新对话（wf conv new）、计数归零，意图自动作废。
 - 顺序：交接消息与本轮消息合成一条，等它的回复落地才会发下一条，不会出现“上一条还在生成又发一条”（collab-wf-dev W39）。
 - M1：自动开新对话的那一轮没有人工事件，无人值守的连续段可以跨对话。
+
+## 23. 1.6.5 卡死与错误都进 inbox；发送间隔；没落地的重发；执行端代决
+
+collab-wf-dev 用户第 53 轮：“我希望各类驱动器，各类错误，各类需要人工执行的，需要执行器执行的，都发到 inbox……任何一个环节卡死，我希望都有信息到 inbox，并通知你解决。”
+
+- 外部信号：`wf signal add --key <键> --title <标题> [--why …] [--for executor|user] [--ttl 秒]`、`wf signal clear --key <键>`、`wf signal list`。信号存在 local/signals/，由写 inbox 的同一处合并（inbox 里的 key 为 `signal|<键>`），所以独立进程投递的信号不会被下一次 wf tick 冲掉；处理掉后清除，带 --ttl 的到期自动丢弃。
+- 看门狗：`wf watchdog [--json] [--write]`，纯只读判定。--write 把每项结果写成 `watchdog:<项目>:<检查>` 信号、恢复后自动清除，并立即重写 inbox（驱动器停了、wf tick 不再运行时也能写进去）。它由独立于驱动器的定时进程调用：驱动器卡死时自己报不出来。阈值：
+
+| 检查 | 判定 |
+|---|---|
+| driver_stale | 最近一次 wf tick 早于 15 分钟（定时器没有加载或在报错） |
+| driver_hung | 驱动器进程还活着，这一次运行超过 25 分钟，且不是在执行命令 |
+| exec_overrun | 一条命令超过 command_timeout_s 再加 5 分钟仍未结束 |
+| poll_overdue | 等回复时，到了 poll_after 10 分钟还没有轮询 |
+| send_unknown | 发送结果不明超过 60 分钟 |
+| dwell | 同一步停留过久：等回复 45 分钟、发送 60 分钟、其余步骤 30 分钟（空闲、完成、有到期时间的等待、等用户、阻塞与执行除外：等用户与阻塞本来就在 inbox 里，执行由 exec_overrun 管） |
+
+  连续验收未通过与目标长期没有进展已有熔断，照旧以“阻塞”进 inbox。项目锁是 fcntl 锁，进程退出即释放，不会残留；进程活着却卡住由 driver_hung 覆盖。
+- 升级：交给执行端的事在 inbox 里超过 2 小时还在，转给用户（for=user，标题写明）；额度等待本来就会持续数小时，除外。
+- 发送间隔（W42）：policy.json 的 min_send_gap_s（默认 0，不改变原有行为；属于时间参数，改动不算扩大权限）。上一条回复落地后不满这个秒数，不发下一条：太早发送会接到上一条残留的生成，被误判为已接受。
+- 没落地的重发（W43）：SEND_NOT_LANDED 阻塞时，`wf resend --code <决定码>` 恢复本轮消息为待发、清掉旧 ref，由驱动器重新发送；不要用 wf unblock --to WAIT_REPLY（会一直等一条不存在的回复）。
+- 执行端代决（W43，用户第 44 轮的决策顺位）：approve、unblock、resend、policy approve、goals approve 可以用 `--by executor --reason <理由>` 代替 `--said`，事件如实记 by=executor（M1 算作人工动作）。只限 inbox 里交给执行端的事项；四道底线、撤销暂停、目标达成仍只认用户原话（--said），执行端代决会被拒绝。
+- wf explain 的“需要”与 inbox 的路由一致：交给执行端的事项显示“执行端”。

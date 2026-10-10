@@ -1,5 +1,18 @@
 # CHANGELOG（collab-wf）
 
+## 1.6.5 — 2026-10-10
+
+卡死与错误都进 inbox（collab-wf-dev 用户第 53 轮：“任何一个环节卡死，我希望都有信息到 inbox”），以及第 52 轮暴露的发送缺口（W42、W43）。
+- 新增 wflib/signals.py 与 wf signal add|clear|list：外部信号存在 local/signals/，由写 inbox 的同一处合并，独立进程投递的不会被 wf tick 冲掉。
+- 新增 wflib/watchdog.py 与 wf watchdog [--write]：驱动器停摆、驱动器进程卡住、命令超时未结束、该轮询没轮询、发送结果不明、同一步停留过久，纯只读判定；--write 写成信号、恢复后清除，并立即重写 inbox。由独立于驱动器的定时进程调用。
+- inbox：交给执行端的事超过 2 小时还在，转给用户（额度等待除外）。
+- 发送间隔：policy.json 的 min_send_gap_s（默认 0；时间参数，改动不算扩大权限）。上一条回复落地后不满这个秒数不发下一条（W42：23 秒后就发送，接到了残留的生成）。
+- wf resend 覆盖 SEND_NOT_LANDED：恢复本轮消息为待发并重新发送（此前只能阻塞，unblock --to WAIT_REPLY 会一直空等）。
+- 执行端代决：approve、unblock、resend、policy approve、goals approve 可用 --by executor --reason，事件记 by=executor；只限交给执行端的事项，四道底线、撤销暂停、目标达成仍只认用户原话（W43）。
+- wf explain 的“需要谁”与 inbox 路由一致。原有检查“explain 回答卡在哪……”的期望随之由“需要：用户”改为“需要：执行端”（该场景是白名单外命令，路由本来就交给执行端）。
+- 文档：DRIVER.md 第 23 节；anomalies.json 的 SEND_NOT_LANDED 说明。
+- 自检新增 5 项（外部信号与升级、看门狗、执行端代决、发送间隔、没落地的重发）；除上面那一处期望外，原有检查没有删改。本版不改 floor.py。
+
 ## 1.6.4 — 2026-10-10
 
 对话达到上限时由驱动器自己开新对话（collab-wf-dev 第 44 轮：执行端按用户的决策顺位决定做；这是此前唯一固定需要人的停顿）。

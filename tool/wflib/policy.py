@@ -43,7 +43,7 @@ def approvals(inst: Instance) -> dict:
     return read_json(approvals_path(inst), {}) or {}
 
 
-def approve(inst: Instance, kind: str, note: str) -> dict:
+def approve(inst: Instance, kind: str, note: str, by: str = "user") -> dict:
     """用户批准 policy 或 goals 的当前内容。只能由用户命令调用；驱动器没有调用路径。"""
     p = inst.wf / f"{kind}.json"
     if not p.exists():
@@ -55,7 +55,7 @@ def approve(inst: Instance, kind: str, note: str) -> dict:
     a.setdefault("history", []).append({"kind": kind, **rec})
     a[kind] = rec
     write_json(approvals_path(inst), a)
-    inst.event("approve", kind=kind, sha=rec["sha256"][:12], note=note, by="user")
+    inst.event("approve", kind=kind, sha=rec["sha256"][:12], note=note, by=by)   # 1.6.5：执行端代决时 by=executor
     return rec
 
 
@@ -109,7 +109,8 @@ def classify(cmd: str, pol: dict) -> dict:
 
 # 1.6.1：不扩大权限的白名单与目标变更由驱动器自动批准（用户第 35 轮：把“需要执行端做的事”降到零）。
 # 判定：新内容给驱动器的能力不多于已批准的旧内容。四道底线在 floor.py，与这里无关；扩大权限的变更照旧停下等用户。
-NEUTRAL_KEYS = {"_说明", "first_poll_after_s", "poll_interval_s", "send_unknown_wait", "page_screenshots", "stale_reply_polls"}
+NEUTRAL_KEYS = {"_说明", "first_poll_after_s", "poll_interval_s", "send_unknown_wait", "page_screenshots", "stale_reply_polls",
+                "min_send_gap_s"}   # 1.6.5：发送间隔只是时间参数
 UPPER_LIMITS = ("max_rounds_per_day", "max_consecutive_failed_rounds", "max_rounds_without_goal_progress",
                 "command_timeout_s", "max_leaf_refusals")
 ZERO_IS_UNLIMITED = ("max_conversation_turns", "max_conversation_chars")

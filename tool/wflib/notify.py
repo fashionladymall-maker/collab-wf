@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 
-from .core import LOCAL, now_iso, read_json, write_json
+from .core import LOCAL, now_iso, read_json, secs_since, write_json
 
 STORE = LOCAL / "notified.json"
 CONFIG = LOCAL / "notify.json"
@@ -94,6 +94,7 @@ def after_tick(projects, sender=None, store=None, inbox=None) -> list:
 
 # 1.5.9：交给用户的事（由执行端转告，执行端不替用户决定）：四道底线命中、撤销暂停、目标达成；其余都交给执行端
 USER_MARKS = ("必须停下的", "新增内容命中", "底线文件", "底线行为检查")
+ESCALATE_S = 7200   # 1.6.5：交给执行端的事超过 2 小时还在，转给用户（“没人接”本身也要让人看见）
 
 
 def route(it: dict) -> str:
@@ -117,6 +118,14 @@ def collect_inbox(projects) -> list:
         except Exception:   # noqa: BLE001  某个项目读不出来，不影响其他项目
             continue
         out += rows
+    try:   # 1.6.5：外部信号（看门狗与其它独立进程投递的错误、卡死、疑难），见 wflib/signals.py
+        from . import signals
+        for s in signals.load():
+            out.append({"key": f"signal|{s['key']}", "project": s.get("project") or "", "for": s.get("for") or "executor",
+                        "title": s.get("title") or "", "why": s.get("why") or "", "action": s.get("action") or "",
+                        "code": "", "source": s.get("source") or "external"})
+    except Exception:   # noqa: BLE001  信号读不出来不影响其余待办
+        pass
     return out
 
 
@@ -127,6 +136,11 @@ def write_inbox(projects, path=None, items=None) -> list:
     items = collect_inbox(projects) if items is None else [dict(x) for x in items]
     for x in items:
         x["since"] = (old.get(x["key"]) or {}).get("since") or now_iso()
+        # 1.6.5（用户第 53 轮）：交给执行端的事超过 2 小时还在，升级给用户；额度等待本来就会持续数小时，除外
+        if x.get("for") == "executor" and (secs_since(x["since"]) or 0) > ESCALATE_S \
+                and not str(x.get("key") or "").split("|", 1)[-1].startswith("quota:"):
+            x["for"], x["escalated"] = "user", True
+            x["title"] = f"{x.get('title') or ''}（交给执行端超过 {ESCALATE_S // 3600} 小时仍未处理，已转给用户）"
     write_json(path, {"updated": now_iso(), "items": items})
     return items
 

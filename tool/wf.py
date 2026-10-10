@@ -63,6 +63,8 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf fingerprint [--files]           仓库指纹（回报草稿自动附带；与 Claude 的副本比对是否同步）
   wf look [--full]                   看一次 Claude 页面，更新看板上的文本快照与截图（--full 截整页；适配器的 snapshot 动作，见 docs/SNAPSHOT.md）
   wf said --text "…" [--kind chat]   逐字记下用户的原话（看板“对话记录”里的“用户”）
+  wf signal add|clear|list …         外部信号：把错误、卡死、疑难投进 inbox（--key --title [--why] [--for executor|user] [--ttl 秒]）
+  wf watchdog [--write]              卡死判定（只读）；--write 写成信号并重写 inbox，由独立于驱动器的定时进程调用
   wf notify test | status            系统通知：发一条测试通知 / 查看是否开启（wf tick 跑完后自动通知新的待决事项）
   wf sync [--dry-run] [--force]      项目上下文同步到执行端配置的仓库（docs/SYNC.md）
   wf snapshot <文件,…> [--max-chars N] [--out F]   按 Claude 的要求生成有界的文件包
@@ -114,11 +116,24 @@ def _record_user(inst, kind, item, said):
     from wflib import roles
     said = (said or "").strip()
     if not said:
-        raise WfError("需要 --said：用户在聊天窗口里的原话（逐字）")
+        raise WfError("需要 --said：用户在聊天窗口里的原话（逐字）；交给执行端的事项也可以由执行端代决：--by executor --reason …")
     inst.event("user_decision", kind=kind, code=item["code"], said=said[:500], title=item["title"], by="user")
     roles.decide(inst, "user", f"{item['title']}（决定码 {item['code']}）", f"用户原话：{said[:300]}", "", "已执行", by="user")
     from wflib import page
     page.record_user(inst, said, kind=kind, title=item["title"], code=item["code"], event=False)   # 1.5.3：对话记录里也有“用户”
+
+
+def _decide_as(inst, kind, item, args) -> tuple:
+    """1.6.5（W43）：默认要用户原话（--said）；--by executor --reason 为执行端代决，只限交给执行端的事项。返回 (说明, by)。"""
+    if getattr(args, "by", None) == "executor":
+        return asks.executor_decision(inst, kind, item, getattr(args, "reason", None)), "executor"
+    _record_user(inst, kind, item, getattr(args, "said", None))
+    return args.said, "user"
+
+
+def _by_args(x):
+    x.add_argument("--by", choices=["executor"], help="执行端代决（只限交给执行端的事项），须同时写 --reason")
+    x.add_argument("--reason", help="执行端代决的理由")
 
 
 def tool_now():
@@ -274,10 +289,10 @@ def main(argv=None):
     x = sub.add_parser("fail"); x.add_argument("--reason", required=True); x.add_argument("--symptom")
     x = sub.add_parser("block"); x.add_argument("--reason", required=True)
     x = sub.add_parser("unblock"); x.add_argument("--to", required=True); x.add_argument("--code", required=True)
-    x.add_argument("--said", "--note", dest="said", required=True)
+    x.add_argument("--said", "--note", dest="said"); _by_args(x)
     x = sub.add_parser("resume"); x.add_argument("--note", required=True); x.add_argument("--to")
     x = sub.add_parser("resend"); x.add_argument("--code", required=True)
-    x.add_argument("--said", "--note", dest="said", required=True)
+    x.add_argument("--said", "--note", dest="said"); _by_args(x)
     x = sub.add_parser("wait"); x.add_argument("--until", required=True); x.add_argument("--reason", required=True)
     x = sub.add_parser("mark"); x.add_argument("what", choices=["sent", "replied"])
     x.add_argument("--message-file"); x.add_argument("--reply-file"); x.add_argument("--kind")
@@ -312,7 +327,7 @@ def main(argv=None):
     sub.add_parser("explain")
     x = sub.add_parser("kick"); x.add_argument("--message", required=True); x.add_argument("--kind", default="task", choices=["task", "report"])
     x.add_argument("--effort", default="high", choices=ops.EFFORTS)
-    x = sub.add_parser("approve"); x.add_argument("--code", required=True); x.add_argument("--said", "--note", dest="said", required=True)
+    x = sub.add_parser("approve"); x.add_argument("--code", required=True); x.add_argument("--said", "--note", dest="said"); _by_args(x)
     x = sub.add_parser("pause"); x.add_argument("--note", default="")
     x = sub.add_parser("said"); x.add_argument("--text", required=True); x.add_argument("--kind", default="chat")
     x = sub.add_parser("notify"); x.add_argument("action", choices=["test", "status"])
@@ -322,11 +337,16 @@ def main(argv=None):
     x = sub.add_parser("undo"); x.add_argument("--note", required=True)
     x = sub.add_parser("audit"); x.add_argument("--n", type=int, default=40)
     x = sub.add_parser("goals"); x.add_argument("action", nargs="?", default="show", choices=["show", "check", "approve", "confirm"])
-    x.add_argument("gid", nargs="?"); x.add_argument("--said", "--note", dest="said"); x.add_argument("--code")
+    x.add_argument("gid", nargs="?"); x.add_argument("--said", "--note", dest="said"); x.add_argument("--code"); _by_args(x)
     x = sub.add_parser("policy"); x.add_argument("action", nargs="?", default="show", choices=["show", "approve"])
-    x.add_argument("--said", "--note", dest="said"); x.add_argument("--code")
+    x.add_argument("--said", "--note", dest="said"); x.add_argument("--code"); _by_args(x)
     x = sub.add_parser("ask"); x.add_argument("--new", action="store_true"); x.add_argument("--mark-shown", action="store_true")
     sub.add_parser("panel")
+    x = sub.add_parser("signal"); x.add_argument("action", choices=["add", "clear", "list"]); x.add_argument("--key")
+    x.add_argument("--title"); x.add_argument("--why", default=""); x.add_argument("--for", dest="for_", default="executor",
+                                                                                 choices=["executor", "user"])
+    x.add_argument("--action-text", dest="action_text", default=""); x.add_argument("--ttl", type=int, default=0)
+    x = sub.add_parser("watchdog"); x.add_argument("--write", action="store_true")
     x = sub.add_parser("transport"); x.add_argument("action", nargs="?", default="check", choices=["check", "test"])
     sub.add_parser("effort")
     x = sub.add_parser("decisions"); x.add_argument("--n", type=int, default=40); x.add_argument("--turn", type=int)
@@ -411,21 +431,39 @@ def main(argv=None):
         if inst.state["state"] != "BLOCKED":
             raise WfError("当前不是 BLOCKED")
         it = asks.verify(inst, "unblock", args.code)
-        _record_user(inst, "unblock", it, args.said)
-        machine.resume(inst, args.said, to=args.to)
+        note, by = _decide_as(inst, "unblock", it, args)
+        machine.resume(inst, note, to=args.to, by=by)
         print(f"已解除阻塞，进入 {args.to.upper()}")
     elif c == "resend":
-        # 1.5.1：发送结果不明、确认没有送达时，由用户批准清除发送意图并重发（不再手改 state.json）
+        # 1.5.1：发送结果不明、确认没有送达时，清除发送意图并重发（不再手改 state.json）。
+        # 1.6.5（W43）：也覆盖“适配器报已接受、却始终没有落地”（SEND_NOT_LANDED）：恢复本轮消息为待发
         inst = _p(args)
-        intent = inst.state.get("send_intent") or {}
-        if inst.state["state"] != "BLOCKED" or intent.get("status") != "pending":
-            raise WfError("当前没有因“发送结果不明”而阻塞的发送意图，不需要 resend。")
+        st = inst.state
+        intent = st.get("send_intent") or {}
+        nl = st.get("not_landed") or {}
+        if st["state"] != "BLOCKED" or not (intent.get("status") == "pending" or nl.get("turn") == st.get("turn")):
+            raise WfError("当前没有因“发送结果不明”或“发送后没有落地”而阻塞的消息，不需要 resend。")
         it = asks.verify(inst, "unblock", args.code)
-        _record_user(inst, "unblock", it, args.said)
-        inst.state["send_intent"] = None
-        inst.event("send_intent_cleared", note=args.said, intent_ts=intent.get("ts"), by="user")
-        machine.resume(inst, args.said, to="SEND")
-        print("已清除结果不明的发送意图；驱动器下次运行会重新发送本轮消息")
+        note, by = _decide_as(inst, "unblock", it, args)
+        if intent.get("status") == "pending":
+            st["send_intent"] = None
+            inst.event("send_intent_cleared", note=note, intent_ts=intent.get("ts"), by=by)
+            msg = "已清除结果不明的发送意图；驱动器下次运行会重新发送本轮消息"
+        else:
+            f = Path(nl.get("file") or "")
+            if not nl.get("file") or not f.is_file():
+                raise WfError(f"找不到本轮发出的消息原文：{nl.get('file')}")
+            st["outgoing"] = {k: nl.get(k) for k in ("turn", "file", "kind", "effort")}
+            st.pop("not_landed", None)
+            st.pop("send_ref", None)
+            cv = st.get("conv") or {}
+            if cv.get("turns"):
+                cv["turns"] = int(cv["turns"]) - 1   # 没落地的那一次不算进对话体量
+            inst.event("resend_not_landed", note=note, file=f.name, by=by)
+            msg = "已恢复本轮消息为待发；驱动器下次运行会重新发送（上一次发送没有落地）"
+        inst.save()
+        machine.resume(inst, note, to="SEND", by=by)
+        print(msg)
     elif c == "resume":
         inst = _p(args)
         if inst.state.get("state") == "AWAITING_USER" and inst.state.get("return_to") == "REVIEW" and not args.to:
@@ -682,6 +720,43 @@ def main(argv=None):
             print(r["text"])
     elif c == "panel":
         print(asks.panel(_p(args)))
+    elif c == "signal":
+        from wflib import signals
+        if args.action == "add":
+            if not args.key or not args.title:
+                raise WfError("用法：wf signal add --key <键> --title <标题> [--why …] [--for executor|user] [--ttl 秒]")
+            r = signals.add(args.key, args.title, args.why, for_=args.for_, project=getattr(args, "project", None) or "",
+                            action=args.action_text, source="cli", ttl_s=args.ttl)
+            out(r) if args.json else print(f"已写入信号 {r['key']}（交给 {r['for']}）；下一次 wf tick 或 wf watchdog --write 时进入 inbox")
+        elif args.action == "clear":
+            if not args.key:
+                raise WfError("用法：wf signal clear --key <键>")
+            print("已清除" if signals.clear(args.key) else "没有这个信号")
+        else:
+            rows = signals.load()
+            if args.json:
+                out({"signals": rows})
+            else:
+                for r in rows:
+                    print(f"{r['key']}  [{r.get('for')}] {r.get('title')}：{r.get('why') or ''}（自 {r.get('since')}，来源 {r.get('source')}）")
+                if not rows:
+                    print("没有信号")
+    elif c == "watchdog":
+        from wflib import watchdog
+        from wflib.core import Instance
+        insts = []
+        for p in load_registry()["projects"]:
+            try:
+                insts.append(Instance(Path(p["root"])))
+            except WfError as e:
+                print(f"跳过 {p['name']}：{e}")
+        rows = watchdog.run(insts, write=args.write)
+        if args.json:
+            out({"findings": rows, "thresholds": watchdog.THRESHOLDS, "written": bool(args.write)})
+        else:
+            for r in rows:
+                print(f"[{r['project']}] {r['check']}：{r['title']}——{r['why']}")
+            print(f"发现 {len(rows)} 项停滞" + ("，已写成信号并重写 inbox" if args.write else "") if rows else "没有发现停滞")
     elif c == "explain":
         from wflib import driver
         e = driver.explain(_p(args))
@@ -707,16 +782,16 @@ def main(argv=None):
         if st["state"] != "AWAITING_USER":
             raise WfError(f"当前是 {st['state']}，没有等待用户决定的事项。")
         it = asks.verify(inst, "approve", args.code)
-        _record_user(inst, "approve", it, args.said)
+        note, by = _decide_as(inst, "approve", it, args)
         if st.get("return_to") == "REVIEW":
             st.setdefault("turn_flags", {})["review_accepted"] = True
-            inst.event("review", accepted=True, user_approved=args.said, by="user")
+            inst.event("review", accepted=True, user_approved=note, by=by)
         st["consecutive_failed"], st["rounds_no_progress"] = 0, 0
         if st.get("budget"):
             st["budget"]["rounds"] = 0
         st.pop("needs_text", None)
         inst.save()
-        st = machine.resume(inst, args.said, by="user")
+        st = machine.resume(inst, note, by=by)
         print(f"已批准，回到 {st['state']}。驱动器下次运行时继续。")
     elif c == "notify":
         from wflib import notify
@@ -783,11 +858,11 @@ def main(argv=None):
             iss = goals.validate(g) if g else ["没有 workflow/goals.json"]
             if iss:
                 raise WfError("目标定义有问题，不能批准：\n  " + "\n  ".join(iss))
-            if not args.code or not args.said:
-                raise WfError("批准需要 --code（wf ask 显示的决定码）与 --said（用户原话）")
+            if not args.code or not (args.said or getattr(args, "by", None)):
+                raise WfError("批准需要 --code（wf ask 显示的决定码）与 --said（用户原话）；交给执行端的事项也可以 --by executor --reason …")
             it = asks.verify(inst, "goals", args.code)
-            _record_user(inst, "goals", it, args.said)
-            r = policy.approve(inst, "goals", args.said)
+            note, by = _decide_as(inst, "goals", it, args)
+            r = policy.approve(inst, "goals", note, by=by)
             print(f"已批准目标定义（sha256 {r['sha256'][:12]}）。今后对 goals.json 的任何改动都需要重新批准。")
         elif args.action == "confirm":
             if not args.gid or not args.code or not args.said:
@@ -813,11 +888,11 @@ def main(argv=None):
         from wflib import policy
         inst = _p(args)
         if args.action == "approve":
-            if not args.code or not args.said:
-                raise WfError("批准需要 --code（wf ask 显示的决定码）与 --said（用户原话）")
+            if not args.code or not (args.said or getattr(args, "by", None)):
+                raise WfError("批准需要 --code（wf ask 显示的决定码）与 --said（用户原话）；交给执行端的事项也可以 --by executor --reason …")
             it = asks.verify(inst, "policy", args.code)
-            _record_user(inst, "policy", it, args.said)
-            r = policy.approve(inst, "policy", args.said)
+            note, by = _decide_as(inst, "policy", it, args)
+            r = policy.approve(inst, "policy", note, by=by)
             print(f"已批准白名单（sha256 {r['sha256'][:12]}）。今后对 policy.json 的任何改动都需要重新批准。")
         else:
             stt = policy.status(inst, "policy")

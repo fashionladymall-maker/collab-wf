@@ -942,6 +942,105 @@ def _t_v164_newconv(_ok):
         str([w_on, w_off, w1, e1, w2, e2, w3]))
 
 
+def _t_v165_signals(_ok):
+    from . import notify, signals
+    orig = signals.SIG_DIR
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        try:
+            signals.SIG_DIR = d / "signals"
+            signals.add("ext:demo", "测试：外部信号", "看门狗发现的问题", for_="executor", project="p1", source="test")
+            signals.add("ext:old", "过期的信号", "x", ttl_s=60)
+            p_old = signals._path("ext:old")
+            rec = json.loads(p_old.read_text(encoding="utf-8"))
+            rec["expires"] = "2000-01-01T00:00:00+00:00"
+            p_old.write_text(json.dumps(rec), encoding="utf-8")
+            rows = notify.collect_inbox([])
+            keys = [r["key"] for r in rows]
+            demo = next((r for r in rows if r["key"] == "signal|ext:demo"), {})
+            inbox = d / "inbox.json"
+            inbox.write_text(json.dumps({"items": [{"key": "p1|AAA", "since": "2000-01-01T00:00:00+00:00"},
+                                                   {"key": "p1|quota:x", "since": "2000-01-01T00:00:00+00:00"}]}),
+                             encoding="utf-8")
+            base = {"project": "p1", "for": "executor", "why": "", "action": ""}
+            items = notify.write_inbox([], inbox, items=[{**base, "key": "p1|AAA", "title": "旧事项", "code": "AAA"},
+                                                         {**base, "key": "p1|quota:x", "title": "额度", "code": ""}])
+            esc = {x["key"]: x for x in items}
+            cleared = signals.clear("ext:demo")
+            after = [r["key"] for r in notify.collect_inbox([])]
+            gone_old = not p_old.exists()
+        finally:
+            signals.SIG_DIR = orig
+    _ok("1.6.5 外部信号：写入后出现在 inbox（交给谁、项目保留），过期的自动丢弃，clear 后消失；交给执行端超过 2 小时的事升级给用户（额度等待除外）",
+        "signal|ext:demo" in keys and demo.get("for") == "executor" and demo.get("project") == "p1"
+        and "signal|ext:old" not in keys and gone_old and cleared and "signal|ext:demo" not in after
+        and esc["p1|AAA"]["for"] == "user" and esc["p1|AAA"].get("escalated") is True
+        and esc["p1|quota:x"]["for"] == "executor", json.dumps([keys, items], ensure_ascii=False)[:600])
+
+
+def _t_v165_watchdog(_ok):
+    from . import notify, signals, watchdog
+    from .core import Instance, now_iso
+    orig = (signals.SIG_DIR, notify.INBOX)
+    past = "2000-01-01T00:00:00+00:00"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "proj"
+        (root / "workflow").mkdir(parents=True)
+        (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"v165-wd-{os.getpid()}"}), encoding="utf-8")
+        (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+        inst = Instance(root)
+        try:
+            signals.SIG_DIR, notify.INBOX = Path(td) / "signals", Path(td) / "inbox.json"
+            inst.state.update(state="WAIT_REPLY", since=past, turn=3, poll_after=past, send_ref="r")
+            inst.save()
+            f1 = {f["check"] for f in watchdog.check(inst)}
+            w1 = watchdog.run([inst], write=True)
+            inbox1 = notify.INBOX.read_text(encoding="utf-8") if notify.INBOX.exists() else ""
+            inst.state.update(state="SEND", since=now_iso(), send_intent={"turn": 3, "status": "pending", "ts": past})
+            inst.state.pop("poll_after", None)
+            inst.save()
+            f2 = {f["check"] for f in watchdog.check(inst)}
+            inst.state.update(state="IDLE", since=now_iso(), send_intent=None)
+            inst.save()
+            f3 = [f["check"] for f in watchdog.check(inst)]
+            watchdog.run([inst], write=True)
+            left = [r["key"] for r in signals.load() if str(r.get("key", "")).startswith("watchdog:")]
+        finally:
+            signals.SIG_DIR, notify.INBOX = orig
+    _ok("1.6.5 看门狗：等回复停留过久、该轮询没轮询、发送结果不明都能判出；--write 写成信号并重写 inbox，恢复后信号自动清除",
+        {"dwell", "poll_overdue"} <= f1 and len(w1) >= 2 and "signal|watchdog:" in inbox1
+        and "send_unknown" in f2 and f3 == [] and left == [], str([f1, f2, f3, left]))
+
+
+def _t_v165_executor_decision(_ok):
+    from . import asks
+    from .core import Instance, WfError
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "proj"
+        (root / "workflow").mkdir(parents=True)
+        (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"v165-ex-{os.getpid()}"}), encoding="utf-8")
+        (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+        inst = Instance(root)
+        floor_item = {"kind": "approve", "key": "approve:1:a", "code": "ABC", "title": "需要你批准才能继续",
+                      "why": "- 命令 1「cat .env」：属于必须停下的“密钥”类"}
+        exec_item = {**floor_item, "key": "approve:1:b", "code": "DEF", "why": "- 命令 1「ls」：不在已批准的命令白名单中"}
+        refused = no_reason = False
+        try:
+            asks.executor_decision(inst, "approve", floor_item, "测试：想代决底线事项")
+        except WfError:
+            refused = True
+        try:
+            asks.executor_decision(inst, "approve", exec_item, "  ")
+        except WfError:
+            no_reason = True
+        note = asks.executor_decision(inst, "approve", exec_item, "测试：只读命令，执行端判断可以放行")
+        evp = root / "workflow" / "events.jsonl"
+        ev = evp.read_text(encoding="utf-8") if evp.exists() else ""
+    _ok("1.6.5 执行端代决：只限交给执行端的事项、必须写理由，如实记 by=executor；四道底线仍只认用户原话",
+        refused and no_reason and note.startswith("执行端代决") and '"executor_decision"' in ev
+        and '"by": "executor"' in ev and '"ABC"' not in ev, ev[-400:])
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -958,7 +1057,9 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.1 不扩大权限的变更自动批准", _t_v161_neutral), ("1.6.1 无人值守的两处停顿", _t_v161_unattended),
          ("1.6.2 适配器调用的程序路径", _t_v162_program_ops),
          ("1.6.3 开新对话的短消息", _t_v163_bootstrap_short),
-         ("1.6.4 驱动器自己开新对话", _t_v164_newconv)]
+         ("1.6.4 驱动器自己开新对话", _t_v164_newconv),
+         ("1.6.5 外部信号与升级", _t_v165_signals), ("1.6.5 看门狗", _t_v165_watchdog),
+         ("1.6.5 执行端代决", _t_v165_executor_decision)]
 
 
 def run_v15(_ok) -> None:

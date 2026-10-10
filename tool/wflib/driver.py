@@ -149,11 +149,16 @@ def explain(inst: Instance) -> dict:
     if st.get("paused"):
         return {"where": where, "why": f"用户暂停了自动化：{st['paused'].get('note') or ''}", "who": "用户", "what": "wf unpause --note …"}
     if s["state"] == "AWAITING_USER":
-        return {"where": where, "why": st.get("needs_text") or "需要用户决定", "who": "用户",
-                "what": "决定后运行 wf approve --note \"决定内容\"；拒绝则 wf pause 并接管"}
+        who = _who(inst, "approve")   # 1.6.5（W43）：与 inbox 的路由一致：底线类交给用户，其余先由执行端处理
+        return {"where": where, "why": st.get("needs_text") or "需要用户决定", "who": who,
+                "what": ("决定后运行 wf approve --code <决定码> --said <用户原话>；拒绝则 wf pause 并接管" if who == "用户" else
+                         "执行端按决策顺位处理：wf approve --code <决定码> --by executor --reason <理由>；做不到的才转告用户")}
     if s["state"] == "BLOCKED":
-        return {"where": where, "why": s["block_reason"] or "", "who": "用户",
-                "what": "排除原因后 wf unblock --to <状态> --note …（wf status 显示该步的处置表）"}
+        who = _who(inst, "unblock")
+        return {"where": where, "why": s["block_reason"] or "", "who": who,
+                "what": "排除原因后 wf unblock --to <状态> --code <决定码> "
+                        + ("--said <用户原话>" if who == "用户" else "--by executor --reason <理由>")
+                        + "（wf status 显示该步的处置表；发送后没有落地用 wf resend）"}
     if s["state"] == "DONE":
         return {"where": where, "why": "全部目标判据已通过", "who": "用户", "what": "验收结果；需要继续时 wf kick"}
     if s["state"] == "WAIT_REPLY":
@@ -166,6 +171,16 @@ def explain(inst: Instance) -> dict:
     if s["state"] == "IDLE":
         return {"where": where, "why": "没有待办，也没有计划节点", "who": "用户", "what": "需要推进时 wf kick --message 任务文件"}
     return {"where": where, "why": s["summary"], "who": "驱动器", "what": "无需操作，下次唤醒时继续"}
+
+
+def _who(inst: Instance, kind: str) -> str:
+    """1.6.5：一件待决事项该谁处理，按 inbox 的同一条路由（notify.route）回答“用户”或“执行端”。"""
+    from . import asks, notify
+    try:
+        it = next((x for x in asks.pending(inst) if x["kind"] == kind), None)
+    except Exception:   # noqa: BLE001
+        it = None
+    return "用户" if it is None or notify.route(it) == "user" else "执行端"
 
 
 # ---------------- 异常处置 ----------------
@@ -478,6 +493,15 @@ def h_send(ctx):
     turn = st["turn"]
     intent = st.get("send_intent")
     tdir = inst.turn_dir()
+    gap = int(ctx.pol.get("min_send_gap_s", 0) or 0)   # 1.6.5（W42）：默认 0，不改变原有行为
+    ra = st.get("replied_at")
+    if gap > 0 and ra and not (intent and intent.get("turn") == turn and intent.get("status") == "pending"):
+        waited = secs_since(ra) or 0
+        if 0 <= waited < gap:
+            st["retry_at"] = (now() + timedelta(seconds=int(gap - waited) + 1)).isoformat(timespec="seconds")
+            inst.save()
+            return "wait", (f"上一条回复 {int(waited)} 秒前才落地，等满 {gap} 秒再发"
+                            "（min_send_gap_s，W42：太早发送会接到上一条残留的生成，被误判为已接受）")
     if intent and intent.get("turn") == turn and intent.get("status") == "pending":
         pargs = ["--project", inst.name, "--turn", turn, "--ref", intent.get("ref") or "", "--out", tdir / "delivered"]
         if anomaly.transport_cfg().get("poll_since"):
@@ -544,6 +568,7 @@ def _finalize_send(ctx, out, note):
     ops.mark_sent(inst, out.get("file"), out.get("kind"), out.get("effort"), model, by="driver",
                   role=out.get("role"), reasons=out.get("reasons"))
     st = inst.state
+    st["last_sent"] = {"turn": st["turn"], "file": out.get("file"), "kind": out.get("kind"), "effort": out.get("effort")}
     st["send_intent"] = None
     st["outgoing"] = None
     st["poll_after"] = (now() + timedelta(seconds=int(ctx.pol.get("first_poll_after_s", 60)))).isoformat(timespec="seconds")
@@ -587,6 +612,7 @@ def h_wait_reply(ctx):
         if n >= int(ctx.pol.get("landed_confirm_polls", 5)):
             st["send_unconfirmed"] = 0
             st.pop("send_ref", None)
+            st["not_landed"] = dict(st.get("last_sent") or {}, turn=st["turn"])   # 1.6.5（W43）：留给 wf resend 恢复本轮消息
             inst.save()
             return _anomaly(ctx, {"source": "driver", "kind": "send_not_landed"},
                             f"适配器曾报告已接受，但连续 {n} 次轮询都看不到这条消息出现在会话中（缺口 11/§3）")
@@ -631,6 +657,7 @@ def h_wait_reply(ctx):
             inst.event("auto", rule="MULTI_DELIVERY", action="report", detail=f"其他交付 {n} 套", by="driver")
             ops.add_note(inst, "deviation", f"[MULTI_DELIVERY] 本轮存在 {n} 套其他交付，只采用了最后一条完整回复的文件", by="driver")
         st.pop("poll_after", None)
+        st["replied_at"] = now_iso()   # 1.6.5（W42）：发下一条之前据此留出间隔
         inst.save()
         _quota(inst)
         ops.mark_replied(inst, rf, r["data"].get("tools"), by="driver")
