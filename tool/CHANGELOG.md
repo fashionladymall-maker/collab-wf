@@ -1,5 +1,12 @@
 # CHANGELOG（collab-wf）
 
+## 1.6.2 — 2026-10-10
+
+修正（collab-wf-dev 第 36 轮执行端报告）：通道是模块方式时，anomaly.call 把所有动作都交给通道适配器，而通道适配器只有 send/poll/quota，wf sync 必然失败（“未知动作：sync”），与 docs/SYNC.md 的说明矛盾。
+- sync、review 在 transport.json 里写了程序路径时，直接运行该程序；写 true 时仍按模块方式的子命令调用；通道动作不变。
+- 文档：SYNC.md、REVIEW.md 写明两种写法。
+- 自检新增 1 项；原有检查没有删改。执行端在适配器里加的 sync 转发继续可用，可以保留，也可以改为直接写程序路径。
+
 ## 1.6.1 — 2026-10-10
 
 把“需要人”的停顿降到底线本身（collab-wf-dev 第 34–35 轮：流程因等执行端批准与处理 AP-2 空转 9 分钟，用户要求彻底解决）。

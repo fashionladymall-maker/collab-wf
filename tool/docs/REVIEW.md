@@ -10,7 +10,7 @@
 
 ## 2. 怎么调用
 
-- 配置：local/transport.json 写 "review": "<审查程序>"（模块方式的适配器按子命令 review 接收）；可选 "review_timeout_s"（默认 900）。
+- 配置：local/transport.json 写 "review": "<审查程序>"（写程序路径时，即使通道是模块方式也直接运行该程序，1.6.2 起；写 true 时由模块方式的适配器按子命令 review 接收）；可选 "review_timeout_s"（默认 900）。
 - 参数：项目版本包是 `review --project <名称> --turn <轮次> --release <版本包 zip> --diff <diff 文件>`；工具版本多一个 `--kind tool`（--project 为 collab-wf，--turn 为 0）。环境变量 WF_ADAPTER_TIMEOUT_S 给出时间上限。
 - 输入：diff 文件是版本包相对当前仓库的统一 diff（最多 40 万字符），审查以它为主；需要上下文时可以解开 zip 看完整文件。
 

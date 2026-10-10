@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 36 轮 · 等待 Claude（WAIT_REPLY）
+第 37 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
-- 工具：collab-wf 1.6.1
-- 项目：v1.3；6ec2857 (HEAD -> main) docs: VISION.md 记录用户裁定（不同意第一版公开化方案）；.gitignore 忽略 .workbuddy-ai/
-- 仓库指纹：2d407489ebf88c00（7 个文件）
+- 工具：collab-wf 1.6.2
+- 项目：v1.4；dad4aad (HEAD -> main, tag: v1.4) release v1.4
+- 仓库指纹：44cc3767d43e4af0（7 个文件）
 
 ## 最近一轮
-- 第 35 轮验收通过（2026-10-10T13:36:36+00:00）
-- 本方最新消息：`turns/turn-036.md`
-- Claude 最新回复：`replies/reply-035.md`
+- 第 36 轮验收通过（2026-10-10T13:47:30+00:00）
+- 本方最新消息：`turns/turn-037.md`
+- Claude 最新回复：`replies/reply-036.md`
 
 ## 目标
 - 进度 3 / 7
@@ -26,5 +26,5 @@
 - 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.1.zip`
-- `artifacts/collab-wf-dev-v1.3.zip`
+- `artifacts/collab-wf-1.6.2.zip`
+- `artifacts/collab-wf-dev-v1.4.zip`

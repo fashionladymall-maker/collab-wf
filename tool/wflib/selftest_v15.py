@@ -862,6 +862,29 @@ def _t_v161_unattended(_ok):
             r[0] == "wait" and st["state"] == "QUOTA_WAIT" and str(st.get("until", "")).startswith(tomorrow), f"{r} {st.get('until')}")
 
 
+def _t_v162_program_ops(_ok):
+    from . import anomaly, fidelity
+    orig = (anomaly.transport_cfg, fidelity.run_with_grace)
+    seen = []
+
+    def fake_run(cmd, t, env, grace=15):
+        seen.append(list(cmd))
+        return 0, '{"ok": true}\n', "", False
+    try:
+        fidelity.run_with_grace = fake_run
+        anomaly.transport_cfg = lambda: {"module": "my_adapter", "sync": "/opt/x/gh_sync.py", "review": True}
+        r1 = anomaly.call("sync", ["--project", "p"])
+        anomaly.call("send", ["--turn", "1"])
+        anomaly.call("review", ["--project", "p"])
+        anomaly.transport_cfg = lambda: {"sync": "/opt/x/gh_sync.py"}
+        anomaly.call("sync", ["--project", "p"])
+    finally:
+        anomaly.transport_cfg, fidelity.run_with_grace = orig
+    _ok("1.6.2 适配器调用：sync、review 写了程序路径时直接运行它，通道动作与写 true 的仍按模块方式（第 36 轮“未知动作：sync”）",
+        r1.get("code") == 0 and seen[0][0] == "/opt/x/gh_sync.py" and seen[1][1:4] == ["-m", "my_adapter", "send"]
+        and seen[2][1:4] == ["-m", "my_adapter", "review"] and seen[3][0] == "/opt/x/gh_sync.py", str(seen))
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -875,7 +898,8 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.5.8 等回复与审查文档", _t_v158_linger), ("1.5.8 自动安装工具版本", _t_v158_auto_update),
          ("1.5.9 底线集中与行为检查", _t_v159_floor), ("1.5.9 执行端待办信号", _t_v159_inbox),
          ("1.6.0 项目上下文同步", _t_v160_sync),
-         ("1.6.1 不扩大权限的变更自动批准", _t_v161_neutral), ("1.6.1 无人值守的两处停顿", _t_v161_unattended)]
+         ("1.6.1 不扩大权限的变更自动批准", _t_v161_neutral), ("1.6.1 无人值守的两处停顿", _t_v161_unattended),
+         ("1.6.2 适配器调用的程序路径", _t_v162_program_ops)]
 
 
 def run_v15(_ok) -> None:

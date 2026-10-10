@@ -72,12 +72,21 @@ def driver_env() -> dict:
     return env
 
 
+# 1.6.2：这些动作不属于对话通道，可以在 transport.json 里单独写程序路径（写 true 时仍按模块方式的子命令调用）
+PROGRAM_OPS = ("sync", "review")
+
+
 def call(op: str, args: list, timeout=None, env_extra=None) -> dict:
     """调用适配器（send/poll/quota 三个可执行程序之一）。返回 {"code": 退出码, "data": JSON 或 {}, "raw": 原始输出}。
     适配器缺失、超时、输出不是 JSON 时，kind 分别为 not_configured / timeout / bad_output（由异常字典处置）。"""
     cfg = transport_cfg()
     env = driver_env()
     mod = cfg.get("module")
+    prog = cfg.get(op)
+    if mod and op in PROGRAM_OPS and isinstance(prog, str) and prog.strip():
+        # 1.6.2（第 36 轮）：sync、review 在 transport.json 里写了程序路径时，即使通道是模块方式也直接运行该程序；
+        # 此前一律按模块方式调用，而通道适配器的动作表只有 send/poll/quota，wf sync 必然报“未知动作：sync”
+        mod = None
     if mod:
         # 模块方式：python -m <模块>；通道适配器放在工具目录之外（module_path），工具目录只提供 adapters.base 接口
         mpath = os.path.expanduser(cfg.get("module_path") or "")
