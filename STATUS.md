@@ -9,7 +9,7 @@
 - 仓库指纹：`仓库指纹 78832752ea25b87b（4 个文件）`
 
 ## 当前进度
-- 第 **28** 轮 · **SEND**
+- 第 **28** 轮 · **WAIT_REPLY**
 - 最近验收：turn-027：c1 pass、c2 pass、c3 pass、c4 pass、c5 pass
 - 我方最新发出：`turns/turn-028.md`
 - Claude 最新回复：`replies/reply-027.md`
