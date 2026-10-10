@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 49 轮 · 等待用户决定（AWAITING_USER）
+第 50 轮 · 阻塞（BLOCKED）
 
 ## 版本
 - 工具：collab-wf 1.6.3
@@ -8,8 +8,8 @@
 - 仓库指纹：6a98508768686f43（7 个文件）
 
 ## 最近一轮
-- 第 48 轮验收通过（2026-10-10T14:52:40+00:00）
-- 本方最新消息：`turns/turn-049.md`
+- 第 49 轮验收通过（2026-10-10T14:57:50+00:00）
+- 本方最新消息：`turns/turn-050.md`
 - Claude 最新回复：`replies/reply-049.md`
 
 ## 目标
@@ -23,9 +23,7 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [executor] 需要你批准才能继续：以下内容需要用户批准后才会执行：
-- 命令 3「grep -n by...user workflow/events.jsonl | tail -n 10」：不在已批准的命令白名单中
-- 命令 4「grep -n by...executor workflow/events.jsonl | tail -n 10」：不在已批准的命令白名单中
+- [executor] 流程阻塞，需要人处理：同一轮消息连续被通道的安全防护拒绝，可能是消息内容触发了防护
 
 ## 最新产物
 - `artifacts/collab-wf-1.6.3-0bc9afa.zip`
