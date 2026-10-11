@@ -23,9 +23,8 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [user] 目标已达成：全部目标判据已通过，自动化停在这里
-- [executor] 执行端待办 T86-1：核对本轮 verify.json 六项是否全部 pass（内存里的 1.6.7 会把失败吞进 DONE），记下 c01、c02 的末行与本机 1.6.8 版本包的 sha256（应为 c5733bc3…），用 wf task done T86-1 --note 写下
-- [executor] 执行端待办 T86-2：P1-C：查找 r4 原件（sha256 1d580864a913f907d6f6c1aacd78d61a13db11976af47c13eb8f3fc995f8794f，72438 字节），先看 workflow/evidence/turn-079/delivered/。脚本用本机已核验的 make_r5.py（708e7dd4…）和 pt5_regress.js（f0d3cec4…，与 rej
+- [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T86-1：逐条核对第86轮六项验收，全部真实 pass，退出码全 0，无失败被 DONE 吞掉：1 build_wf_168.py exit0（自检231/231、63文；T86-2：T86-2 结果：未能生成 r5——不是找不到 r4，而是生成器缺失。
+1 r4 原件：已找到并核对——workflow/evidence/turn-079
 - [executor] 执行端待办 T86-3：P0-A 实景（最后做）：先在 T86-3 未完成时记下 wf status（应为第 86 轮 DONE）、wf task list、local/inbox.json 里的 task:T86-3（应带 action）、wf explain（应写“需要：执行端”）；然后 wf task done T86-3 --note "P0-A 实景"，再记下 done:86 的 why 是否附上三项结果、状态
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
