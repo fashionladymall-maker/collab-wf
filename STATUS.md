@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 81 轮 · 等待用户决定（AWAITING_USER）
+第 81 轮 · 组织消息（COMPOSE）
 
 ## 版本
 - 工具：collab-wf 1.6.6
@@ -23,7 +23,7 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [executor] 需要你批准才能继续：[CONTEXT_FULL] 当前对话的体量达到上限，继续会降低回复质量。恢复包已生成，需要开新对话。policy 的 auto_new_conversation 为 true 时由驱动器自动完成（1.6.4）；停在这里说明没有开启，或自动开新对话没有成功（原因见详情）。 当前对话已 20 轮、约 104689 字符，达到上限（policy：20 轮 / 0 字符）。自动开新对话未成功：适配器 c
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.6.6-d3fc14b.zip`
