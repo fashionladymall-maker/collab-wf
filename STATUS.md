@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 88 轮 · 发送（SEND）
+第 88 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.6.8
@@ -9,7 +9,7 @@
 
 ## 最近一轮
 - 第 87 轮验收通过（2026-10-11T23:33:47+00:00）
-- 本方最新消息：`turns/turn-087.md`
+- 本方最新消息：`turns/turn-088.md`
 - Claude 最新回复：`replies/reply-087.md`
 
 ## 目标
