@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 72 轮 · 发送（SEND）
+第 73 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.6.6
@@ -9,8 +9,8 @@
 
 ## 最近一轮
 - 第 71 轮验收通过（2026-10-10T18:51:17+00:00）
-- 本方最新消息：`turns/turn-071.md`
-- Claude 最新回复：`replies/reply-071.md`
+- 本方最新消息：`turns/turn-072.md`
+- Claude 最新回复：`replies/reply-072.md`
 
 ## 目标
 - 进度 7 / 7
