@@ -160,6 +160,12 @@ def explain(inst: Instance) -> dict:
                         + ("--said <用户原话>" if who == "用户" else "--by executor --reason <理由>")
                         + "（wf status 显示该步的处置表；发送后没有落地用 wf resend）"}
     if s["state"] == "DONE":
+        from . import tasks as _tasks   # 1.6.7：目标达成后仍有执行端待办时先说待办（DONE 不变，做完也不会自动回报）
+        left = _tasks.open_items(inst)
+        if left:
+            return {"where": where, "why": f"全部目标判据已通过；另有 {len(left)} 项执行端待办未完成："
+                    + "；".join(f"{t['id']} {t['text'][:30]}" for t in left[:3]), "who": "执行端",
+                    "what": "做完一项 wf task done <编号> --note \"结果\"；目标已达成，做完不会自动回报，需要继续时 wf kick"}
         return {"where": where, "why": "全部目标判据已通过", "who": "用户", "what": "验收结果；需要继续时 wf kick"}
     if s["state"] == "WAIT_REPLY":
         return {"where": where, "why": "Claude 正在处理消息", "who": "Claude", "what": "无需操作，驱动器会定时检查"}
@@ -1105,12 +1111,21 @@ def h_verify(ctx):
     # 熔断：同一问题连续多轮没有解决
     st["consecutive_failed"] = st.get("consecutive_failed", 0) + 1 if round_failed else 0
     limit = int(ctx.pol.get("max_consecutive_failed_rounds", 3))
+    # 1.6.7（collab-wf-dev 第 80、81 轮）：先登记执行端待办，再判定目标。此前登记在目标判定之后，目标已达成时直接
+    # 进入 DONE 并返回，待办被静默丢弃（不进 inbox，wf task 也看不到）。登记只写待办与 tasks_opened 事件，
+    # 不参与目标判定、熔断与“之后”的选择。
+    from . import tasks as _tasks
+    added = _tasks.add(inst, st["turn"], d.get("executor_tasks") or {})
     # 目标
     prog = goals.run_checks(inst, timeout=ctx.pol.get("command_timeout_s", 900)) if policy.status(inst, "goals")["approved"] else goals.progress(inst)
     if prog.get("reached"):
+        if added:
+            # DONE 的语义不变：目标达成、自动化停下、等用户。待办留在 inbox 里可见；不等待、不自动回报、不推进版本
+            decide(inst, "after", f"目标已达成：{len(added)} 项执行端待办已登记进 inbox，不等待、不自动回报",
+                   "全部目标判据通过；Claude 的【驱动指令】列了执行端待办", "；".join(t["id"] for t in added), "目标达成")
         machine.go(inst, "DONE", by="driver", reason="全部目标判据通过")
         _clear_turn(inst)
-        return "done", "全部目标判据通过"
+        return "done", "全部目标判据通过" + (f"；已登记 {len(added)} 项执行端待办（wf task）" if added else "")
     if prog.get("approved"):
         best = st.get("best_progress", 0)
         if prog["done"] > best:
@@ -1124,9 +1139,7 @@ def h_verify(ctx):
     np_limit = int(ctx.pol.get("max_rounds_without_goal_progress", 8))
     if prog.get("approved") and st.get("rounds_no_progress", 0) >= np_limit:
         return _breaker(ctx, f"连续 {st['rounds_no_progress']} 轮目标没有进展（policy.max_rounds_without_goal_progress = {np_limit}）")
-    from . import tasks as _tasks
-    _tasks.add(inst, st["turn"], d.get("executor_tasks") or {})   # 1.6.6：写给执行端的事登记成可追踪的待办（进 inbox）
-    after = d.get("after") or "report"
+    after = d.get("after") or "report"   # 1.6.7：执行端待办已在目标判定之前登记
     if round_failed or exec_failed:
         after = "report"
     left = _tasks.open_items(inst)

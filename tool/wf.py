@@ -752,8 +752,10 @@ def main(argv=None):
                 raise WfError("用法：wf task done <编号> --note \"结果\"（wf task 列出未完成的待办）")
             t = tasks.done(inst, args.tid, args.note)
             left = tasks.open_items(inst)
-            print(f"已完成 {t['id']}；" + (f"还有 {len(left)} 项未完成" if left else
-                                           "全部待办已完成" + ("，驱动器下次运行时自动生成回报" if inst.state.get("await_executor") is not None else "")))
+            tail = ("，驱动器下次运行时自动生成回报" if inst.state.get("await_executor") is not None else
+                    "；目标已达成，自动化停在这里，不会自动回报：结果已写进 inbox 的“目标已达成”提示与 wf task，"
+                    "需要交给 Claude 时 wf kick" if inst.state.get("state") == "DONE" else "")   # 1.6.7
+            print(f"已完成 {t['id']}；" + (f"还有 {len(left)} 项未完成" if left else "全部待办已完成" + tail))
         else:
             rows = inst.state.get("executor_tasks") or []
             if args.json:

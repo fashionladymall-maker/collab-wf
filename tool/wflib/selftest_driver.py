@@ -353,6 +353,57 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _ok("1.6.6 执行端待办到最迟时间仍未完成：照常生成回报并写明未完成的待办",
         w2 and _state(et2)["state"] == "WAIT_REPLY" and "仍未完成" in last6 and "T1-1" in last6, o + o2)
 
+    # B7. 1.6.7（第 80、81 轮）：目标已达成时执行端待办仍登记进 inbox；DONE 不变、不发送；做完有提示；无待办时行为不变
+    gj7 = json.dumps({"goals": [{"id": "G1", "title": "已交付", "kind": "exec", "check": "cat done.txt",
+                                 "pass": {"exit": 0, "contains": ["ok"]}, "means": "完成", "on_fail": "继续"}]}, ensure_ascii=False)
+    pol7 = {**base_pol, "allow": [r"^echo ", r"^cat "]}
+
+    def _done_setup(name):
+        root = setup(name, pol7, {"done.txt": "ok\n", "workflow/goals.json": gj7})
+        _user(_wf, env, root, "goals", "goals", "approve")
+        _wf(env, root, "kick", "--message", str(task))
+        _wf(env, root, "run")
+        return root
+
+    def _sent(name):
+        return len(sorted((fake / "inbox").glob(f"*-{name}-*.md")))
+
+    dt = _done_setup("dtask")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"],
+        "发布：无\n执行端 1：测试：目标达成后的待办\n之后：等执行端\n验收 1：c1 exit=0"), encoding="utf-8")
+    n7 = _sent("dtask")
+    rc7, o7 = _wf(env, dt, "run")
+    s7 = _state(dt)
+    tid7 = f"T{s7.get('turn')}-1"
+    rc, oa7 = _wf(env, dt, "--json", "ask")
+    ev7 = (dt / "workflow" / "events.jsonl").read_text(encoding="utf-8")
+    _ok("1.6.7 ① 目标已达成时执行端待办仍登记（T<轮次>-1、tasks_opened 事件）并进 inbox（wf ask 可见 task:<编号>）",
+        any(t.get("id") == tid7 and not t.get("done") for t in s7.get("executor_tasks") or [])
+        and f"task:{tid7}" in oa7 and '"tasks_opened"' in ev7, o7 + oa7)
+    rc, oe7 = _wf(env, dt, "explain")
+    _ok("1.6.7 ② 待办登记不改变目标达成：仍进入 DONE（退出码 30），不等待、不发送；explain 先说待办、交给执行端",
+        rc7 == 30 and s7["state"] == "DONE" and s7.get("await_executor") is None and _sent("dtask") == n7
+        and "需要：执行端" in oe7 and "执行端待办" in oe7, o7 + oe7)
+    rc8, o8 = _wf(env, dt, "task", "done", tid7, "--note", "测试：DONE 下已做完")
+    rc9, o9 = _wf(env, dt, "run")
+    rc, oa9 = _wf(env, dt, "--json", "ask")
+    _ok("1.6.7 ③ DONE 下待办做完：wf task done 说明不会自动回报，结果写进“目标已达成”提示；仍停在 DONE、不发送",
+        rc8 == 0 and "不会自动回报" in o8 and rc9 == 30 and _state(dt)["state"] == "DONE"
+        and "测试：DONE 下已做完" in oa9 and f"task:{tid7}" not in oa9 and _sent("dtask") == n7, o8 + o9 + oa9)
+    dn = _done_setup("dnone")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"], "发布：无\n之后：空闲\n验收 1：c1 exit=0"),
+                                              encoding="utf-8")
+    rc10, o10 = _wf(env, dn, "run")
+    rc, oa10 = _wf(env, dn, "--json", "ask")
+    rc, oe10 = _wf(env, dn, "explain")
+    _ok("1.6.7 ④ 没有执行端待办时目标达成的行为不变：DONE、无 tasks_opened 事件、提示原文不变、explain 仍交给用户",
+        rc10 == 30 and _state(dn)["state"] == "DONE" and not _state(dn).get("executor_tasks")
+        and '"tasks_opened"' not in (dn / "workflow" / "events.jsonl").read_text(encoding="utf-8")
+        and "全部目标判据已通过，自动化停在这里" in oa10 and "本轮执行端待办" not in oa10 and "需要：用户" in oe10,
+        o10 + oa10 + oe10)
+
     # C. 独立审查适配器认为应阻止 → 停下等用户
     rv = tmp / "t-review"
     rv.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：发现问题"]}\'\n')

@@ -76,7 +76,13 @@ def notices(inst: Instance) -> list:
     s = machine.status(inst)
     out = []
     if s["state"] == "DONE":
-        out.append({"key": f"done:{s['turn']}", "title": "目标已达成", "why": "全部目标判据已通过，自动化停在这里"})
+        why = "全部目标判据已通过，自动化停在这里"
+        # 1.6.7：目标达成那一轮登记的执行端待办做完后，结果写进这条提示。key 不变（done:<轮次>），交给用户、
+        # 没有 action 与 code，看门狗仍按正常完成提示识别；DONE 不自动回报
+        fin = [t for t in (inst.state.get("executor_tasks") or []) if t.get("turn") == s["turn"] and t.get("done")]
+        if fin:
+            why += "；本轮执行端待办已完成：" + "；".join(f"{t['id']}：{(t.get('note') or '没有写说明')[:80]}" for t in fin[:5])
+        out.append({"key": f"done:{s['turn']}", "title": "目标已达成", "why": why})
     if s["state"] == "QUOTA_WAIT":
         out.append({"key": f"quota:{s.get('until')}", "title": "额度用尽，等待重置",
                     "why": f"将在 {s.get('until')} 后自动继续，不需要你做什么"})
