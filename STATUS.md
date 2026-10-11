@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 85 轮 · 发送（SEND）
+第 86 轮 · 执行与取证（EXECUTE）
 
 ## 版本
 - 工具：collab-wf 1.6.7
@@ -9,8 +9,8 @@
 
 ## 最近一轮
 - 第 82 轮验收通过（2026-10-11T16:04:44+00:00）
-- 本方最新消息：`turns/turn-084.md`
-- Claude 最新回复：`replies/reply-084.md`
+- 本方最新消息：`turns/turn-086.md`
+- Claude 最新回复：`replies/reply-086.md`
 
 ## 目标
 - 进度 7 / 7
@@ -26,5 +26,5 @@
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.7.zip`
+- `artifacts/collab-wf-1.6.8.zip`
 - `artifacts/collab-wf-dev-v2.7.zip`
