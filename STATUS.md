@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 82 轮 · 发送（SEND）
+第 82 轮 · 执行与取证（EXECUTE）
 
 ## 版本
 - 工具：collab-wf 1.6.6
@@ -9,8 +9,8 @@
 
 ## 最近一轮
 - 第 81 轮验收通过（2026-10-11T15:38:35+00:00）
-- 本方最新消息：`turns/turn-081.md`
-- Claude 最新回复：`replies/reply-081.md`
+- 本方最新消息：`turns/turn-082.md`
+- Claude 最新回复：`replies/reply-082.md`
 
 ## 目标
 - 进度 7 / 7
@@ -26,5 +26,5 @@
 - 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.6-d3fc14b.zip`
+- `artifacts/collab-wf-1.6.7.zip`
 - `artifacts/collab-wf-dev-v2.6.zip`
