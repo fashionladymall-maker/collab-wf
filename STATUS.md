@@ -24,6 +24,7 @@
 
 ## 待办
 - [user] 目标已达成：全部目标判据已通过，自动化停在这里
+- [executor] 独立审查 drill-release.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/drill-release.zip.request.json
 
 ## 最新产物
 - `artifacts/collab-wf-1.6.6-d3fc14b.zip`
