@@ -25,9 +25,8 @@
 ## 待办
 - [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T86-1：逐条核对第86轮六项验收，全部真实 pass，退出码全 0，无失败被 DONE 吞掉：1 build_wf_168.py exit0（自检231/231、63文；T86-2：T86-2 结果：未能生成 r5——不是找不到 r4，而是生成器缺失。
 1 r4 原件：已找到并核对——workflow/evidence/turn-079
-- [executor] 执行端待办 T86-3：P0-A 实景（最后做）：先在 T86-3 未完成时记下 wf status（应为第 86 轮 DONE）、wf task list、local/inbox.json 里的 task:T86-3（应带 action）、wf explain（应写“需要：执行端”）；然后 wf task done T86-3 --note "P0-A 实景"，再记下 done:86 的 why 是否附上三项结果、状态
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
 ## 最新产物
-- `artifacts/collab-wf-1.6.8.zip`
+- `artifacts/collab-wf-1.6.8-048f960.zip`
 - `artifacts/collab-wf-dev-v2.7.zip`
