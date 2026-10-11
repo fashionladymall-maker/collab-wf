@@ -282,3 +282,12 @@ collab-wf-dev 第 58 轮：回复正文里写给执行端的事，执行端做�
 - “之后：回报”时待办照样登记、照样进 inbox，回报照常发出；之后做完的结果随下一份回报带上。
 - Claude 写给执行端的事，一律写成“执行端 N：”，不再只写在正文里（此前的“给执行端：”段落没有可追踪的出口）。
 - 1.6.7：目标已达成时同样登记（collab-wf-dev 第 80、81 轮：此前目标判定在前，达成即进入 DONE，待办被静默丢弃）。DONE 的语义不变：自动化停下等用户，“之后”不起作用，不等待、不自动回报、不推进版本；待办照样进 inbox 交给执行端，`wf explain` 先说待办。做完后 `wf task done` 写明不会自动回报，结果写进 inbox 的“目标已达成”提示（key 仍是 done:<轮次>）；需要交给 Claude 时 `wf kick`。
+
+## 25. 1.6.8 失败不被 DONE 吞掉；落地核对按墙钟；R3 飞行宽限；审查演练
+
+collab-wf-dev 第 82、83 轮与改进批次一（P1-D、P2-E）。
+
+- 目标判据通过、但本轮有验收未通过或命令失败时，不进入 DONE，照常回报（决策日志写明“先回报，不进入目标达成”）。DONE 只在“目标达成且本轮干净”时进入；下一轮干净、目标仍达成，照常进入 DONE。执行端待办照样先登记（1.6.7），熔断照常计数。
+- 落地核对（SEND_NOT_LANDED）：policy.json 新增 `landed_timeout_s`（秒）与 `landed_min_polls`（默认 3），都是时间参数，改动不算扩大权限。设了 `landed_timeout_s` 时按墙钟：距本轮发送（sent_at）已满这个秒数、且至少核对了 `landed_min_polls` 次才停下；此时 `landed_confirm_polls` 不再起作用，`landed_poll_s` 仍是核对间隔。没设时沿用旧的次数判定（兼容）。迁移：在 policy.json 里加 `"landed_timeout_s": 2700`，旧的两个参数可以保留。不变量不变：SEND_NOT_LANDED 不自动重发，恢复只用 `wf resend`。
+- `wf bridge-check` 的 R3：发送之后还没有结果、也还没有新的发送时，距现在不超过宽限（`--grace-s`，默认 900 秒）视为仍在飞行、不报，消息里写明在等待；超过宽限照常报（此前作为最后一条的发送永远不报）。结果出现之前又有新的发送，一律报。`--hours` 只过滤日志窗口，不是宽限。
+- `wf drill review --kind block|timeout --dir <空目录> --review <审查程序>`：在隔离目录里让真实驱动器消费真实审查程序的 block 与超时，见 docs/DRILL.md。

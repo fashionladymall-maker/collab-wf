@@ -3,7 +3,7 @@
 第 86 轮 · 执行与取证（EXECUTE）
 
 ## 版本
-- 工具：collab-wf 1.6.7
+- 工具：collab-wf 1.6.8
 - 项目：v2.6；e213fe3 (HEAD -> main, tag: v2.6) release v2.6
 - 仓库指纹：b848fba7f3776a69（7 个文件）
 

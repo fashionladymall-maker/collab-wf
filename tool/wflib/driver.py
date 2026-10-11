@@ -610,6 +610,24 @@ def _quota(inst):
             inst.event("auto", rule="QUOTA_READ", action="ignore", detail=r["raw"][:200], by="driver")
 
 
+def _landed_since(st):
+    """1.6.8（P2-E）：落地核对的墙钟起点：本轮发送时刻（mark_sent 写的 sent_at）；缺失时用第一次核对不到的时刻。"""
+    from .core import parse_iso as _pi
+    return _pi(st.get("sent_at")) or _pi(st.setdefault("send_unconfirmed_since", now_iso()))
+
+
+def _landed_gave_up(ctx, n: int) -> bool:
+    """1.6.8（P2-E）：落地核对何时放弃（进入 SEND_NOT_LANDED；仍不自动重发，恢复只用 wf resend）。
+    policy 有 landed_timeout_s（秒，> 0）时按墙钟：距发送已满 landed_timeout_s，且至少核对了 landed_min_polls 次
+    （默认 3，避免长时间没被唤醒后只查一次就下结论）；此时 landed_confirm_polls 不再起作用。
+    没有 landed_timeout_s 时沿用 landed_confirm_polls 次数（旧行为，兼容）。"""
+    pol, st = ctx.pol, ctx.st
+    lt = int(pol.get("landed_timeout_s", 0) or 0)
+    if lt > 0:
+        return (now() - _landed_since(st)).total_seconds() >= lt and n >= max(1, int(pol.get("landed_min_polls", 3) or 1))
+    return n >= int(pol.get("landed_confirm_polls", 5))
+
+
 def h_wait_reply(ctx):
     inst, st = ctx.inst, ctx.st
     w = _wait_retry(ctx)
@@ -633,16 +651,19 @@ def h_wait_reply(ctx):
     # landed 字段（适配器可给出）或 generating/done 都算“确实落地”；若连续 none，说明消息没落地，按 POLL_NONE 退避/阻塞。
     if status in ("generating", "done") or r["data"].get("landed"):
         st.pop("send_unconfirmed", None)
+        st.pop("send_unconfirmed_since", None)
     elif status == "none":
         n = st.get("send_unconfirmed", 0) + 1
         st["send_unconfirmed"] = n
-        if n >= int(ctx.pol.get("landed_confirm_polls", 5)):
+        if _landed_gave_up(ctx, n):   # 1.6.8（P2-E）：设了 landed_timeout_s 时按墙钟
+            span = int((now() - _landed_since(st)).total_seconds())
             st["send_unconfirmed"] = 0
+            st.pop("send_unconfirmed_since", None)
             st.pop("send_ref", None)
             st["not_landed"] = dict(st.get("last_sent") or {}, turn=st["turn"])   # 1.6.5（W43）：留给 wf resend 恢复本轮消息
             inst.save()
             return _anomaly(ctx, {"source": "driver", "kind": "send_not_landed"},
-                            f"适配器曾报告已接受，但连续 {n} 次轮询都看不到这条消息出现在会话中（缺口 11/§3）")
+                            f"适配器曾报告已接受，但连续 {n} 次轮询（距发送约 {span // 60} 分钟）都看不到这条消息出现在会话中（缺口 11/§3）")
         # 落地未确认：用较短的间隔尽快再查一次，不进入 POLL_NONE 的长退避
         st["poll_after"] = (now() + timedelta(seconds=int(ctx.pol.get("landed_poll_s", 60)))).isoformat(timespec="seconds")
         inst.save()
@@ -1118,7 +1139,13 @@ def h_verify(ctx):
     added = _tasks.add(inst, st["turn"], d.get("executor_tasks") or {})
     # 目标
     prog = goals.run_checks(inst, timeout=ctx.pol.get("command_timeout_s", 900)) if policy.status(inst, "goals")["approved"] else goals.progress(inst)
-    if prog.get("reached"):
+    if prog.get("reached") and (round_failed or exec_failed):
+        # 1.6.8（第 82、83 轮发现）：目标判据通过、但本轮有验收未通过或命令失败时，不进入 DONE，照常回报。此前目标判定在前，
+        # 失败被 DONE 静默吞掉。DONE 只在“目标达成且本轮干净”时进入；下一轮干净且目标仍达成，照常进入 DONE。
+        # 执行端待办已在上面登记；熔断照常计数。
+        decide(inst, "after", "目标判据通过，但本轮有失败：先回报，不进入目标达成",
+               f"验收未通过 {failed_items} 项；命令失败：{'有' if exec_failed else '无'}", "verify.json", "回报")
+    if prog.get("reached") and not (round_failed or exec_failed):
         if added:
             # DONE 的语义不变：目标达成、自动化停下、等用户。待办留在 inbox 里可见；不等待、不自动回报、不推进版本
             decide(inst, "after", f"目标已达成：{len(added)} 项执行端待办已登记进 inbox，不等待、不自动回报",

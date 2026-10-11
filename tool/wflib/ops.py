@@ -600,9 +600,14 @@ BRIDGE_ACTIONS = {"send", "accepted", "rejected", "generating", "done", "retry",
                   "poll", "conv_new", "snapshot"}   # 1.5.0：适配器会记录 poll，此前被 R6 误报为无法解析；1.5.2：conv_new（新建对话）；1.5.3：snapshot
 
 
-def bridge_check(log: Path, hours=None) -> list:
+R3_GRACE_S = 900   # 1.6.8：发送后等结果的宽限（秒）。适配器发送阶段最长约 420 秒（W06），留出余量
+
+
+def bridge_check(log: Path, hours=None, grace_s=None, at=None) -> list:
+    """at：判定所用的“现在”（默认当前时间，自检用固定值）；hours 只过滤日志窗口，不是飞行宽限。"""
     from datetime import timedelta
     from .core import now, parse_iso
+    ref_now = at or now()
     res = []
     ok = lambda rule, cond, msg: res.append({"rule": rule, "ok": bool(cond), "msg": msg})
     log = Path(log)
@@ -611,7 +616,7 @@ def bridge_check(log: Path, hours=None) -> list:
         return res
     raw = log.read_text(encoding="utf-8").splitlines()
     evs, bad = [], []
-    since = now() - timedelta(hours=hours) if hours else None
+    since = ref_now - timedelta(hours=hours) if hours else None
     for i, line in enumerate(raw, 1):
         if not line.strip():
             continue
@@ -638,16 +643,24 @@ def bridge_check(log: Path, hours=None) -> list:
         elif a in ("done", "error", "abort", "aborted", "rejected") and inflight is not None:   # 被拒的发送不在途（1.5.0）
             inflight = None
     ok("R1 一条在途", not v1, "未发现重叠发送" if not v1 else f"上一条未结束又发送：第 {', '.join(map(str, v1[:5]))} 行")
-    # R3 每次发送都有结果
-    v3 = []
+    # R3 每次发送都有结果。1.6.8：发送之后还没有结果、也还没有新的发送时，距 at 不超过宽限（grace_s，默认 R3_GRACE_S）
+    # 视为仍在飞行，不报；超过宽限照常报（此前作为最后一条的发送永远不报，之后跟着 poll、quota 的又会立即误报）。
+    # 结果出现之前又有新的发送，一律报，与宽限无关。
+    v3, flying = [], []
+    g = R3_GRACE_S if grace_s is None else float(grace_s)
     for i, e in enumerate(evs):
         if e["action"] != "send":
             continue
         nxt = next((x for x in evs[i + 1:] if x["action"] in ("accepted", "rejected", "error", "aborted", "send")), None)
-        if nxt is None or nxt["action"] == "send":
-            if nxt is not None or i < len(evs) - 1:
-                v3.append(e["_line"])
-    ok("R3 发送有结果", not v3, "每次发送都有接受、拒绝、错误或中断记录" if not v3 else f"发送后没有结果记录：第 {', '.join(map(str, v3[:5]))} 行")
+        if nxt is not None and nxt["action"] != "send":
+            continue
+        if nxt is None and (ref_now - e["_t"]).total_seconds() <= g:
+            flying.append(e["_line"])
+            continue
+        v3.append(e["_line"])
+    fly = f"；另有 {len(flying)} 条发送在 {int(g)} 秒宽限内等待结果（第 {', '.join(map(str, flying[:5]))} 行）" if flying else ""
+    ok("R3 发送有结果", not v3, ("每次发送都有接受、拒绝、错误或中断记录" if not v3 else
+                               f"发送后没有结果记录（超过 {int(g)} 秒宽限，或结果出现前又有新的发送）：第 {', '.join(map(str, v3[:5]))} 行") + fly)
     # R2 不中止生成：中止前须连续被拒至少 10 分钟，且期间没有生成迹象
     v2 = []
     for i, e in enumerate(evs):

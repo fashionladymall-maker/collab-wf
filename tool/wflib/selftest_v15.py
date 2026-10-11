@@ -123,6 +123,28 @@ def _t_bridge(_ok):
         res = {r["rule"].split()[0]: r for r in ops.bridge_check(log)}
         _ok("桥接自检：poll 是合法动作（R6 曾把它误报为无法解析）", res["R6"]["ok"], res["R6"]["msg"])
         _ok("桥接自检：被拒后重发不算重叠发送（R1 曾因此误报）", res["R1"]["ok"], res["R1"]["msg"])
+        # 1.6.8：R3 的飞行宽限（时钟、终态、新的发送、过滤窗口的边界）
+        from datetime import datetime, timedelta, timezone
+        t0 = datetime(2026, 10, 10, 5, 0, 0, tzinfo=timezone.utc)
+
+        def r3(rows, at, **kw):
+            log.write_text("\n".join(json.dumps({"ts": (t0 + timedelta(seconds=s)).isoformat(), "action": a}) for s, a in rows) + "\n",
+                           encoding="utf-8")
+            return {r["rule"].split()[0]: r for r in ops.bridge_check(log, at=t0 + timedelta(seconds=at), **kw)}["R3"]
+        fly = [(0, "send"), (30, "poll"), (40, "quota")]
+        a = r3(fly, 60)
+        _ok("R3 宽限：发送后只有 poll、quota、还在宽限内（60 秒）→ 不报，并写明在等待", a["ok"] and "宽限内等待结果" in a["msg"], a["msg"])
+        _ok("R3 宽限：恰好等于宽限（900 秒）不报，超过 1 秒（901 秒）照常报", r3(fly, 900)["ok"] and not r3(fly, 901)["ok"])
+        _ok("R3 宽限：只有一条发送且已过期（1 小时）照常报（此前作为最后一条的发送永远不报）", not r3([(0, "send")], 3600)["ok"])
+        _ok("R3 终态：有接受、拒绝、错误或中断记录时，过多久都不报",
+            all(r3([(0, "send"), (5, "poll"), (9, x)], 86400)["ok"] for x in ("accepted", "rejected", "error", "aborted")))
+        b = r3([(0, "send"), (5, "poll"), (10, "send"), (12, "accepted")], 20)
+        _ok("R3 新的发送：结果出现前又有新的发送，在宽限内也照常报第一条", not b["ok"] and "第 1 行" in b["msg"], b["msg"])
+        _ok("R3 宽限可调：--grace-s 0 时 60 秒前的在途发送照常报", not r3(fly, 60, grace_s=0)["ok"])
+        _ok("R3 过滤窗口不是宽限：窗口外的旧发送不检查；窗口内超过宽限的照常报",
+            r3([(0, "send"), (5, "poll")], 7200, hours=1)["ok"] and not r3([(0, "send"), (5, "poll")], 7200, hours=3)["ok"]
+            and not r3([(0, "send"), (5, "poll")], 1800, hours=1)["ok"])
+        _ok("R3 时钟：发送时间晚于判定时刻（时钟偏差）按在途处理、不报", r3([(120, "send")], 0)["ok"])
 
 
 def _t_usage_seq(_ok):

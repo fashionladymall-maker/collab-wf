@@ -404,6 +404,26 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
         and "全部目标判据已通过，自动化停在这里" in oa10 and "本轮执行端待办" not in oa10 and "需要：用户" in oe10,
         o10 + oa10 + oe10)
 
+    # B8. 1.6.8：目标判据通过、但本轮验收未通过：不进入 DONE，照常回报；待办照样登记；下一轮干净时照常进入 DONE
+    df = _done_setup("dfail")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"],
+        "发布：无\n执行端 1：测试：失败轮的待办\n之后：空闲\n验收 1：c1 exit=0 包含 \"不会出现的字样\""), encoding="utf-8")
+    n8 = _sent("dfail")
+    rc8, o8 = _wf(env, df, "run")
+    s8 = _state(df)
+    last8 = sorted((fake / "inbox").glob("*-dfail-*.md"))[-1].read_text(encoding="utf-8")
+    dec8 = (df / "workflow" / "decisions.jsonl").read_text(encoding="utf-8")
+    _ok("1.6.8 目标判据通过但本轮验收未通过：不进入 DONE、照常发出回报（写明未通过的清单项），待办照样登记，决策日志说明原因",
+        s8["state"] == "WAIT_REPLY" and _sent("dfail") == n8 + 1 and "清单第 1 项" in last8
+        and any(str(t.get("id", "")).endswith("-1") for t in s8.get("executor_tasks") or []) and "先回报，不进入目标达成" in dec8,
+        o8 + last8[:400])
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"], "发布：无\n之后：空闲\n验收 1：c1 exit=0 包含 \"hi\""),
+                                              encoding="utf-8")
+    rc9, o9 = _wf(env, df, "run")
+    _ok("1.6.8 下一轮干净且目标仍达成：照常进入 DONE（退出码 30）", rc9 == 30 and _state(df)["state"] == "DONE", o9)
+
     # C. 独立审查适配器认为应阻止 → 停下等用户
     rv = tmp / "t-review"
     rv.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：发现问题"]}\'\n')
@@ -584,7 +604,54 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _ok("1.6.5 发送后没有落地：wf resend 由执行端代决恢复本轮消息并重新发送，事件如实记 by=executor（W43）",
         rc4 == 0 and _state(nl)["state"] == "WAIT_REPLY" and '"resend_not_landed"' in evn and '"executor_decision"' in evn
         and '"by": "executor"' in evn, o4 + o5)
+    # C2c. 1.6.8（P2-E）：设了 landed_timeout_s 时按墙钟判定落地核对
+    lw = setup("landwall", {**base_pol, "landed_confirm_polls": 1, "landed_poll_s": 0, "landed_timeout_s": 3600})
+    (fake / "poll_never").write_text("1")
+    _wf(env, lw, "kick", "--message", str(task))
+    _wf(env, lw, "run")
+    rc, ow1 = _wf(env, lw, "run")
+    _ok("1.6.8 墙钟落地核对：landed_confirm_polls 已满但没到 landed_timeout_s，不放弃、仍在等回复",
+        _state(lw)["state"] == "WAIT_REPLY" and "SEND_NOT_LANDED" not in ow1, ow1)
+    lw2 = setup("landwall2", {**base_pol, "landed_poll_s": 1, "landed_timeout_s": 1, "landed_min_polls": 3})
+    _wf(env, lw2, "kick", "--message", str(task))
+    _wf(env, lw2, "run")
+    n_lw2 = len(list((fake / "inbox").glob("*-landwall2-*.md")))
+    __import__("time").sleep(1.3)
+    rc, ow2 = _wf(env, lw2, "run")
+    s_mid = _state(lw2)
+    mid = s_mid["state"] == "WAIT_REPLY" and 1 <= int(s_mid.get("send_unconfirmed") or 0) < 3
+    ow3 = ""
+    for _ in range(6):
+        if _state(lw2)["state"] != "WAIT_REPLY":
+            break
+        __import__("time").sleep(1.1)
+        rc, o_ = _wf(env, lw2, "run")
+        ow3 += o_
+    (fake / "poll_never").unlink()
+    _ok("1.6.8 墙钟落地核对：时间已到但核对次数不足 landed_min_polls 时不放弃；时间与次数都满足才停在 SEND_NOT_LANDED，且没有重发",
+        mid and _state(lw2)["state"] == "BLOCKED" and "SEND_NOT_LANDED" in ow3 and "距发送约" in ow3
+        and len(list((fake / "inbox").glob("*-landwall2-*.md"))) == n_lw2 == 1, ow2 + ow3 + str(s_mid.get("send_unconfirmed")))
     (local / "transport.json").write_text(json.dumps(tcfg))
+
+    # C2d. 1.6.8（P1-D）：wf drill review 在隔离目录里让真实驱动器消费审查程序的 block 与超时
+    rvb = tmp / "t-review-drill-block"
+    rvb.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：削弱了四道底线"]}\'\n')
+    rvb.chmod(0o755)
+    rvt = tmp / "t-review-drill-slow"
+    rvt.write_text("#!/bin/sh\nsleep 6\necho '{\"verdict\": \"pass\"}'\n")
+    rvt.chmod(0o755)
+    rcb, ob = _wf(env, tmp, "drill", "review", "--kind", "block", "--dir", str(tmp / "drill-b"), "--review", str(rvb))
+    resb = json.loads((tmp / "drill-b" / "drill-result.json").read_text(encoding="utf-8")) if (tmp / "drill-b" / "drill-result.json").exists() else {}
+    _ok("1.6.8 演练 block：驱动器停在 AWAITING_USER、审查意见可见、版本包没有落地；演练项目已暂停、不在生产注册表里",
+        rcb == 0 and resb.get("ok") and resb.get("state") == "AWAITING_USER"
+        and resb.get("project", "x") not in (local / "registry.json").read_text(encoding="utf-8"), ob[-800:])
+    rct, ot = _wf(env, tmp, "drill", "review", "--kind", "timeout", "--dir", str(tmp / "drill-t"), "--review", str(rvt),
+                  "--review-timeout-s", "2")
+    rest = json.loads((tmp / "drill-t" / "drill-result.json").read_text(encoding="utf-8")) if (tmp / "drill-t" / "drill-result.json").exists() else {}
+    _ok("1.6.8 演练超时：决策日志记“未审查”、没有结论文件、良性版本包照常落地并继续",
+        rct == 0 and rest.get("ok"), ot[-800:])
+    rcx, ox = _wf(env, tmp, "drill", "review", "--kind", "block", "--dir", str(tmp / "drill-b"), "--review", str(rvb))
+    _ok("1.6.8 演练目录不空时拒绝运行（不覆盖、不删除已有证据）", rcx != 0 and "必须不存在或为空" in ox, ox[-300:])
 
     # 手动发送登记 ref → 驱动器从 WAIT_REPLY 接管
     k = setup("manualref", base_pol)

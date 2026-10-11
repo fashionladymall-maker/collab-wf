@@ -69,7 +69,8 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf notify test | status            系统通知：发一条测试通知 / 查看是否开启（wf tick 跑完后自动通知新的待决事项）
   wf sync [--dry-run] [--force]      项目上下文同步到执行端配置的仓库（docs/SYNC.md）
   wf snapshot <文件,…> [--max-chars N] [--out F]   按 Claude 的要求生成有界的文件包
-  wf bridge-check --log <桥接日志> [--hours 24]    核对桥接工具日志是否满足行为约定
+  wf bridge-check --log <桥接日志> [--hours 24] [--grace-s 900]    核对桥接工具日志是否满足行为约定
+  wf drill review --kind block|timeout --dir <空目录> --review <审查程序>    独立审查的驱动器侧演练（docs/DRILL.md）
 
 工具自身：
   wf version | wf self-init | wf self-update [--auto] <zip> | wf self-rollback <版本> | wf selftest
@@ -323,6 +324,10 @@ def main(argv=None):
     x.add_argument("--out")
     x = sub.add_parser("bridge-check"); x.add_argument("--log"); x.add_argument("--hours", type=float)
     x.add_argument("--list-actions", action="store_true")
+    x.add_argument("--grace-s", type=float, help="发送后等结果的宽限秒数（默认 900）")   # 1.6.8
+    x = sub.add_parser("drill"); x.add_argument("what", choices=["review"]); x.add_argument("--kind", required=True, choices=["block", "timeout"])
+    x.add_argument("--dir", required=True); x.add_argument("--review", required=True)
+    x.add_argument("--review-timeout-s", type=int, default=900)   # 1.6.8（P1-D）：docs/DRILL.md
     x = sub.add_parser("run"); x.add_argument("--max-seconds", type=float, default=600); x.add_argument("--max-steps", type=int, default=40)
     x = sub.add_parser("tick"); x.add_argument("--max-seconds", type=float, default=900)
     sub.add_parser("explain")
@@ -663,6 +668,18 @@ def main(argv=None):
             print(f"文件包：{args.out}（{len(text)} 字符）")
         else:
             print(text)
+    elif c == "drill":   # 1.6.8（P1-D）：独立审查 block 与超时的驱动器侧演练，隔离在 --dir 里（docs/DRILL.md）
+        from wflib import drill
+        r = drill.run(args.kind, Path(args.dir), args.review, args.review_timeout_s)
+        if args.json:
+            out(r)
+        else:
+            for x in r["checks"]:
+                print(f"{'✓' if x['ok'] else '✗'} {x['check']}" + ("" if x["ok"] else f"  —— {x['detail']}"))
+            print(f"\n演练（{r['kind']}）{'通过' if r['ok'] else '未通过'}：项目 {r['project']}，状态 {r['state']}；"
+                  f"结果与证据清单见 {Path(r['dir']) / 'drill-result.json'}；演练项目已暂停，目录保留")
+        if not r["ok"]:
+            sys.exit(1)
     elif c == "bridge-check":
         if args.list_actions:
             acts = sorted(ops.BRIDGE_ACTIONS)
@@ -670,7 +687,7 @@ def main(argv=None):
             return
         if not args.log:
             raise WfError("用法：wf bridge-check --log <日志>，或 wf bridge-check --list-actions")
-        res = ops.bridge_check(Path(args.log), args.hours)
+        res = ops.bridge_check(Path(args.log), args.hours, args.grace_s)
         if args.json:
             out(res)
         else:

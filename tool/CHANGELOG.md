@@ -1,5 +1,16 @@
 # CHANGELOG（collab-wf）
 
+## 1.6.8 — 2026-10-12
+
+改进批次一的第二个工具版本（collab-wf-dev 第 82–84 轮）。
+- 目标判据通过、但本轮有验收未通过或命令失败时不进入 DONE，照常回报；下一轮干净时照常进入 DONE（driver.py h_verify）。执行端待办照样先登记，结果不明不重发不变。
+- P2-E：落地核对可按墙钟计时：policy 的 landed_timeout_s 与 landed_min_polls（时间参数，不算扩大权限）；没设时沿用 landed_confirm_polls。SEND_NOT_LANDED 仍不自动重发。
+- wf bridge-check：R3 对在途发送给有限宽限（--grace-s，默认 900 秒），超过照常报；结果出现前又有新的发送一律报；作为最后一条的旧发送不再被漏报。判定时刻可固定（自检用）。
+- P1-D：wf drill review --kind block|timeout（wflib/drill.py、docs/DRILL.md）：WF_LOCAL_DIR 隔离的一次性演练项目，替身只替代 Claude 通道，审查用真实程序；结束后暂停项目、保留目录。
+- 构建器：自检在副本上运行，打包时过滤 local/、.git、__pycache__、*.pyc，并核对版本包成员集合等于文件清单加 MANIFEST.json（W46）。
+- 文档：DRIVER.md 第 25 节、DRILL.md。
+- 自检新增 15 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.6.7 — 2026-10-11
 
 目标已达成时执行端待办不再丢失（collab-wf-dev 第 80 轮发现、第 81 轮真实复现：DONE 后 wf task 与 inbox 都没有 T81-1）。
