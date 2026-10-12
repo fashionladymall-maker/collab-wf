@@ -23,12 +23,8 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [user] 目标已达成：全部目标判据已通过，自动化停在这里
-- [executor] 执行端待办 T99-2：两个项目同时运行的本机实测，攒满 2 小时后写进 wf task done，内容如下：
-- [executor] 执行端待办 T99-3：两项做完后，先用 wf note --kind info 写说明，再用 wf kick --kind report 发回报
+- [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T100-2：用户 21:02 明确新范围『这里只保留 collab-wf，其余项目清除』，已执行：amy-local 备份到 /Users/admin/.workbuddy；T100-3：T100-2 已按用户新范围处理（amy-local 清理归档，不解冻）；1.7.6 事后补审 pass 已 note。后续主线转为单项目 collab
 - [executor] 执行端待办 T100-1：同步程序 gh_sync.py 接受 --repo 参数（给了就推到它指定的仓库，没给就保持现状）。改好后在 transport.json 加 "sync_repos": {"collab-wf-dev": "fashionladymall-maker/collab-wf"}，amy-local 等用户决定仓库后再加。然后用一次 wf sync --dry-run 加一次真实推送，确认 colla
-- [executor] 执行端待办 T100-2：通道恢复、1.7.6 装好后，解冻 amy-local（wf.json 的 auto 改回 true）。需要补充说明的，先用 wf --project amy-local tell 排队。记下两件事：它下一条续接消息里有没有带块规格；那边回复的 intake 里 blocks_missing 的原文。如果连续 3 轮仍缺块，它会自动停下，这时把原文带回即可。结果写进 wf task done
-- [executor] 执行端待办 T100-3：两项做完后，先用 wf note --kind info 写说明，再用 wf kick --kind report 发回报
 
 ## 最新产物
 - `artifacts/collab-wf-1.7.6.zip`
