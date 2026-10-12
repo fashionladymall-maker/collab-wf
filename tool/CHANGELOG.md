@@ -1,5 +1,14 @@
 # CHANGELOG（collab-wf）
 
+## 1.7.3 — 2026-10-12
+
+多项目隔离 S2 的工具侧：按项目寻址（collab-wf-dev 第 93 轮，执行端接口评估 T92-2）。
+- 信号按项目分目录（local/signals/<项目>/），旧位置带项目的读取时搬入；wf --project <名> signal list | clear 只看本项目。inbox 里信号的 key 不变。
+- 分项目只读视图 local/views/<项目>/inbox.json；全局 inbox 不变。
+- transport.json 声明 review_key 时给审查程序传 --key（项目版本 <项目>.t<轮次>.<包名>，工具版本 collab-wf.tool.<包名>）。
+- 项目版本的审查等待输出开始行与周期心跳。
+- DRIVER.md 第 30 节、TRANSPORT.md review 一节、USER.md“同时跑几个项目时”。自检新增 2 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.7.2 — 2026-10-12
 
 多项目隔离 S3：每个项目自己的定时任务（collab-wf-dev 第 92 轮，ISOLATION.md 第 6 节）。

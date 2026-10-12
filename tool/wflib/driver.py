@@ -857,8 +857,12 @@ def _independent_review(ctx, src, zip_path) -> list:
         parts += list(difflib.unified_diff(old, new, f"a/{rel}", f"b/{rel}", lineterm=""))
     diff = inst.turn_dir() / "release.diff"
     diff.write_text("\n".join(parts)[:400000], encoding="utf-8")
-    r = anomaly.call("review", ["--project", inst.name, "--turn", inst.state["turn"], "--release", zip_path,
-                                "--diff", diff], timeout=anomaly.transport_cfg().get("review_timeout_s", 900))
+    tmo = int(anomaly.transport_cfg().get("review_timeout_s", 900) or 900)
+    hb = max(1, int(anomaly.transport_cfg().get("review_heartbeat_s", 30) or 30))
+    rargs = ["--project", inst.name, "--turn", inst.state["turn"], "--release", zip_path, "--diff", diff]
+    rargs += anomaly.review_key_args(inst.name, inst.state["turn"], zip_path)   # 1.7.3：审查键（声明 review_key 时）
+    # 1.7.3：项目版本的审查等待同样输出开始行与周期心跳（1.6.9 只覆盖了工具版本）
+    r = release._with_heartbeat(lambda: anomaly.call("review", rargs, timeout=tmo), tmo, hb)
     if r["code"] != 0 or r["data"].get("verdict") not in ("pass", "concerns", "block"):
         decide(inst, "review", "独立审查不可用，按规则继续", f"适配器返回 {r['code']}：{r['raw'][:120]}", str(diff), "未审查")
         return []

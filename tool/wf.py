@@ -820,9 +820,11 @@ def main(argv=None):
         elif args.action == "clear":
             if not args.key:
                 raise WfError("用法：wf signal clear --key <键>")
-            print("已清除" if signals.clear(args.key) else "没有这个信号")
+            print("已清除" if signals.clear(args.key, getattr(args, "project", None) or None) else "没有这个信号")
         else:
             rows = signals.load()
+            if getattr(args, "project", None):   # 1.7.3：wf --project <名> signal list 只列本项目
+                rows = [r for r in rows if r.get("project") == args.project]
             if args.json:
                 out({"signals": rows})
             else:

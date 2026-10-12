@@ -1281,6 +1281,65 @@ def _t_v172_schedule(_ok):
         and rc6 != 0 and "nosuch" in o6, json.dumps([o1[-200:], rows2, rows3, keys, o4, rows5, o6[-200:]], ensure_ascii=False)[:1500])
 
 
+def _t_v173_signals(_ok):
+    from . import signals
+    orig = signals.SIG_DIR
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            signals.SIG_DIR = Path(td) / "signals"
+            signals.add("k1", "A 的事", project="pa", source="test")
+            signals.add("k1", "B 的事", project="pb", source="test")
+            signals.add("g1", "没有项目的事", source="test")
+            legacy = signals._path("k9")   # 旧位置里带项目的信号：读取时搬进分目录
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_text(json.dumps({"key": "k9", "project": "pc", "for": "executor", "title": "旧位置", "since": "t"}),
+                              encoding="utf-8")
+            rows = signals.load()
+            got = sorted((r["key"], r.get("project") or "") for r in rows)
+            moved = (signals.SIG_DIR / "pc" / legacy.name).exists() and not legacy.exists()
+            in_dirs = (signals._path("k1", "pa").exists() and signals._path("k1", "pb").exists()
+                       and signals._path("g1").parent == signals.SIG_DIR)
+            c1 = signals.clear("k1", "pa")
+            after1 = sorted((r["key"], r.get("project") or "") for r in signals.load())
+            c2 = signals.clear("k1")
+            after2 = sorted((r["key"], r.get("project") or "") for r in signals.load())
+        finally:
+            signals.SIG_DIR = orig
+    _ok("1.7.3 信号按项目：带项目的写进 signals/<项目>/、同一个 key 两个项目各一份；旧位置带项目的读取时搬进分目录；"
+        "按项目清除只清本项目，不带项目时清所有位置",
+        got == [("g1", ""), ("k1", "pa"), ("k1", "pb"), ("k9", "pc")] and moved and in_dirs and c1 and c2
+        and after1 == [("g1", ""), ("k1", "pb"), ("k9", "pc")] and after2 == [("g1", ""), ("k9", "pc")],
+        str([got, moved, in_dirs, after1, after2]))
+
+
+def _t_v173_views_key(_ok):
+    from . import anomaly, notify
+    with tempfile.TemporaryDirectory() as td:
+        inbox = Path(td) / "inbox.json"
+        base = {"for": "executor", "why": "", "action": "", "code": ""}
+        notify.write_inbox([], inbox, items=[{**base, "project": "pa", "key": "pa|A", "title": "A"},
+                                             {**base, "project": "pb", "key": "pb|B", "title": "B"},
+                                             {**base, "project": "", "key": "signal|g", "title": "全局"}])
+        va = json.loads((Path(td) / "views" / "pa" / "inbox.json").read_text(encoding="utf-8"))
+        vb = json.loads((Path(td) / "views" / "pb" / "inbox.json").read_text(encoding="utf-8"))
+        allk = [x["key"] for x in json.loads(inbox.read_text(encoding="utf-8"))["items"]]
+    orig = anomaly.transport_cfg
+    try:
+        anomaly.transport_cfg = lambda: {}
+        k0 = anomaly.review_key_args("pa", 7, "/x/pa-v1.0.zip")
+        anomaly.transport_cfg = lambda: {"review_key": True}
+        k1 = anomaly.review_key_args("pa", 7, "/x/pa-v1.0.zip")
+        k2 = anomaly.review_key_args("pb", 7, "/y/pa-v1.0.zip")
+        k3 = anomaly.review_key_args("collab-wf", "tool", "/z/collab-wf-1.7.3.zip")
+    finally:
+        anomaly.transport_cfg = orig
+    _ok("1.7.3 分项目视图只含本项目、全局 inbox 不变；审查键：没声明不传，声明后按项目与轮次区分同名包，工具版本用 tool",
+        [x["key"] for x in va["items"]] == ["pa|A"] and [x["key"] for x in vb["items"]] == ["pb|B"]
+        and allk == ["pa|A", "pb|B", "signal|g"] and k0 == [] and k1 == ["--key", "pa.t7.pa-v1.0"]
+        and k2 == ["--key", "pb.t7.pa-v1.0"] and k3 == ["--key", "collab-wf.tool.collab-wf-1.7.3"],
+        str([va, vb, allk, k0, k1, k2, k3])[:800])
+
+
 def _t_v170_sync_reasons(_ok):
     from . import sync
     d = sync.scan_detailed({"artifacts/x.zip": b"not a zip", "a.txt": "普通文字\n".encode("utf-8")})
@@ -1324,7 +1383,8 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.9 暂停与静音不报停滞", _t_v169_quiet), ("1.6.9 结果不明不算停留过久", _t_v169_send_dwell),
          ("1.6.9 同步暂停提示", _t_v169_sync_notice), ("1.6.9 审查心跳", _t_v169_review_heartbeat),
          ("1.7.0 对话参数", _t_v170_conv_args), ("1.7.0 同步阻断原因", _t_v170_sync_reasons),
-         ("1.7.0 适配器告警去重", _t_v170_warning_dedupe), ("1.7.2 每项目定时任务", _t_v172_schedule)]
+         ("1.7.0 适配器告警去重", _t_v170_warning_dedupe), ("1.7.2 每项目定时任务", _t_v172_schedule),
+         ("1.7.3 信号按项目", _t_v173_signals), ("1.7.3 分项目视图与审查键", _t_v173_views_key)]
 
 
 def run_v15(_ok) -> None:

@@ -93,6 +93,8 @@ review --project <项目> --turn <轮次> --release <版本包> --diff <改动�
 退出码 0，标准输出最后一行：`{"verdict": "pass" | "concerns" | "block", "model": "审查所用模型", "notes": ["…"]}`。
 用来接入另一个模型系列做独立审查。它只能阻止（block）或提出关注点（concerns），不能放行任何东西；不可用时驱动器记录“未审查”并照常按其他规则继续。
 
+1.7.3：transport.json 写 `"review_key": true` 后，wf 多传 `--key <键>`（项目版本 `<项目>.t<轮次>.<版本包名去掉 .zip>`，工具版本 `collab-wf.tool.<版本包名去掉 .zip>`）。审查程序的全部文件都用这个键命名，不再从版本包文件名反推；同一轮同一个包重审时键相同。
+
 ## quota（可选）
 
 ```

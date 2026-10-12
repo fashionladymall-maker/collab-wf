@@ -346,3 +346,13 @@ collab-wf-dev 第 92 轮；设计见该项目的 ISOLATION.md 第 6 节。一次
 - `wf --project <名> schedule release`：撤回登记，全局定时任务下次起推进它（另需 launchctl bootout 卸载那个配置）。
 - `wf schedule status`：有自己定时任务的项目按它自己的周期判断是否停了。
 - 同一项目不会被两个进程同时推进（项目锁不变）。P0-C（单条长命令占满 tick）因此只影响这个项目自己。
+
+## 30. 1.7.3 按项目寻址（多项目隔离 S2 的工具侧）
+
+collab-wf-dev 第 93 轮；按执行端的接口评估（T92-2）实现。
+
+- 信号：`wf --project <名> signal add` 写到 local/signals/<名>/，没有项目的仍在 local/signals/；写路径由工具决定，执行端照旧经 wf 命令读写。旧位置里带项目的信号在读取时由工具一次性搬进分目录。`wf --project <名> signal list | clear` 只看本项目；不带 --project 的 clear 清所有位置里这个 key 的。inbox 里信号的 key 不变（signal|<键>）。
+- 分项目视图：每次写 inbox 时同时写 local/views/<名>/inbox.json（只含本项目的项），只由工具生成、只读；执行端照旧读全局 local/inbox.json。local/views/<名>/ 与项目工作树是两回事。按项目的机器可读待办也可以用 `wf --project <名> --json ask`。
+- 审查键：transport.json 声明 `"review_key": true` 时，工具给审查程序传 `--key`——项目版本为 `<项目>.t<轮次>.<版本包名去掉 .zip>`，工具版本为 `collab-wf.tool.<版本包名去掉 .zip>`；同一轮同一个包重审时键相同。审查程序的请求、心跳、未审查标记与信号都用这个键。没声明时不传（旧程序不认识这个参数）。
+- 项目版本的审查等待也输出开始行与周期心跳（1.6.9 只覆盖了工具版本）。
+- 唤醒按项目找会话属于执行端的唤醒程序（I6）；没有会话时的告警请用带项目的信号（例如 key 为 wake:<项目>:<事项>），一个项目没开窗口不影响另一个项目的告警。

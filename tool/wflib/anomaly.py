@@ -85,6 +85,16 @@ def conv_args(inst) -> list:
     return ["--conv", str(cid)] if cid else []
 
 
+def review_key_args(project: str, turn, zip_path) -> list:
+    """1.7.3（ISOLATION.md S2，执行端第 93 轮意见）：transport.json 声明 review_key 时，由工具给审查程序显式传键，
+    审查程序不再从版本包文件名反推（两个项目同名的版本包会撞）。同一轮同一个包重审时键相同。"""
+    if not transport_cfg().get("review_key"):
+        return []
+    stem = Path(str(zip_path)).name
+    stem = stem[:-4] if stem.endswith(".zip") else stem
+    return ["--key", f"{project}.tool.{stem}" if str(turn) == "tool" else f"{project}.t{turn}.{stem}"]
+
+
 def conv_new_args(inst) -> list:
     """1.7.0（ISOLATION.md S1）：声明 per_project_conv 时，conv_new 带上项目名，适配器只改该项目的绑定、不改默认对话。"""
     return ["--project", inst.name] if transport_cfg().get("per_project_conv") else []

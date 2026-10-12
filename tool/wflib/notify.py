@@ -134,7 +134,25 @@ def write_inbox(projects, path=None, items=None) -> list:
     1.7.2：每个项目自己的定时任务会并发写它，读改写放在文件锁里。"""
     path = path or INBOX
     with _inbox_lock(path):
-        return _write_inbox_locked(projects, path, items)
+        res = _write_inbox_locked(projects, path, items)
+        _write_views(projects, path, res)
+        return res
+
+
+def _write_views(projects, path, items) -> None:
+    """1.7.3（ISOLATION.md S2）：分项目的只读视图 local/views/<项目>/inbox.json，由工具生成；执行端照旧读全局 inbox。
+    注意 local/views/<项目>/ 与项目工作树是两回事。"""
+    import re as _re
+    names = {getattr(i, "name", "") for i in projects or []} | {x.get("project") or "" for x in items}
+    base = os.path.join(os.path.dirname(str(path)) or ".", "views")
+    for n in sorted(x for x in names if x):
+        try:
+            d = os.path.join(base, _re.sub(r"[^A-Za-z0-9_.-]", "_", n)[:80] or "_")
+            os.makedirs(d, exist_ok=True)
+            write_json(os.path.join(d, "inbox.json"), {"updated": now_iso(), "project": n, "view_of": str(path),
+                                                       "items": [x for x in items if x.get("project") == n]})
+        except OSError:
+            continue
 
 
 def _inbox_lock(path):

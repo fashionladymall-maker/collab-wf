@@ -329,7 +329,9 @@ def _review_tool(src: Path, zip_path) -> tuple:
     tmo = int(anomaly.transport_cfg().get("review_timeout_s", 900) or 900)
     hb = max(1, int(anomaly.transport_cfg().get("review_heartbeat_s", 30) or 30))
     r = _with_heartbeat(lambda: anomaly.call("review", ["--kind", "tool", "--project", "collab-wf", "--turn", "0",
-                                                        "--release", zip_path, "--diff", diff], timeout=tmo), tmo, hb)
+                                                        "--release", zip_path, "--diff", diff]
+                                             + anomaly.review_key_args("collab-wf", "tool", zip_path),   # 1.7.3
+                                             timeout=tmo), tmo, hb)
     data = r.get("data") or {}
     if r.get("code") != 0 or data.get("verdict") not in ("pass", "concerns", "block"):
         why = (r.get("raw") or "")[:200] or f"审查程序退出码 {r.get('code')}"
