@@ -34,5 +34,6 @@
   "gates": [],
   "landed_confirm_polls": 45,
   "landed_poll_s": 60,
+  "landed_timeout_s": 2700,
   "auto_new_conversation": true
 }
