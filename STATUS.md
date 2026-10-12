@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 96 轮 · 目标达成（DONE）
+第 97 轮 · 目标达成（DONE）
 
 ## 版本
 - 工具：collab-wf 1.7.4
@@ -8,9 +8,9 @@
 - 仓库指纹：6173d2069d354e57（10 个文件）
 
 ## 最近一轮
-- 第 96 轮验收通过（2026-10-12T04:52:54+00:00）
-- 本方最新消息：`turns/turn-096.md`
-- Claude 最新回复：`replies/reply-096.md`
+- 第 97 轮验收通过（2026-10-12T05:02:42+00:00）
+- 本方最新消息：`turns/turn-097.md`
+- Claude 最新回复：`replies/reply-097.md`
 
 ## 目标
 - 进度 7 / 7
@@ -24,9 +24,9 @@
 
 ## 待办
 - [user] 目标已达成：全部目标判据已通过，自动化停在这里
-- [executor] 执行端待办 T96-1：唤醒通道 429（W56）：查明限流来自哪一层、按什么窗口计数，降低投递频率（例如同一会话的投递合并、退避遵守响应里的重试时间）或换用不限流的投递方式；写清改了什么、改后连续 2 小时的投递成功与失败次数。另外，回报发出后清除 review-late:collab-wf.tool.collab-wf-1.7.4 信号。结果写进 wf task done
-- [executor] 执行端待办 T96-2：把【需要用户决定】的三项原样转告用户本人；收到回复后用 wf said 逐字记下原话，并在 wf task done 里写明。没有回音就不催、不代决，写明“已转告、未回复”即可
-- [executor] 执行端待办 T96-3：两项做完后，先用 wf note --kind info 写说明，再用 wf kick --kind report 发回报
+- [executor] 执行端待办 T97-1：按 REVIEW.md 第 3 节对 v3.1 做事后补审（collab-wf-dev.t96.collab-wf-dev-v3.1，只改 PROJECT.md 与 CHANGELOG.md），结论写进 wf task done；补审后清除对应的审查请求信号
+- [executor] 执行端待办 T97-2：到 14:56 之后，从 wake.log 统计 W56 改动后连续 2 小时的投递成功次数、因 429 失败的次数、冷却跳过的次数，逐字摘几行原文，写进 wf task done
+- [executor] 执行端待办 T97-3：两项做完后，用 wf kick --kind report 发回报；之后若无用户回复，就停在 DONE，不再发起
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
 ## 最新产物
