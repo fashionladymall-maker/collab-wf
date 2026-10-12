@@ -23,7 +23,6 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [executor] 执行端待办 T91-2：I1 真实发送核对：在适配器动作日志里找到第 91 轮回报与本轮之后第一次发送的记录，逐字复制它们所用的对话（应为 collab-wf-dev 登记的对话）与告警字段（应无 conv_from_default）；再用 wf audit 查第 91、92 轮有没有 ADAPTER_WARNING
 - [executor] 执行端待办 T91-3：以上两项做完、1.7.1 装好后，用 wf kick --kind report（不带 --message）发回报，说明先用 wf note --kind info 写。这一项本身就是 1.7.1 的实景验收：回报应带 ② 终端原文与 ④ 需要注意
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
