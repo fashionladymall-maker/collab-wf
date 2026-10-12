@@ -1,6 +1,6 @@
 # ISOLATION.md —— 多项目并行与全链路隔离（设计 v1）
 
-collab-wf-dev 第 89 轮（v2.8）起草，第 91 轮（v2.9）更新：S1 已实现并迁移。需求来源：执行端第 87–88 轮转述的用户原话与需求包乙（R1–R5、本机实测 15 项、判据 I1–I8，第 88 轮回报全文）。本文件是设计与分阶段计划；代码随各阶段的工具版本交付，验收以 I1–I8 的本机实测为准。
+collab-wf-dev 第 89 轮（v2.8）起草，第 91 轮（v2.9）、第 94 轮（v3.0）更新。现状：S1 已闭合（I1），S3 已在真实环境切换，S2 的工具侧已装；余下 S2 的执行端部分与 S4。需求来源：执行端第 87–88 轮转述的用户原话与需求包乙（R1–R5、本机实测 15 项、判据 I1–I8，第 88 轮回报全文）。本文件是设计与分阶段计划；代码随各阶段的工具版本交付，验收以 I1–I8 的本机实测为准。
 
 ## 1. 原则
 
@@ -119,12 +119,12 @@ WF_LOCAL_DIR 保留：它让演练与自检整体用另一套 local/（wf drill�
 
 | 阶段 | 工具版本 | 内容 | 验收 | 回滚 |
 |---|---|---|---|---|
-| S1 会话按项目绑定 | 1.7.0 | --conv、conv_new --project、wf conv bind、transport test 两项、TRANSPORT.md 约定 | I1；之后 amy-local 才改回 auto:true | 适配器退回默认对话；工具回到 1.6.9 |
-| S2 按项目寻址 | 1.7.2 | 分项目 inbox 视图、wf ask --project、信号分目录、审查键 | I2、I4、I7（执行端：I6、审查程序参数化） | 兼容读取旧位置；工具回到 1.7.1 |
-| S3 每项目调度 | 1.7.3 | wf tick --project、wf schedule plist --project、schedule status 按项目 | I3、I5 | 重新加载全局定时任务 |
-| S4 共用资源仲裁 | 1.7.4 | 发送槽、arbiter.jsonl、看板一栏、transport.json 的项目覆盖 | I8 | shared_max_inflight 设为不限，行为同现在 |
+| S1 会话按项目绑定 | 1.7.0（已闭合） | --conv、conv_new --project、wf conv bind、transport test 一项、TRANSPORT.md 约定 | I1 已成立（第 92–93 轮，真实发送都用本项目对话、无告警）；amy-local 改回 auto:true 还要等用户对暂停的一句话 | 适配器退回默认对话；工具回到 1.6.9 |
+| S3 每项目调度 | 1.7.2（已切换） | wf --project <名> tick、wf --project <名> schedule plist / release、schedule status 按项目、inbox 汇总全部项目并加锁 | collab-wf-dev 第 93 轮已切到自己的定时任务；I3、I5 等第二个项目运行时实测 | schedule release 并卸载该项目的配置 |
+| S2 按项目寻址 | 1.7.3（工具侧已装） | 分项目只读视图 local/views/<名>/inbox.json、信号分目录与迁移、wf --project 的 signal list / clear、审查 --key（review_key 开关） | I2、I4、I7；执行端：审查程序接受 --key 后打开 review_key，唤醒按项目找会话（I6） | 兼容读取旧位置；工具回到 1.7.2 |
+| S4 共用资源仲裁 | 待定 | 发送槽、arbiter.jsonl、看板一栏、transport.json 的项目覆盖 | I8 | shared_max_inflight 设为不限，行为同现在 |
 
-1.7.1 用于目标达成后由证据生成回报（与隔离无关，插在 S1 之后）。S2 与 S3 可以对调：如果更急的是“一个卡住不拖累另一个”，就先做 S3。每个阶段的构建器都附自检，原有检查不删改，floor.py 不动；P2-F 的演练（无会话退化、多项目并行）放在对应阶段的验收里做。
+1.7.1 用于目标达成后由证据生成回报（与隔离无关）。实际顺序是 S1、S3、S2：先解决“一个卡住拖累另一个”，S3 只改工具内部。S2 与 S3 可以对调：如果更急的是“一个卡住不拖累另一个”，就先做 S3。每个阶段的构建器都附自检，原有检查不删改，floor.py 不动；P2-F 的演练（无会话退化、多项目并行）放在对应阶段的验收里做。
 
 ## 9. 不在本设计内
 
