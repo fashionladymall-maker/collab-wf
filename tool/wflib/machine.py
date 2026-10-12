@@ -6,6 +6,9 @@ from .core import DEF_PATH, Instance, WfError, now_iso, parse_iso, read_json, re
 _DEF = None
 
 
+SEND_UNKNOWN_DWELL_S = 3900   # 1.6.9（N8）
+
+
 def definition() -> dict:
     global _DEF
     if _DEF is None:
@@ -97,6 +100,10 @@ def status(inst: Instance) -> dict:
     sd = sdef(sid)
     dwell = secs_since(st.get("since")) or 0
     limit = sd.get("max_dwell_s")
+    if sid == "SEND" and limit and (st.get("send_intent") or {}).get("status") == "pending":
+        # 1.6.9（N8）：结果不明时 SEND_UNKNOWN_WAIT 会反复确认约一小时（绝不自动重发），按 900 秒报停留过久是误报；
+        # 放宽到 65 分钟，与看门狗的 send_unknown（60 分钟）衔接
+        limit = max(limit, SEND_UNKNOWN_DWELL_S)
     until = parse_iso(st.get("until"))
     overdue = None
     if until is not None:

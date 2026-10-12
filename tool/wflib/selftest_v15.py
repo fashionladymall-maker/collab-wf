@@ -1094,6 +1094,118 @@ def _t_v166_tasks(_ok):
         json.dumps([d, left, errs], ensure_ascii=False)[:500])
 
 
+def _v169_inst(td, name, cfg_extra=None):
+    from .core import Instance
+    root = Path(td) / name
+    (root / "workflow").mkdir(parents=True)
+    (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"{name}-{os.getpid()}", **(cfg_extra or {})}),
+                                               encoding="utf-8")
+    (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+    return Instance(root)
+
+
+def _t_v169_quiet(_ok):
+    from . import asks, watchdog
+    past = "2000-01-01T00:00:00+00:00"
+    with tempfile.TemporaryDirectory() as td:
+        a = _v169_inst(td, "v169-a")
+        a.state.update(state="SEND", since=past, turn=2)
+        a.save()
+        k1 = [n["key"] for n in asks.notices(a) if n["key"].startswith("stuck:")]
+        a.state["paused"] = {"by": "user", "ts": past}
+        a.save()
+        k2 = [n["key"] for n in asks.notices(a) if n["key"].startswith("stuck:")]
+        b = _v169_inst(td, "v169-b", {"auto": False})
+        b.state.update(state="COMPOSE", since=past, turn=2)
+        b.save()
+        k3 = [n["key"] for n in asks.notices(b) if n["key"].startswith("stuck:")]
+        w3 = watchdog.check(b)
+    _ok("1.6.9（N9）：停留过久照常提示；已暂停的项目、wf.json auto=false 的项目不再被判“停留超过上限”，看门狗同样不报",
+        len(k1) == 1 and k2 == [] and k3 == [] and w3 == [], str([k1, k2, k3, w3]))
+
+
+def _t_v169_send_dwell(_ok):
+    from . import machine
+    from datetime import timedelta
+    from .core import now
+    with tempfile.TemporaryDirectory() as td:
+        a = _v169_inst(td, "v169-send")
+        t20 = (now() - timedelta(minutes=20)).isoformat(timespec="seconds")
+        t70 = (now() - timedelta(minutes=70)).isoformat(timespec="seconds")
+        a.state.update(state="SEND", since=t20, turn=3, send_intent={"turn": 3, "status": "pending", "ts": t20})
+        a.save()
+        s1 = machine.status(a)
+        a.state.update(send_intent=None)
+        a.save()
+        s2 = machine.status(a)
+        a.state.update(since=t70, send_intent={"turn": 3, "status": "pending", "ts": t70})
+        a.save()
+        s3 = machine.status(a)
+    _ok("1.6.9（N8）：发送结果不明的 20 分钟不算停留过久；没有待定意图时照旧按 15 分钟判；结果不明超过 65 分钟仍会报",
+        not s1["stuck"] and s1["max_dwell_s"] == machine.SEND_UNKNOWN_DWELL_S and s2["stuck"] and s3["stuck"],
+        str([s1["stuck"], s1["max_dwell_s"], s2["stuck"], s3["stuck"]]))
+
+
+def _t_v169_sync_notice(_ok):
+    from . import sync
+    orig = (sync.enabled, sync.record)
+    recs = []
+    try:
+        sync.enabled = lambda inst: True
+        sync.record = lambda inst: recs[-1]
+        recs.append({"blocked": {"ts": "2026-10-12T01:00:00+00:00", "secrets": ["artifacts/x.zip：不是有效的 zip"]}})
+        n1 = sync.notices(None)
+        recs.append({"blocked": {"ts": "2026-10-12T01:01:00+00:00", "secrets": ["artifacts/x.zip：不是有效的 zip"]}})
+        n2 = sync.notices(None)
+        recs.append({"blocked": {"ts": "2026-10-12T01:02:00+00:00", "secrets": ["a.txt 第 1 行：疑似私钥（abcd…ef）"]}})
+        n3 = sync.notices(None)
+    finally:
+        sync.enabled, sync.record = orig
+    _ok("1.6.9（N6、N7）：只有无效 zip 时标题不写“疑似密钥”；同一原因不同时刻 key 相同；真有疑似密钥时照旧写明",
+        len(n1) == 1 and "不是有效的 zip" in n1[0]["title"] and "密钥" not in n1[0]["title"]
+        and n1[0]["key"] == n2[0]["key"] and n1[0]["key"].startswith("sync_blocked:")
+        and "疑似密钥" in n3[0]["title"] and n3[0]["key"] != n1[0]["key"], json.dumps([n1, n2, n3], ensure_ascii=False)[:600])
+
+
+def _t_v169_review_heartbeat(_ok):
+    import contextlib
+    import io
+    from . import anomaly, core, release
+    orig = (anomaly.transport_cfg, anomaly.call, core.LOCAL)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        (src / "wflib").mkdir(parents=True)
+        (src / "wflib" / "x.py").write_text("x = 1\n", encoding="utf-8")
+
+        def slow(op, args, timeout=None, env_extra=None):
+            time.sleep(2.6)
+            return {"code": 4, "data": {"verdict": "unreviewed"}, "raw": "测试：没有可用会话"}
+
+        def quick(op, args, timeout=None, env_extra=None):
+            return {"code": 0, "data": {"verdict": "pass", "notes": []}, "raw": ""}
+        err1, err2 = io.StringIO(), io.StringIO()
+        try:
+            core.LOCAL = Path(td) / "local"
+            anomaly.transport_cfg = lambda: {"review": "测试审查程序", "review_timeout_s": 300, "review_heartbeat_s": 1}
+            anomaly.call = slow
+            t0 = time.monotonic()
+            with contextlib.redirect_stderr(err1):
+                v1 = release._review_tool(src, Path(td) / "collab-wf-9.9.9.zip")
+            took = time.monotonic() - t0
+            anomaly.call = quick
+            with contextlib.redirect_stderr(err2):
+                v2 = release._review_tool(src, Path(td) / "collab-wf-9.9.8.zip")
+            unrev = core.LOCAL / "reviews" / "collab-wf-9.9.9.unreviewed.json"
+            rec = json.loads(unrev.read_text(encoding="utf-8")) if unrev.exists() else {}
+        finally:
+            anomaly.transport_cfg, anomaly.call, core.LOCAL = orig
+    e1, e2 = err1.getvalue(), err2.getvalue()
+    _ok("1.6.9（P0-A）：等审查期间按周期输出心跳；没有结论时按“未审查”返回、写明原因并留档；有结论时不输出心跳",
+        v1[0] == "unavailable" and e1.count("仍在等独立审查") >= 2 and "开始等独立审查" in e1 and "本次未审查" in e1
+        and "没有可用会话" in rec.get("reason", "") and took < 10
+        and v2[0] == "pass" and "仍在等独立审查" not in e2 and "独立审查结论：pass" in e2, e1[-400:] + " | " + e2[-200:])
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -1112,7 +1224,9 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.3 开新对话的短消息", _t_v163_bootstrap_short),
          ("1.6.4 驱动器自己开新对话", _t_v164_newconv),
          ("1.6.5 外部信号与升级", _t_v165_signals), ("1.6.5 看门狗", _t_v165_watchdog),
-         ("1.6.5 执行端代决", _t_v165_executor_decision), ("1.6.6 执行端待办", _t_v166_tasks)]
+         ("1.6.5 执行端代决", _t_v165_executor_decision), ("1.6.6 执行端待办", _t_v166_tasks),
+         ("1.6.9 暂停与静音不报停滞", _t_v169_quiet), ("1.6.9 结果不明不算停留过久", _t_v169_send_dwell),
+         ("1.6.9 同步暂停提示", _t_v169_sync_notice), ("1.6.9 审查心跳", _t_v169_review_heartbeat)]
 
 
 def run_v15(_ok) -> None:

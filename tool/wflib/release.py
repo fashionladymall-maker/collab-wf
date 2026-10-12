@@ -278,6 +278,31 @@ def guard_changes(new_files: dict, cur_files: dict) -> list:
     return [f for f in GUARD_FILES if new_files.get(f) != cur_files.get(f)]
 
 
+def _with_heartbeat(fn, limit_s: int, every_s: int):
+    """1.6.9（P0-A）：在后台线程里运行 fn，期间每 every_s 秒向 stderr 输出一行心跳，让“在等”与“卡死”可区分。"""
+    import threading
+    import time
+    box = {}
+
+    def target():
+        try:
+            box["r"] = fn()
+        except Exception as e:   # noqa: BLE001
+            box["e"] = e
+    print(f"开始等独立审查（上限 {limit_s} 秒；到时没有结论按“未审查”继续安装）", file=sys.stderr, flush=True)
+    t0 = time.monotonic()
+    th = threading.Thread(target=target, daemon=True)
+    th.start()
+    while True:
+        th.join(every_s)
+        if not th.is_alive():
+            break
+        print(f"仍在等独立审查：已 {int(time.monotonic() - t0)} 秒 / 上限 {limit_s} 秒", file=sys.stderr, flush=True)
+    if "e" in box:
+        raise box["e"]
+    return box.get("r") or {}
+
+
 def _review_tool(src: Path, zip_path) -> tuple:
     """1.5.8：自动安装前请另一个模型系列审查工具版本的 diff。返回 (结论, 说明)；没有配置审查时返回 ("none", "")。"""
     import difflib
@@ -301,11 +326,19 @@ def _review_tool(src: Path, zip_path) -> tuple:
     rd.mkdir(parents=True, exist_ok=True)
     diff = rd / f"{Path(zip_path).stem}.diff"
     diff.write_text("\n".join(parts)[:400000], encoding="utf-8")
-    r = anomaly.call("review", ["--kind", "tool", "--project", "collab-wf", "--turn", "0", "--release", zip_path, "--diff", diff],
-                     timeout=anomaly.transport_cfg().get("review_timeout_s", 900))
+    tmo = int(anomaly.transport_cfg().get("review_timeout_s", 900) or 900)
+    hb = max(1, int(anomaly.transport_cfg().get("review_heartbeat_s", 30) or 30))
+    r = _with_heartbeat(lambda: anomaly.call("review", ["--kind", "tool", "--project", "collab-wf", "--turn", "0",
+                                                        "--release", zip_path, "--diff", diff], timeout=tmo), tmo, hb)
     data = r.get("data") or {}
     if r.get("code") != 0 or data.get("verdict") not in ("pass", "concerns", "block"):
-        return "unavailable", (r.get("raw") or "")[:200]
+        why = (r.get("raw") or "")[:200] or f"审查程序退出码 {r.get('code')}"
+        # 1.6.9（P0-A）：未审查照常安装（不变），但写明原因并留档，事后可按 diff 补审
+        write_json(rd / f"{Path(zip_path).stem}.unreviewed.json",
+                   {"ts": now_iso(), "release": str(zip_path), "diff": str(diff), "reason": why})
+        print(f"本次未审查：{why}；照常安装，可事后按 {diff} 补审", file=sys.stderr, flush=True)
+        return "unavailable", why
+    print(f"独立审查结论：{data['verdict']}", file=sys.stderr, flush=True)
     write_json(rd / f"{Path(zip_path).stem}.json", data)
     return data["verdict"], "；".join(data.get("notes", [])[:5])
 
@@ -337,6 +370,7 @@ def self_update(zip_path, skip_test=False, allow_same=False, auto=False) -> dict
             if verdict == "block":
                 raise WfError(f"另一个模型系列审查认为应阻止，自动安装已拒绝：{notes}")
         if not skip_test:
+            print(f"正在运行新版本 {new} 的完整自检", file=sys.stderr, flush=True)   # 1.6.9（P0-A）：长步骤先说一声
             env = dict(os.environ)
             env.pop("WF_LOCAL_DIR", None)
             r = subprocess.run([sys.executable, str(src / "wf.py"), "selftest"], capture_output=True, text=True,

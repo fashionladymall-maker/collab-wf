@@ -1,5 +1,16 @@
 # CHANGELOG（collab-wf）
 
+## 1.6.9 — 2026-10-12
+
+加固批次（collab-wf-dev 第 86–88 轮，执行端需求甲）。
+- P0-A：wf self-update 等独立审查时输出开始行与周期心跳（transport.json 的 review_heartbeat_s，默认 30 秒）；没有结论时输出原因并写 local/reviews/<版本包名>.unreviewed.json，照常安装；运行新版本自检前先输出一行。
+- N8（P1-C）：发送结果不明（意图未结束）期间，SEND 的停留上限按 65 分钟计（machine.SEND_UNKNOWN_DWELL_S），不再误报“停留超过上限”。
+- N9：已暂停或 wf.json auto=false 的项目不报“停留超过上限”、看门狗不报停滞、心跳不判“停了”；wf schedule status 把 auto=false 标为“已静音”。
+- N6、N7（P1-B）：同步暂停提示按实际命中写标题；key 由命中内容算出，不再随时间变化。
+- N10（P1-D）：wf conv new 清掉 send_ref 与 resend_parent，与驱动器自动开新对话一致。
+- 文档：DRIVER.md 第 26 节（含“人不在场时各道门的处理”）。
+- 自检新增 5 项；原有检查没有删改。本版不改 floor.py。P0-C、P0-D、P1-A 不在本版（见 DRIVER.md 第 26 节）。
+
 ## 1.6.8 — 2026-10-12
 
 改进批次一的第二个工具版本（collab-wf-dev 第 82–84 轮）。

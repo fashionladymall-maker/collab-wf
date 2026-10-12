@@ -33,6 +33,8 @@ def check(inst: Instance) -> list:
 
     if st.get("paused"):
         return out   # 暂停本身已在 inbox 里（交给用户）；暂停期间不报停滞
+    if inst.cfg.get("auto") is False:
+        return out   # 1.6.9（N9）：wf.json auto=false，驱动器按设计不推进，不报停滞
     s = machine.status(inst)
     pol = read_json(inst.wf / "policy.json", {}) or {}
     tmo = int(pol.get("command_timeout_s", 1800) or 1800)

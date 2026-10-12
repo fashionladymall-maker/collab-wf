@@ -257,8 +257,17 @@ def notices(inst) -> list:
     out = []
     if rec.get("blocked"):
         b = rec["blocked"]
-        out.append({"key": f"sync_blocked:{b['ts']}", "title": "项目同步已暂停：发现疑似密钥",
-                    "why": "要同步的内容里有疑似密钥，整次没有推送。先查明来源并移除，再运行 wf sync。命中位置：" + "；".join(b["secrets"][:3])})
+        hits = [str(h) for h in (b.get("secrets") or [])]
+        badzip = [h for h in hits if h.endswith("不是有效的 zip")]
+        secret = [h for h in hits if h not in badzip]
+        # 1.6.9（N6、N7）：标题按实际命中写；key 由命中内容算出，同一原因不随每次 tick 的时间变成新键、反复唤醒
+        key = "sync_blocked:" + hashlib.sha256("\n".join(sorted(hits)).encode("utf-8")).hexdigest()[:12]
+        if secret:
+            out.append({"key": key, "title": "项目同步已暂停：发现疑似密钥" + ("，另有无效 zip" if badzip else ""),
+                        "why": "要同步的内容里有疑似密钥，整次没有推送。先查明来源并移除，再运行 wf sync。命中位置：" + "；".join((secret + badzip)[:3])})
+        else:
+            out.append({"key": key, "title": "项目同步已暂停：版本包不是有效的 zip",
+                        "why": "要同步的版本包打不开（可能下载到了错误的内容），整次没有推送。核对并移走或替换后再运行 wf sync。命中：" + "；".join(badzip[:3])})
     if int(rec.get("failures", 0)) >= 3:
         last = rec.get("last") or {}
         out.append({"key": f"sync_failing:{rec.get('pushed_ts')}", "title": "项目同步连续失败",

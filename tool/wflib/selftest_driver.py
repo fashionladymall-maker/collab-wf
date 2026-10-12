@@ -254,7 +254,10 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     boots = list((c / "workflow" / "outbox").glob("bootstrap-*.md"))
     _ok("对话体量达到上限：停下等用户，并已生成新对话恢复包", rc == 20 and _state(c)["state"] == "AWAITING_USER"
         and "CONTEXT_FULL" in o and boots, o)
+    had_ref = bool(_state(c).get("send_ref"))
     _wf(env, c, "conv", "new", "--note", "测试：已开新对话")
+    _ok("1.6.9（N10）：手工 wf conv new 清掉旧对话的 send_ref，新对话首轮不再拿它当 --prev-ref",
+        had_ref and not _state(c).get("send_ref"), json.dumps(_state(c).get("conv"), ensure_ascii=False))
     _user(_wf, env, c, "approve", "approve")
     rc, o = _wf(env, c, "run")
     _ok("开新对话并批准后继续发送", _state(c)["state"] == "WAIT_REPLY" and (_state(c).get("conv") or {}).get("turns") == 1, o)

@@ -31,7 +31,7 @@ def driver_health(inst: Instance) -> dict:
         status = "running"
     elif age is None:
         status = "never"
-    elif age > STALE_S and approved and not paused:
+    elif age > STALE_S and approved and not paused and inst.cfg.get("auto") is not False:   # 1.6.9（N9）
         status = "stale"
     else:
         status = "ok"

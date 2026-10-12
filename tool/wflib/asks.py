@@ -86,7 +86,8 @@ def notices(inst: Instance) -> list:
     if s["state"] == "QUOTA_WAIT":
         out.append({"key": f"quota:{s.get('until')}", "title": "额度用尽，等待重置",
                     "why": f"将在 {s.get('until')} 后自动继续，不需要你做什么"})
-    if s.get("stuck"):
+    if s.get("stuck") and not inst.state.get("paused") and inst.cfg.get("auto") is not False:
+        # 1.6.9（N9）：与看门狗一致，暂停期间不报停滞；auto=false 的项目驱动器不推进，停留本来就不变
         out.append({"key": f"stuck:{s['state']}:{s['since']}", "title": f"“{s['name']}”停留超过上限",
                     "why": "驱动器会按异常处置表处理；若一直这样，看板会显示原因"})
     for t in (inst.state.get("executor_tasks") or []):   # 1.6.6：写给执行端的待办，做完前一直在 inbox 里

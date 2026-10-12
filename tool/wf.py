@@ -262,6 +262,9 @@ def _schedule(args):
         except WfError as e:
             print(f"  {p['name']}：不可用（{e}）")
             continue
+        if inst.cfg.get("auto") is False:   # 1.6.9（N9）：驱动器按设计跳过它，旧的运行记录不说明定时器停了
+            print(f"  {inst.name}：已静音（wf.json auto=false，驱动器跳过），不计入")
+            continue
         last = (inst.state.get("driver") or {}).get("last") or {}
         age = secs_since(last.get("ts")) if last else None
         if age is None:
@@ -990,6 +993,10 @@ def main(argv=None):
             old = dict(cst)
             inst.state["conv"] = {"since_turn": inst.state.get("turn", 0) + 1, "since": tool_now(), "chars": 0, "turns": 0,
                                   "previous": {k: old.get(k) for k in ("since_turn", "since", "chars", "turns")}}
+            # 1.6.9（N10）：与驱动器自动开新对话（driver.py）一致：上一轮的 ref 属于旧对话，不再作为 --prev-ref 交给适配器；
+            # 否则新对话首轮的轮询会去查旧对话，消息已落地也确认不到，最后阻塞，而 wf resend 会重复发送
+            inst.state.pop("send_ref", None)
+            inst.state.pop("resend_parent", None)
             inst.event("conv_new", note=args.note, by="user")
             roles.decide(inst, "context", "开始新对话", args.note, "", "计数已归零", by="user")
             print("已记录新对话的起点，计数归零。如驱动器停在等待用户决定，接着运行 wf approve --note …")
