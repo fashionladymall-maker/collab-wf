@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 99 轮 · 目标达成（DONE）
+第 100 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.7.5
@@ -23,7 +23,6 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [user] 目标已达成：全部目标判据已通过，自动化停在这里
 - [executor] 执行端待办 T99-1：amy-local 的白名单补走正式路径（W57）：在 amy-local 自己的对话里，把 PP7 那份 policy.json 的内容与来由写进下一份回报，请那边的 Claude 以项目版本正式交付（可以原样、也可以修改），落地时经独立审查、再批准；之前的 PP7 保持有效，不撤。做到“已提交给 amy-local 的 Claude”这一步即可写 wf task done，写明是哪一轮
 - [executor] 执行端待办 T99-2：两个项目同时运行的本机实测，攒满 2 小时后写进 wf task done，内容如下：
 - [executor] 执行端待办 T99-3：两项做完后，先用 wf note --kind info 写说明，再用 wf kick --kind report 发回报
