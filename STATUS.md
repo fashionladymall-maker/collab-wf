@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 90 轮 · 目标达成（DONE）
+第 91 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.7.0
@@ -23,7 +23,6 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T90-1：已运行 wf pin：项目固定版本 1.6 → 1.7（wf.json 有变化，随下次版本一起提交）。wf doctor 的版本匹配行原文：『✓ 版本匹配：项目；T90-2：S1迁移已完成。① 已备份 /Users/admin/.workbuddy-ai/adapter/aimonkey.py（aimonkey.py.bak-b
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
 ## 最新产物
