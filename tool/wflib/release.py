@@ -330,7 +330,7 @@ def _review_tool(src: Path, zip_path) -> tuple:
     hb = max(1, int(anomaly.transport_cfg().get("review_heartbeat_s", 30) or 30))
     r = _with_heartbeat(lambda: anomaly.call("review", ["--kind", "tool", "--project", "collab-wf", "--turn", "0",
                                                         "--release", zip_path, "--diff", diff]
-                                             + anomaly.review_key_args("collab-wf", "tool", zip_path),   # 1.7.3
+                                             + anomaly.review_key_args("collab-wf", 0, zip_path, kind="tool"),   # 1.7.4
                                              timeout=tmo), tmo, hb)
     data = r.get("data") or {}
     if r.get("code") != 0 or data.get("verdict") not in ("pass", "concerns", "block"):

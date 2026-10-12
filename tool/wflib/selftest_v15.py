@@ -1340,6 +1340,37 @@ def _t_v173_views_key(_ok):
         str([va, vb, allk, k0, k1, k2, k3])[:800])
 
 
+def _t_v174_kind_xml(_ok):
+    import plistlib
+    import subprocess
+    import sys
+    from . import anomaly
+    from .core import WF_HOME
+    orig = anomaly.transport_cfg
+    try:
+        anomaly.transport_cfg = lambda: {"review_key": True}
+        k1 = anomaly.review_key_args("collab-wf", 0, "/z/collab-wf-1.7.4.zip", kind="tool")
+        k2 = anomaly.review_key_args("pa", 3, "/x/pa-v1.0.zip")
+    finally:
+        anomaly.transport_cfg = orig
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ)
+        env["WF_LOCAL_DIR"] = str(Path(td) / "local")
+        wf = [sys.executable, str(WF_HOME / "wf.py")]
+        subprocess.run(wf + ["init", "--name", "s4&x", "--root", str(Path(td) / "s4x")], cwd=td, env=env,
+                       capture_output=True, text=True, timeout=120)
+        r = subprocess.run(wf + ["--project", "s4&x", "schedule", "plist"], cwd=td, env=env,
+                           capture_output=True, text=True, timeout=120)
+        try:
+            pl = plistlib.loads(r.stdout.encode("utf-8"))
+        except Exception as e:   # noqa: BLE001
+            pl = {"error": str(e)}
+    _ok("1.7.4 审查键用显式 kind（格式不变）；项目名含 & 时 plist 仍是合法 XML，参数里是原始项目名",
+        k1 == ["--key", "collab-wf.tool.collab-wf-1.7.4"] and k2 == ["--key", "pa.t3.pa-v1.0"]
+        and r.returncode == 0 and "s4&x" in (pl.get("ProgramArguments") or [])
+        and pl.get("Label") == "local.collab-wf.tick.s4_x", str([k1, k2, pl, r.stderr[-300:]])[:800])
+
+
 def _t_v170_sync_reasons(_ok):
     from . import sync
     d = sync.scan_detailed({"artifacts/x.zip": b"not a zip", "a.txt": "普通文字\n".encode("utf-8")})
@@ -1384,7 +1415,8 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.9 同步暂停提示", _t_v169_sync_notice), ("1.6.9 审查心跳", _t_v169_review_heartbeat),
          ("1.7.0 对话参数", _t_v170_conv_args), ("1.7.0 同步阻断原因", _t_v170_sync_reasons),
          ("1.7.0 适配器告警去重", _t_v170_warning_dedupe), ("1.7.2 每项目定时任务", _t_v172_schedule),
-         ("1.7.3 信号按项目", _t_v173_signals), ("1.7.3 分项目视图与审查键", _t_v173_views_key)]
+         ("1.7.3 信号按项目", _t_v173_signals), ("1.7.3 分项目视图与审查键", _t_v173_views_key),
+         ("1.7.4 审查键 kind 与 plist 转义", _t_v174_kind_xml)]
 
 
 def run_v15(_ok) -> None:

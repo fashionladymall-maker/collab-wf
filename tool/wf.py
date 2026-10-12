@@ -250,7 +250,8 @@ def _schedule(args):
             if args.project not in [p["name"] for p in load_registry()["projects"]]:
                 raise WfError(f"注册表里没有项目 {args.project}（wf projects 列出全部）")
             label = f"local.collab-wf.tick.{_safe_name(args.project)}"
-            pargs = f"    <string>--project</string>\n    <string>{args.project}</string>\n"
+            from xml.sax.saxutils import escape as _xe   # 1.7.4：项目名按 XML 转义
+            pargs = f"    <string>--project</string>\n    <string>{_xe(args.project)}</string>\n"
             logf = LOCAL / f"tick-{_safe_name(args.project)}.log"
             sj.setdefault("projects", {})[args.project] = {"interval": args.interval, "max_seconds": args.max_seconds,
                                                             "label": label, "since": _now()}
@@ -303,6 +304,7 @@ def _schedule(args):
             print(f"{args.project} 没有登记自己的定时任务")
         return
     reg = load_registry()["projects"]
+    own_all = _own_sched()   # 1.7.4：local/schedule.json 只读一次
     worst = 0
     for p in reg:
         try:
@@ -319,7 +321,7 @@ def _schedule(args):
             print(f"  {inst.name}：驱动器从未运行")
             worst = max(worst, 1)
         else:
-            own = _own_sched().get(inst.name) or {}   # 1.7.2：有自己定时任务的项目按它自己的周期判断
+            own = own_all.get(inst.name) or {}   # 1.7.2：有自己定时任务的项目按它自己的周期判断（1.7.4：只读一次）
             iv = int(own.get("interval") or args.interval)
             stale = age > 3 * iv
             if own:

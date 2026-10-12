@@ -1,5 +1,13 @@
 # CHANGELOG（collab-wf）
 
+## 1.7.4 — 2026-10-12
+
+执行端事后补审 1.7.1–1.7.3 的质量意见（collab-wf-dev 第 95 轮）。
+- review_key_args 增加显式 kind 参数，工具版本改用 kind="tool"；键的格式不变，turn 为 "tool" 的旧写法仍兼容。
+- schedule plist 的项目名按 XML 转义；schedule status 只读一次 schedule.json。
+- DRIVER.md 第 31 节：审查程序的在场判定分档与迟到结论的去处。
+- 自检新增 1 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.7.3 — 2026-10-12
 
 多项目隔离 S2 的工具侧：按项目寻址（collab-wf-dev 第 93 轮，执行端接口评估 T92-2）。
