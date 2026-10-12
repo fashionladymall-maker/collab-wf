@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 104 轮 · 目标达成（DONE）
+第 105 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.7.6
@@ -23,8 +23,7 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T104-1：已只读回核：VERSION/PROJECT/WORKFLOW及公开工具包SHA与作者完全一致；wf version实际1.7.6，fingerprint278a；T104-2：身份核对完成：实际cid2af8fbfd-d873-42b8-817f-cf5bd24947c2；human uuid01a130e1-36e3-7f2
-- [executor] 执行端待办 T104-6：执行端 1–5 都做完后，先用 wf note --kind info 写明：T100-2 已被用户边界取代，没有标 done，等 cancelled 或 superseded 状态上线后再正式关闭。然后用 wf kick --kind report 发回报，不必等旧待办超时
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.7.6-ca8c2da.zip`
