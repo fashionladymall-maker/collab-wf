@@ -64,7 +64,13 @@ def pending(inst: Instance) -> list:
                 out.append(_item(f"confirm:{g['id']}", f"confirm:{g['id']}:{gs['current']}", f"确认目标 {g['id']}",
                                  g["title"], ["确认 {code}"], f"wf goals confirm {g['id']} --code {{code}} --said …",
                                  f"目标 {g['id']} 一直算未完成：{g.get('on_fail') or ''}", "workflow/goals.json"))
-    if st.get("paused"):
+    if st.get("paused") and st["paused"].get("by") == "executor":   # 1.7.5（P1-A）：执行端发起的暂停交给执行端
+        it = _item("unpause", f"unpause:{st['paused'].get('ts')}", "自动化已暂停（执行端发起）",
+                   st["paused"].get("note") or "已暂停", ["继续 {code}"], "wf unpause --by executor --reason …",
+                   "保持暂停，驱动器不会推进这个项目")
+        it["initiator"] = "executor"
+        out.append(it)
+    elif st.get("paused"):
         out.append(_item("unpause", f"unpause:{st['paused'].get('ts')}", "自动化已暂停",
                          st["paused"].get("note") or "已暂停", ["继续 {code}"], "wf unpause --code {code} --said …",
                          "保持暂停，驱动器不会推进这个项目"))

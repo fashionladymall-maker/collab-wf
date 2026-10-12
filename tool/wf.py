@@ -391,12 +391,12 @@ def main(argv=None):
     x = sub.add_parser("kick"); x.add_argument("--message"); x.add_argument("--kind", default="task", choices=["task", "report"])
     x.add_argument("--effort", default="high", choices=ops.EFFORTS)
     x = sub.add_parser("approve"); x.add_argument("--code", required=True); x.add_argument("--said", "--note", dest="said"); _by_args(x)
-    x = sub.add_parser("pause"); x.add_argument("--note", default="")
+    x = sub.add_parser("pause"); x.add_argument("--note", default=""); _by_args(x)   # 1.7.5：--by executor 记明是执行端发起
     x = sub.add_parser("said"); x.add_argument("--text", required=True); x.add_argument("--kind", default="chat")
     x = sub.add_parser("notify"); x.add_argument("action", choices=["test", "status"])
     x = sub.add_parser("sync"); x.add_argument("--dry-run", action="store_true"); x.add_argument("--force", action="store_true")
     x = sub.add_parser("look"); x.add_argument("--full", action="store_true")
-    x = sub.add_parser("unpause"); x.add_argument("--code", required=True); x.add_argument("--said", "--note", dest="said", required=True)
+    x = sub.add_parser("unpause"); x.add_argument("--code"); x.add_argument("--said", "--note", dest="said"); _by_args(x)   # 1.7.5
     x = sub.add_parser("undo"); x.add_argument("--note", required=True)
     x = sub.add_parser("audit"); x.add_argument("--n", type=int, default=40)
     x = sub.add_parser("goals"); x.add_argument("action", nargs="?", default="show", choices=["show", "check", "approve", "confirm"])
@@ -945,17 +945,34 @@ def main(argv=None):
         print(r["note"])
     elif c == "pause":
         inst = _p(args)
-        inst.state["paused"] = {"ts": tool_now(), "note": args.note}
-        inst.event("pause", note=args.note, by="user")
+        by = "executor" if getattr(args, "by", None) == "executor" else "user"   # 1.7.5（P1-A）：记下是谁发起的
+        note = args.note or (getattr(args, "reason", None) or "")
+        if by == "executor" and not note.strip():
+            raise WfError("执行端发起暂停需要写明原因：wf pause --by executor --note \"…\"")
+        inst.state["paused"] = {"ts": tool_now(), "note": note, "by": by}
+        inst.event("pause", note=note, by=by)
         print("已暂停自动化。驱动器不会再推进这个项目，直到 wf unpause。手动命令仍可使用。")
     elif c == "unpause":
         inst = _p(args)
         if not inst.state.get("paused"):
             raise WfError("当前没有暂停。")
-        it = asks.verify(inst, "unpause", args.code)
-        _record_user(inst, "unpause", it, args.said)
-        inst.state.pop("paused", None)
-        inst.event("unpause", note=args.said, by="user")
+        if getattr(args, "by", None) == "executor":
+            # 1.7.5（P1-A，用户第 98 轮授权）：执行端发起的暂停可以由执行端解除；用户发起的暂停仍只认用户原话
+            if (inst.state.get("paused") or {}).get("by") != "executor":
+                raise WfError("这个暂停是用户发起的（或没有记录发起方），只认用户原话：wf unpause --code <决定码> --said …")
+            it = next((x for x in asks.pending(inst) if x["kind"] == "unpause"), None)
+            if not it:
+                raise WfError("找不到暂停事项")
+            note = asks.executor_decision(inst, "unpause", it, getattr(args, "reason", None))
+            inst.state.pop("paused", None)
+            inst.event("unpause", note=note, by="executor")
+        else:
+            if not args.code or not args.said:
+                raise WfError("用法：wf unpause --code <决定码> --said \"用户原话\"；执行端发起的暂停：wf unpause --by executor --reason …")
+            it = asks.verify(inst, "unpause", args.code)
+            _record_user(inst, "unpause", it, args.said)
+            inst.state.pop("paused", None)
+            inst.event("unpause", note=args.said, by="user")
         print("已恢复自动化。")
     elif c == "undo":
         inst = _p(args)

@@ -100,6 +100,8 @@ ESCALATE_S = 7200   # 1.6.5：交给执行端的事超过 2 小时还在，转�
 def route(it: dict) -> str:
     """一件待办该由谁处理：user 或 executor。"""
     kind, key = str(it.get("kind") or ""), str(it.get("key") or "")
+    if kind == "unpause" and it.get("initiator") == "executor":   # 1.7.5（P1-A）：执行端发起的暂停由执行端解除
+        return "executor"
     if kind == "unpause" or key.startswith("done:"):
         return "user"
     return "user" if any(m in str(it.get("why") or "") for m in USER_MARKS) else "executor"

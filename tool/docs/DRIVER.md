@@ -313,7 +313,7 @@ collab-wf-dev 第 86–88 轮（执行端加固需求甲）。
 | 独立审查 | 等到 review_timeout_s 为止（审查程序检测到没人时应立即退出），没有结论按“未审查”继续；只有 block 能阻止 |
 | 执行端待办 | 等执行端，最迟 executor_task_timeout_s（默认 4 小时）照常回报并列出没做完的 |
 | 白名单外的命令、扩大权限的变更、熔断、阻塞 | 停下，先交执行端代决（--by executor），2 小时没处理转给用户 |
-| 四道底线（资金、密钥、合规、实盘）、改 floor.py 的版本、撤销暂停、目标达成后的继续 | 停下，只认用户本人 |
+| 四道底线（资金、密钥、合规、实盘）、改 floor.py 的版本、撤销用户发起的暂停、目标达成后的继续 | 停下，只认用户本人（1.7.5 起，执行端发起的暂停由执行端解除，见第 32 节） |
 
 ## 27. 1.7.0 会话按项目绑定（多项目隔离第一阶段）
 
@@ -363,4 +363,13 @@ collab-wf-dev 第 95 轮，执行端事后补审 1.7.1–1.7.3 的质量意见�
 - review_key_args 有显式的 kind 参数（工具版本传 kind="tool"），键的格式不变。
 - `wf --project <名> schedule plist` 的项目名按 XML 转义；schedule status 只读一次 schedule.json。
 - 审查程序的在场判定（执行端第 95 轮修 N15）：确实没有执行端会话进程时约 10 秒内返回 no_session；有会话进程但暂时不可达时最多再等 90 秒（no_session_unreachable）；查不准时照常等到 review_timeout_s。
-- 迟到的审查结论（请求已按未审查关闭之后才写出）：不当作已审查，不改变已经做出的处置。审查程序留档在 local/reviews/<键>.late.*.json；项目版本的迟到结论另用 `wf --project <项目> note --kind info "迟到的审查结论：…"` 写进该项目当前一轮（工具解析轮次目录，审查程序不用猜路径）；工具版本的迟到结论用 `wf signal add --key review-late:<键>` 进 inbox，由执行端在下一份回报里写明。
+- 迟到的审查结论（请求已按未审查关闭之后才写出）：不当作已审查，不改变已经做出的处置。审查程序留档在 local/reviews/<键>.late.*.json；项目版本的迟到结论另用 `wf --project <项目> note --kind info "迟到的审查结论：…"` 写进该项目当前一轮（工具解析轮次目录，审查程序不用猜路径）；工具版本的迟到结论用 `wf signal add --key review-late:<键>` 进 inbox，由执行端在下一份回报里写明，回报发出后用 `wf signal clear --key review-late:<键>` 清除（否则 2 小时后升级给用户）。
+
+## 32. 1.7.5 执行端解除它自己发起的暂停（P1-A）
+
+collab-wf-dev 第 98 轮：用户把三项待决事项交给执行端决定（原话“你帮我决策”），其中一项是“是否授权执行端解除它自己发起的暂停”。
+
+- `wf pause --by executor --note "原因"`：记下发起方（state 的 paused.by），事件记 by=executor；必须写原因。不带 --by 时与以前相同，记为用户发起。
+- 执行端发起的暂停在 inbox 里交给执行端（标题“自动化已暂停（执行端发起）”），用 `wf unpause --by executor --reason "…"` 解除，事件如实记 by=executor（M1 判据里算人工动作）。
+- 用户发起的暂停（以及 1.7.5 之前没有记录发起方的暂停）仍只认用户原话：`wf unpause --code <决定码> --said …`；执行端用 --by executor 解除会被拒绝。
+- 驱动器仍没有任何解除暂停的路径（floor.py 的护栏命令名单不变）。

@@ -1,5 +1,13 @@
 # CHANGELOG（collab-wf）
 
+## 1.7.5 — 2026-10-12
+
+执行端解除它自己发起的暂停（P1-A；collab-wf-dev 第 98 轮，用户授权）。
+- wf pause --by executor --note …：记下发起方；执行端发起的暂停在 inbox 里交给执行端，wf unpause --by executor --reason … 解除，事件记 by=executor。
+- 用户发起的暂停（含没有记录发起方的旧暂停）仍只认用户原话；驱动器仍没有解除暂停的路径，floor.py 不变。
+- DRIVER.md 第 32 节；第 26 节的表与第 31 节（review-late 信号回报后清除）相应更新。
+- 自检新增 1 项；原有检查没有删改。
+
 ## 1.7.4 — 2026-10-12
 
 执行端事后补审 1.7.1–1.7.3 的质量意见（collab-wf-dev 第 95 轮）。

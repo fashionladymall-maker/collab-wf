@@ -1371,6 +1371,45 @@ def _t_v174_kind_xml(_ok):
         and pl.get("Label") == "local.collab-wf.tick.s4_x", str([k1, k2, pl, r.stderr[-300:]])[:800])
 
 
+def _t_v175_pause(_ok):
+    import subprocess
+    import sys
+    from . import asks, notify
+    from .core import WF_HOME, Instance
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ)
+        env["WF_LOCAL_DIR"] = str(Path(td) / "local")
+        root = Path(td) / "p175"
+
+        def wf(*a):
+            r = subprocess.run([sys.executable, str(WF_HOME / "wf.py"), *a], cwd=str(root), env=env,
+                               capture_output=True, text=True, timeout=120)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        subprocess.run([sys.executable, str(WF_HOME / "wf.py"), "init", "--name", "p175", "--root", str(root)],
+                       cwd=td, env=env, capture_output=True, text=True, timeout=120)
+        rc0, o0 = wf("pause", "--by", "executor")
+        rc1, o1 = wf("pause", "--by", "executor", "--note", "测试：执行端发起")
+        st1 = json.loads((root / "workflow" / "state.json").read_text(encoding="utf-8"))
+        it1 = next((x for x in asks.pending(Instance(root)) if x["kind"] == "unpause"), {})
+        rc2, o2 = wf("unpause", "--by", "executor", "--reason", "测试：执行端解除")
+        st2 = json.loads((root / "workflow" / "state.json").read_text(encoding="utf-8"))
+        ev = [json.loads(x) for x in (root / "workflow" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        un = [e for e in ev if e.get("type") == "unpause"]
+        rc3, o3 = wf("pause", "--note", "测试：用户发起")
+        it3 = next((x for x in asks.pending(Instance(root)) if x["kind"] == "unpause"), {})
+        rc4, o4 = wf("unpause", "--by", "executor", "--reason", "想解除")
+        rc5, o5 = wf("unpause")
+        st5 = json.loads((root / "workflow" / "state.json").read_text(encoding="utf-8"))
+    _ok("1.7.5 执行端发起的暂停：要写原因、记 by=executor、交给执行端、可由执行端解除并记 by=executor；"
+        "用户发起的暂停仍交给用户，执行端解除被拒，缺决定码或原话报用法",
+        rc0 != 0 and rc1 == 0 and (st1.get("paused") or {}).get("by") == "executor"
+        and notify.route(it1) == "executor" and "--by executor" in it1.get("command", "")
+        and rc2 == 0 and not st2.get("paused") and un and un[-1].get("by") == "executor"
+        and rc3 == 0 and notify.route(it3) == "user" and rc4 != 0 and "只认用户原话" in o4
+        and rc5 != 0 and "用法" in o5 and (st5.get("paused") or {}).get("by") == "user",
+        str([o0[-120:], o1[-80:], it1.get("command"), o2[-120:], un[-1:] if un else None, o4[-160:], o5[-160:]])[:900])
+
+
 def _t_v170_sync_reasons(_ok):
     from . import sync
     d = sync.scan_detailed({"artifacts/x.zip": b"not a zip", "a.txt": "普通文字\n".encode("utf-8")})
@@ -1416,7 +1455,7 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.7.0 对话参数", _t_v170_conv_args), ("1.7.0 同步阻断原因", _t_v170_sync_reasons),
          ("1.7.0 适配器告警去重", _t_v170_warning_dedupe), ("1.7.2 每项目定时任务", _t_v172_schedule),
          ("1.7.3 信号按项目", _t_v173_signals), ("1.7.3 分项目视图与审查键", _t_v173_views_key),
-         ("1.7.4 审查键 kind 与 plist 转义", _t_v174_kind_xml)]
+         ("1.7.4 审查键 kind 与 plist 转义", _t_v174_kind_xml), ("1.7.5 执行端发起的暂停", _t_v175_pause)]
 
 
 def run_v15(_ok) -> None:
