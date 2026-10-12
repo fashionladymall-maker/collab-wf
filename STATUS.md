@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 92 轮 · 等待 Claude（WAIT_REPLY）
+第 92 轮 · 执行与取证（EXECUTE）
 
 ## 版本
-- 工具：collab-wf 1.7.1
+- 工具：collab-wf 1.7.2
 - 项目：v2.9；f21569e (HEAD -> main, tag: v2.9) release v2.9
 - 仓库指纹：95674b23bab4790e（10 个文件）
 
 ## 最近一轮
 - 第 91 轮验收通过（2026-10-12T02:09:27+00:00）
 - 本方最新消息：`turns/turn-092.md`
-- Claude 最新回复：`replies/reply-091.md`
+- Claude 最新回复：`replies/reply-092.md`
 
 ## 目标
 - 进度 7 / 7
@@ -26,5 +26,5 @@
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
 ## 最新产物
-- `artifacts/collab-wf-1.7.1.zip`
+- `artifacts/collab-wf-1.7.2.zip`
 - `artifacts/collab-wf-dev-v2.9.zip`

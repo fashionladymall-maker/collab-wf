@@ -1242,6 +1242,45 @@ def _t_v170_warning_dedupe(_ok):
         got == [(4, "poll：conv_mismatch"), (4, "send：conv_mismatch")], str(got))
 
 
+def _t_v172_schedule(_ok):
+    import subprocess
+    import sys
+    from .core import WF_HOME
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ)
+        env["WF_LOCAL_DIR"] = str(Path(td) / "local")
+        env.pop("WF_PROJECT", None)
+
+        def wf(cwd, *a):
+            r = subprocess.run([sys.executable, str(WF_HOME / "wf.py"), *a], cwd=str(cwd), env=env,
+                               capture_output=True, text=True, timeout=120)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        for n in ("s3a", "s3b"):
+            wf(td, "init", "--name", n, "--root", str(Path(td) / n))
+        rc1, o1 = wf(td, "--project", "s3a", "schedule", "plist", "--interval", "60", "--max-seconds", "300")
+        sj = json.loads((Path(td) / "local" / "schedule.json").read_text(encoding="utf-8"))
+        rc2, o2 = wf(td, "--json", "tick", "--max-seconds", "30")
+        rows2 = {r["project"]: r for r in json.loads(o2[o2.index("{"):])["projects"]}
+        wf(Path(td) / "s3b", "pause", "--note", "测试：另一个项目的待办")
+        rc3, o3 = wf(td, "--project", "s3a", "--json", "tick", "--max-seconds", "30")
+        rows3 = [r["project"] for r in json.loads(o3[o3.index("{"):])["projects"]]
+        inbox = json.loads((Path(td) / "local" / "inbox.json").read_text(encoding="utf-8"))
+        keys = [x.get("key", "") for x in inbox.get("items") or []]
+        rc4, o4 = wf(td, "--project", "s3a", "schedule", "release")
+        sj4 = json.loads((Path(td) / "local" / "schedule.json").read_text(encoding="utf-8"))
+        rc5, o5 = wf(td, "--json", "tick", "--max-seconds", "30")
+        rows5 = {r["project"]: r for r in json.loads(o5[o5.index("{"):])["projects"]}
+        rc6, o6 = wf(td, "--project", "nosuch", "tick")
+    _ok("1.7.2 每项目定时任务：plist --project 生成独立标签与参数并登记；全局 tick 跳过它、只推进其余；--project tick 只推进它，"
+        "inbox 仍保留别的项目的待办；release 撤回后全局 tick 重新推进它；不存在的项目报错",
+        rc1 == 0 and "local.collab-wf.tick.s3a" in o1 and "<string>--project</string>" in o1 and "tick-s3a.log" in o1
+        and "s3a" in (sj.get("projects") or {}) and sj.get("interval") is None
+        and "自己的定时任务" in rows2["s3a"]["note"] and rows2["s3a"]["exit"] is None and rows2["s3b"]["exit"] is not None
+        and rows3 == ["s3a"] and any(k.startswith("s3b|") for k in keys)
+        and rc4 == 0 and "s3a" not in (sj4.get("projects") or {}) and rows5["s3a"]["exit"] is not None
+        and rc6 != 0 and "nosuch" in o6, json.dumps([o1[-200:], rows2, rows3, keys, o4, rows5, o6[-200:]], ensure_ascii=False)[:1500])
+
+
 def _t_v170_sync_reasons(_ok):
     from . import sync
     d = sync.scan_detailed({"artifacts/x.zip": b"not a zip", "a.txt": "普通文字\n".encode("utf-8")})
@@ -1285,7 +1324,7 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.9 暂停与静音不报停滞", _t_v169_quiet), ("1.6.9 结果不明不算停留过久", _t_v169_send_dwell),
          ("1.6.9 同步暂停提示", _t_v169_sync_notice), ("1.6.9 审查心跳", _t_v169_review_heartbeat),
          ("1.7.0 对话参数", _t_v170_conv_args), ("1.7.0 同步阻断原因", _t_v170_sync_reasons),
-         ("1.7.0 适配器告警去重", _t_v170_warning_dedupe)]
+         ("1.7.0 适配器告警去重", _t_v170_warning_dedupe), ("1.7.2 每项目定时任务", _t_v172_schedule)]
 
 
 def run_v15(_ok) -> None:

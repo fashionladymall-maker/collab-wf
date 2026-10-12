@@ -335,3 +335,14 @@ collab-wf-dev 第 89–91 轮：目标达成（DONE）后不自动回报，执�
 - 要补充说明：先 `wf note --kind info "…"`（偏离用 --kind deviation，需要决定的用 --kind decision），再运行上面的命令；备注会出现在 ① 里。
 - `wf report` 在 DONE 下同样可用。`wf kick --message <文件>` 的行为不变（任务类必须带 --message）。
 - DONE 与待办做完时的提示（wf explain、wf task done）改为推荐这条命令。
+
+## 29. 1.7.2 每个项目自己的定时任务（多项目隔离 S3）
+
+collab-wf-dev 第 92 轮；设计见该项目的 ISOLATION.md 第 6 节。一次唤醒串行推进全部项目时，一个项目的长命令会占满整次 tick（第 86 轮 912 秒），别的项目都停着。
+
+- `wf --project <名> schedule plist [--interval 60 --max-seconds 540]`：生成这个项目自己的 launchd 配置（标签 `local.collab-wf.tick.<名>`，运行 `wf --project <名> tick`，日志 `local/tick-<名>.log`），并登记在 local/schedule.json 的 projects 里。登记后全局定时任务不再推进它，所以生成后要立即加载；没加载时 15 分钟后心跳报停。
+- `wf --project <名> tick`：只推进这一个项目。不带 --project 的 `wf tick` 跳过已登记的项目（回报里写“有自己的定时任务”），其余照旧。
+- inbox 每次仍汇总全部项目，并在文件锁里读改写：只写本项目会把别的项目的待办冲掉，而执行端以“key 从 inbox 消失”判定做完。
+- `wf --project <名> schedule release`：撤回登记，全局定时任务下次起推进它（另需 launchctl bootout 卸载那个配置）。
+- `wf schedule status`：有自己定时任务的项目按它自己的周期判断是否停了。
+- 同一项目不会被两个进程同时推进（项目锁不变）。P0-C（单条长命令占满 tick）因此只影响这个项目自己。

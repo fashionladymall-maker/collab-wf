@@ -1,5 +1,14 @@
 # CHANGELOG（collab-wf）
 
+## 1.7.2 — 2026-10-12
+
+多项目隔离 S3：每个项目自己的定时任务（collab-wf-dev 第 92 轮，ISOLATION.md 第 6 节）。
+- wf --project <名> schedule plist：生成这个项目的 launchd 配置（标签 local.collab-wf.tick.<名>、日志 local/tick-<名>.log）并登记；wf --project <名> schedule release 撤回。
+- wf --project <名> tick 只推进这一个项目；全局 wf tick 跳过已登记的项目。
+- inbox 仍汇总全部项目，读改写加文件锁（local/inbox.json.lock）。
+- schedule.json 改为合并写，保留各项目的登记；schedule status 按项目自己的周期判断。
+- DRIVER.md 第 29 节。自检新增 1 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.7.1 — 2026-10-12
 
 目标达成后由证据生成回报（collab-wf-dev 第 89–91 轮）。

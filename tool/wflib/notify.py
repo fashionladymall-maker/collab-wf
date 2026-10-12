@@ -130,8 +130,36 @@ def collect_inbox(projects) -> list:
 
 
 def write_inbox(projects, path=None, items=None) -> list:
-    """覆盖写 inbox：当前全部待办；同一件事保留第一次出现的时间（since），处理掉的事随之消失。"""
+    """覆盖写 inbox：当前全部待办；同一件事保留第一次出现的时间（since），处理掉的事随之消失。
+    1.7.2：每个项目自己的定时任务会并发写它，读改写放在文件锁里。"""
     path = path or INBOX
+    with _inbox_lock(path):
+        return _write_inbox_locked(projects, path, items)
+
+
+def _inbox_lock(path):
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        try:
+            import fcntl
+        except ImportError:   # 没有 fcntl 的平台不加锁
+            yield
+            return
+        lp = str(path) + ".lock"
+        os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
+        fh = open(lp, "a")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+            fh.close()
+    return _cm()
+
+
+def _write_inbox_locked(projects, path, items) -> list:
     old = {x.get("key"): x for x in ((read_json(path, {}) or {}).get("items") or []) if isinstance(x, dict)}
     items = collect_inbox(projects) if items is None else [dict(x) for x in items]
     for x in items:

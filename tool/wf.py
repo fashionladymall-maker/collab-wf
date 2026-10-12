@@ -39,7 +39,8 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
 
 自动驱动（由系统定时唤醒调用）：
   wf run [--max-seconds 600]          推进当前项目到需要等待或需要用户为止（退出码 0/10/20/30）
-  wf tick [--max-seconds 900]         推进全部项目（多项目调度）
+  wf tick [--max-seconds 900]         推进全部项目（多项目调度）；有自己定时任务的项目跳过（1.7.2）
+  wf --project <名> tick              只推进这一个项目（它自己的定时任务用，1.7.2）
   wf explain                          现在卡在哪、为什么、需要谁做什么
   wf kick --message <任务文件>         发起一轮新任务，交给驱动器
   wf kick --kind report               由本轮证据生成标准回报（含终端原文与“需要注意”），交给驱动器发送（1.7.1）
@@ -54,6 +55,7 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf conv [new --note … [--conv <id>]]  当前对话的体量与对话 id；开新对话后记录起点（--conv 同时登记新对话）
   wf conv bind --conv <id> --note …   只登记本项目当前所在的对话（不换对话、不清计数；1.7.0，迁移用）
   wf schedule plist | status          生成系统定时器配置（launchd）/ 检查定时器是否在运行
+  wf --project <名> schedule plist | release  这个项目自己的定时任务：生成配置并登记 / 撤回登记（1.7.2）
 
 项目与版本：
   wf init --name N [--root 路径] [--adopt [--turn N --state S]]   新建或接入项目
@@ -224,14 +226,37 @@ def _transport_test() -> int:
     return 0 if all(g for g, _, _ in res) else 1
 
 
+def _safe_name(name) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(name or ""))[:80] or "_"
+
+
+def _own_sched() -> dict:
+    """1.7.2（ISOLATION.md S3）：登记了自己定时任务的项目（local/schedule.json 的 projects）。"""
+    from wflib.core import LOCAL, read_json
+    return dict(((read_json(LOCAL / "schedule.json", {}) or {}).get("projects")) or {})
+
+
 def _schedule(args):
     from wflib.core import LOCAL, WF_HOME, load_registry, secs_since
     from wflib.core import Instance
     if args.action == "plist":
         from wflib.core import write_json as _wj
-        _wj(LOCAL / "schedule.json", {"interval": args.interval, "max_seconds": args.max_seconds})
+        from wflib.core import read_json as _rj, now_iso as _now
+        sj = _rj(LOCAL / "schedule.json", {}) or {}   # 1.7.2：合并写，保留各项目自己的定时任务记录
         py = sys.executable
         label = "local.collab-wf.tick"
+        pargs, logf = "", LOCAL / "tick.log"
+        if args.project:   # 1.7.2（ISOLATION.md S3）：这个项目自己的定时任务
+            if args.project not in [p["name"] for p in load_registry()["projects"]]:
+                raise WfError(f"注册表里没有项目 {args.project}（wf projects 列出全部）")
+            label = f"local.collab-wf.tick.{_safe_name(args.project)}"
+            pargs = f"    <string>--project</string>\n    <string>{args.project}</string>\n"
+            logf = LOCAL / f"tick-{_safe_name(args.project)}.log"
+            sj.setdefault("projects", {})[args.project] = {"interval": args.interval, "max_seconds": args.max_seconds,
+                                                            "label": label, "since": _now()}
+        else:
+            sj.update(interval=args.interval, max_seconds=args.max_seconds)
+        _wj(LOCAL / "schedule.json", sj)
         print(f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -241,7 +266,7 @@ def _schedule(args):
   <array>
     <string>{py}</string>
     <string>{WF_HOME / "wf.py"}</string>
-    <string>tick</string>
+{pargs}    <string>tick</string>
     <string>--max-seconds</string>
     <string>{args.max_seconds}</string>
   </array>
@@ -254,12 +279,28 @@ def _schedule(args):
     <key>PATH</key><string>{WF_HOME / "bin"}:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     <key>LANG</key><string>en_US.UTF-8</string>
   </dict>
-  <key>StandardOutPath</key><string>{LOCAL / "tick.log"}</string>
-  <key>StandardErrorPath</key><string>{LOCAL / "tick.log"}</string>
+  <key>StandardOutPath</key><string>{logf}</string>
+  <key>StandardErrorPath</key><string>{logf}</string>
 </dict>
 </plist>''')
         print(f"<!-- 保存为 ~/Library/LaunchAgents/{label}.plist，然后：launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{label}.plist -->",
               file=sys.stderr)
+        if args.project:
+            print(f"<!-- 登记后全局定时任务不再推进 {args.project}；请立即加载上面的配置，否则它没人推进（心跳会在 15 分钟后报停）。"
+                  f"撤回：wf --project {args.project} schedule release，再 launchctl bootout gui/$(id -u)/{label} -->", file=sys.stderr)
+        return
+    if args.action == "release":   # 1.7.2：撤回某个项目自己的定时任务，回到全局定时任务推进
+        from wflib.core import read_json as _rj, write_json as _wj
+        if not args.project:
+            raise WfError("用法：wf --project <名> schedule release")
+        sj = _rj(LOCAL / "schedule.json", {}) or {}
+        rec = (sj.get("projects") or {}).pop(args.project, None)
+        _wj(LOCAL / "schedule.json", sj)
+        if rec:
+            print(f"已撤回 {args.project} 自己的定时任务登记，全局定时任务下次起推进它；"
+                  f"另请卸载：launchctl bootout gui/$(id -u)/{rec.get('label')}")
+        else:
+            print(f"{args.project} 没有登记自己的定时任务")
         return
     reg = load_registry()["projects"]
     worst = 0
@@ -278,7 +319,11 @@ def _schedule(args):
             print(f"  {inst.name}：驱动器从未运行")
             worst = max(worst, 1)
         else:
-            stale = age > 3 * args.interval
+            own = _own_sched().get(inst.name) or {}   # 1.7.2：有自己定时任务的项目按它自己的周期判断
+            iv = int(own.get("interval") or args.interval)
+            stale = age > 3 * iv
+            if own:
+                print(f"  {inst.name}：自己的定时任务 {own.get('label')}，周期 {iv} 秒")
             worst = max(worst, 1 if stale else 0)
             print(f"  {inst.name}：最近一次运行 {int(age // 60)} 分钟前，退出码 {last.get('exit')}" + ("  ← 超过 3 个周期，定时器可能没有运行" if stale else ""))
     log = LOCAL / "tick.log"
@@ -371,7 +416,7 @@ def main(argv=None):
     x.add_argument("--tsv", action="store_true")
     x = sub.add_parser("conv"); x.add_argument("action", nargs="?", default="show", choices=["show", "new", "bind"]); x.add_argument("--note")
     x.add_argument("--conv")   # 1.7.0（ISOLATION.md S1）：本项目的对话 id
-    x = sub.add_parser("schedule"); x.add_argument("action", choices=["plist", "status"])
+    x = sub.add_parser("schedule"); x.add_argument("action", choices=["plist", "status", "release"])
     x.add_argument("--interval", type=int, default=300); x.add_argument("--max-seconds", type=int, default=540)
     sub.add_parser("self-init")
     sub.add_parser("self-check")
@@ -721,10 +766,10 @@ def main(argv=None):
     elif c == "tick":
         from wflib import driver
         from wflib.core import LOCAL
-        _log = LOCAL / "tick.log"
+        _log = LOCAL / (f"tick-{_safe_name(args.project)}.log" if args.project else "tick.log")   # 1.7.2：各写各的日志
         if _log.exists() and _log.stat().st_size > 5 * 1024 * 1024:
             import os as _os
-            _os.replace(_log, LOCAL / "tick.log.1")
+            _os.replace(_log, _log.with_name(_log.name + ".1"))
         from wflib.core import Instance
         insts = []
         for p in load_registry()["projects"]:
@@ -732,9 +777,22 @@ def main(argv=None):
                 insts.append(Instance(Path(p["root"])))
             except WfError as e:
                 print(f"跳过 {p['name']}：{e}")
-        code, rows = driver.tick(insts, args.max_seconds)
+        # 1.7.2（ISOLATION.md S3）：wf --project <名> tick 只推进这一个项目；不带 --project 时跳过有自己定时任务的项目。
+        # inbox 仍汇总全部项目：只写本项目会把别的项目的待办冲掉，而执行端以“key 从 inbox 消失”判定做完
+        own = set(_own_sched())
+        if args.project:
+            drive = [i for i in insts if i.name == args.project]
+            if not drive:
+                raise WfError(f"注册表里没有项目 {args.project}（wf projects 列出全部）")
+            pre = []
+        else:
+            drive = [i for i in insts if i.name not in own]
+            pre = [{"project": i.name, "exit": None, "note": "有自己的定时任务（wf schedule plist --project），由它推进"}
+                   for i in insts if i.name in own]
+        code, rows = driver.tick(drive, args.max_seconds)
+        rows = pre + rows
         from wflib import sync as _sync   # 1.6.0：项目上下文同步（docs/SYNC.md），先于 inbox
-        _sync.after_tick(insts)
+        _sync.after_tick(drive)
         from wflib import notify   # 1.5.7：新出现的待决事项与提示弹成系统通知（每件事只通知一次）
         notify.after_tick(insts)
         if args.json:
