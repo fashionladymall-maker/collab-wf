@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 102 轮 · 空闲（IDLE）
+第 103 轮 · 等待用户决定（AWAITING_USER）
 
 ## 版本
 - 工具：collab-wf 1.7.6
@@ -23,7 +23,7 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- 无
+- [executor] 需要你批准才能继续：[NO_REF] 本轮是在驱动器之外手动发出的，没有登记适配器的 ref，驱动器无法轮询接续。手动 wf mark replied 处理本轮；之后用 wf mark sent --ref 发送即可全自动。 本轮消息是手动发出的、没有登记 ref，驱动器无法轮询接续。请手动 wf mark replied，或下次用 wf mark sent --ref（适配器返回的 ref）发送
 
 ## 最新产物
 - `artifacts/collab-wf-1.7.6.zip`
