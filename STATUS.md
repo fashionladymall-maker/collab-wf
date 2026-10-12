@@ -26,5 +26,5 @@
 - [executor] 需要你批准才能继续：[NO_REF] 本轮是在驱动器之外手动发出的，没有登记适配器的 ref，驱动器无法轮询接续。手动 wf mark replied 处理本轮；之后用 wf mark sent --ref 发送即可全自动。 本轮消息是手动发出的、没有登记 ref，驱动器无法轮询接续。请手动 wf mark replied，或下次用 wf mark sent --ref（适配器返回的 ref）发送
 
 ## 最新产物
-- `artifacts/collab-wf-1.7.6.zip`
+- `artifacts/collab-wf-1.7.6-ca8c2da.zip`
 - `artifacts/collab-wf-dev-v3.2.zip`
