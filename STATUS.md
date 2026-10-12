@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 106 轮 · 发送（SEND）
+第 106 轮 · 等待用户决定（AWAITING_USER）
 
 ## 版本
 - 工具：collab-wf 1.7.6
@@ -9,8 +9,8 @@
 
 ## 最近一轮
 - 第 105 轮验收通过（2026-10-12T17:26:42+00:00）
-- 本方最新消息：`turns/turn-105.md`
-- Claude 最新回复：`replies/reply-105.md`
+- 本方最新消息：`turns/turn-106.md`
+- Claude 最新回复：`replies/reply-106.md`
 
 ## 目标
 - 进度 7 / 7
@@ -23,8 +23,9 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- 无
+- [executor] 需要你批准才能继续：以下内容需要用户批准后才会执行：
+- 版本包 workflow/goals.json：改动了白名单或目标定义，且扩大了自动执行的范围（生效前需要用户批准）：M2-B1 的检查命令不在已批准的白名单内：wf self-check --probes；M2-B2 的检查命令不在已批准的白名单内：wf self-check --probes；M2-E1 的检查命令不在已批准的白名单内：wf self-ch
 
 ## 最新产物
 - `artifacts/collab-wf-1.7.6-ca8c2da.zip`
-- `artifacts/collab-wf-dev-v3.2.zip`
+- `artifacts/collab-wf-1.8.0.zip`
