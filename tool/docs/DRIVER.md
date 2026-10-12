@@ -296,7 +296,7 @@ collab-wf-dev 第 82、83 轮与改进批次一（P1-D、P2-E）。
 
 collab-wf-dev 第 86–88 轮（执行端加固需求甲）。
 
-- 审查等待可见（P0-A）：自动安装前等独立审查时，wf self-update 先输出“开始等独立审查（上限 N 秒）”，之后每 `review_heartbeat_s`（transport.json，默认 30）秒输出“仍在等独立审查：已 X 秒 / 上限 N 秒”；没有结论时输出“本次未审查：原因”，并写 local/reviews/<版本包名>.unreviewed.json（时刻、原因、diff 路径），版本照常安装，事后可按 diff 补审。运行新版本自检前也先输出一行。“未审查不阻止安装、只有 block 能阻止”不变。
+- 审查等待可见（P0-A）：自动安装前等独立审查时，wf self-update 先输出“开始等独立审查（上限 N 秒）”，之后每 `review_heartbeat_s`（transport.json，默认 30）秒输出“仍在等独立审查：已 X 秒 / 上限 N 秒”；没有结论时输出“本次未审查：原因”，并写 local/reviews/<版本包名去掉 .zip>.unreviewed.json（例如 collab-wf-1.6.9.unreviewed.json；时刻、原因、diff 路径），版本照常安装，事后可按 diff 补审。运行新版本自检前也先输出一行。“未审查不阻止安装、只有 block 能阻止”不变。
 - 执行端不在场时（P0-B）：在场检测属于执行端的审查程序（它知道有没有可用会话）。约定：没有可用会话时，审查程序应在几秒内以非 0 退出（例如输出 `{"verdict": "unreviewed", "reason": "no_session"}`），工具按“未审查”继续；有会话时才等，等待上限仍是 review_timeout_s。不采用“先安装、事后 block 再回滚”：回滚是护栏命令（self-rollback），驱动器没有调用它的路径，而且未审查的代码会先跑起来。
 - 发送结果不明（N8）：SEND 有待定的发送意图（结果不明、SEND_UNKNOWN_WAIT 正在反复确认）时，停留上限按 65 分钟计，不再在 15 分钟时误报“停留超过上限”；看门狗的 send_unknown（60 分钟）不变。
 - 暂停与静音（N9）：已暂停的项目、wf.json auto=false 的项目，不再出现“停留超过上限”提示，看门狗不报停滞，驱动器心跳不判“停了”；wf schedule status 把 auto=false 的项目标为“已静音”，不计入“定时器可能没有运行”。暂停本身仍在 inbox 里交给用户。
@@ -314,3 +314,15 @@ collab-wf-dev 第 86–88 轮（执行端加固需求甲）。
 | 执行端待办 | 等执行端，最迟 executor_task_timeout_s（默认 4 小时）照常回报并列出没做完的 |
 | 白名单外的命令、扩大权限的变更、熔断、阻塞 | 停下，先交执行端代决（--by executor），2 小时没处理转给用户 |
 | 四道底线（资金、密钥、合规、实盘）、改 floor.py 的版本、撤销暂停、目标达成后的继续 | 停下，只认用户本人 |
+
+## 27. 1.7.0 会话按项目绑定（多项目隔离第一阶段）
+
+collab-wf-dev 第 88–90 轮；设计见该项目的 ISOLATION.md 第 3 节，适配器约定见 TRANSPORT.md 附录“1.7.0”。
+
+- 开关：transport.json 的 `per_project_conv`。没声明时行为与 1.6.9 完全相同（旧适配器不认识新参数）。
+- 本项目的对话记在状态的 conv.conv：驱动器自动开新对话时取适配器返回的 conv；手工换对话用 `wf conv new --note … --conv <id>`；只登记、不换对话、不清计数用 `wf conv bind --conv <id> --note …`（迁移用）。`wf conv` 显示对话 id。
+- 声明后：send、poll（含结果不明时的确认轮询）、snapshot 都带 `--conv <id>`（登记了才带）；conv_new 带 `--project <名>`，适配器只改这个项目的绑定。
+- 适配器输出里的 `warning`（例如 conv_from_default、conv_mismatch）写进本轮“需要注意”（自动处置 ADAPTER_WARNING），同一轮同一动作的同一告警只记一次；只记录，不改变处置。
+- wf transport test：声明了 per_project_conv 时多一项，poll 带一个不存在的 --conv 时仍返回 none 或 no_ref。I1（一个项目换对话不影响另一个）由执行端在真实通道上实测。
+- 迁移顺序（执行端第 90 轮意见）：先升级适配器（不认识的参数不报错，按 projects[--project] 选对话），再装 1.7.0、`wf conv bind` 登记当前对话，最后在 transport.json 打开 per_project_conv。
+- 同版一并修：同步阻断记录带结构化原因（reasons：secret / bad_zip），提示标题以它为准；第 26 节 unreviewed 文件名的写法。

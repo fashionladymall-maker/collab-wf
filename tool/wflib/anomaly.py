@@ -76,6 +76,20 @@ def driver_env() -> dict:
 PROGRAM_OPS = ("sync", "review")
 
 
+def conv_args(inst) -> list:
+    """1.7.0（ISOLATION.md S1）：transport.json 声明 per_project_conv 时，把本项目登记的对话（state.conv.conv）交给适配器。
+    没声明时返回空列表：旧适配器不认识 --conv，传了会被当成错误。"""
+    if not transport_cfg().get("per_project_conv"):
+        return []
+    cid = (inst.state.get("conv") or {}).get("conv")
+    return ["--conv", str(cid)] if cid else []
+
+
+def conv_new_args(inst) -> list:
+    """1.7.0（ISOLATION.md S1）：声明 per_project_conv 时，conv_new 带上项目名，适配器只改该项目的绑定、不改默认对话。"""
+    return ["--project", inst.name] if transport_cfg().get("per_project_conv") else []
+
+
 def call(op: str, args: list, timeout=None, env_extra=None) -> dict:
     """调用适配器（send/poll/quota 三个可执行程序之一）。返回 {"code": 退出码, "data": JSON 或 {}, "raw": 原始输出}。
     适配器缺失、超时、输出不是 JSON 时，kind 分别为 not_configured / timeout / bad_output（由异常字典处置）。"""

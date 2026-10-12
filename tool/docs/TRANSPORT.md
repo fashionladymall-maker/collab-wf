@@ -137,3 +137,13 @@ policy.json 的 auto_new_conversation 为 true 时，wf 在对话达到上限时
 - 切换成功后，wf 不再把上一轮（旧对话）的 ref 作为 --prev-ref 交给适配器。
 
 一致性检查（wf transport test）：对空 ref 的 poll，返回 none 或 no_ref 都算合规（1.6.4 起；此前只认 none，与上面 1.5.1 的约定矛盾）。
+
+## 附：1.7.0 按项目绑定对话（可选；collab-wf-dev 的 ISOLATION.md S1）
+
+适配器支持后，在 transport.json 写 `"per_project_conv": true`。没写时 wf 不传下面的参数。
+
+- send、poll、snapshot 多一个 `--conv <对话 id>`（wf 为本项目登记了对话时才传）。
+- conv_new 多一个 `--project <项目名>`：只改该项目的绑定，不改默认对话；成功时照旧返回 `{"ok": true, "conv": "<新对话 id>", …}`。
+- 选对话的顺序：`--conv` > 适配器配置里该项目的绑定（projects[--project]）> `--prev-ref` 所属的对话 > 默认对话。`--prev-ref` 仍然提供定位的下界（上一轮的坐标），但不决定用哪个对话（执行端第 90 轮的意见：否则换对话后仍会按旧 ref 查旧对话，N10 重演）。
+- 退到默认对话时，输出加 `"warning": "conv_from_default"`；`--prev-ref` 所属对话与选定的对话不同时加 `"warning": "conv_mismatch"`。warning 是可选字段：wf 只把它写进回报的“需要注意”，不改变任何处置。
+- 一致性检查：声明了 per_project_conv 时，wf transport test 用空 ref 加一个不存在的 `--conv` 做一次 poll，要求退出码 0、status 为 none 或 no_ref。

@@ -233,7 +233,8 @@ def look(inst: Instance, full=False) -> dict:
     """wf look：看一次 Claude 页面（适配器的 snapshot 动作），更新文本快照与截图。不发送任何消息，不改变工作流状态。"""
     from . import anomaly
     st = inst.state
-    r = anomaly.call("snapshot", ["--project", inst.name, "--ref", st.get("send_ref") or "", "--out", inst.turn_dir()],
+    r = anomaly.call("snapshot", ["--project", inst.name, "--ref", st.get("send_ref") or "", "--out", inst.turn_dir()]
+                     + anomaly.conv_args(inst),   # 1.7.0（ISOLATION.md S1）
                      timeout=120, env_extra=poll_env(inst, shots=True, mode="full" if full else None))
     if r.get("kind") == "not_configured":
         after_poll(inst, "look")

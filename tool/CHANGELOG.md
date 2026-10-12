@@ -1,9 +1,20 @@
 # CHANGELOG（collab-wf）
 
+## 1.7.0 — 2026-10-12
+
+多项目隔离第一阶段 S1：会话按项目绑定（collab-wf-dev 第 88–90 轮，ISOLATION.md 第 3 节）。
+- transport.json 的 per_project_conv 打开后：send、poll（含结果不明时的确认轮询）、snapshot 带 --conv（本项目登记的对话）；conv_new 带 --project。没打开时行为不变。
+- wf conv bind --conv <id> --note …：只登记对话，不换对话、不清计数；wf conv new 可带 --conv；wf conv 显示对话 id。
+- 适配器输出的 warning 进“需要注意”（ADAPTER_WARNING），同一轮同一动作同一告警只记一次。
+- wf transport test：声明 per_project_conv 时检查 poll 接受 --conv。
+- TRANSPORT.md 附录：选对话的顺序 --conv > projects[--project] > --prev-ref 所属对话 > 默认对话（执行端第 90 轮意见），告警字段。DRIVER.md 第 27 节。
+- 1.6.9 审查意见：同步阻断记录带结构化原因 reasons（secret / bad_zip），提示标题以它为准，旧记录仍按文案判断；unreviewed 文件名的文档写法更正。
+- 自检替身记录每次调用的参数；自检新增 4 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.6.9 — 2026-10-12
 
 加固批次（collab-wf-dev 第 86–88 轮，执行端需求甲）。
-- P0-A：wf self-update 等独立审查时输出开始行与周期心跳（transport.json 的 review_heartbeat_s，默认 30 秒）；没有结论时输出原因并写 local/reviews/<版本包名>.unreviewed.json，照常安装；运行新版本自检前先输出一行。
+- P0-A：wf self-update 等独立审查时输出开始行与周期心跳（transport.json 的 review_heartbeat_s，默认 30 秒）；没有结论时输出原因并写 local/reviews/<版本包名去掉 .zip>.unreviewed.json，照常安装；运行新版本自检前先输出一行。
 - N8（P1-C）：发送结果不明（意图未结束）期间，SEND 的停留上限按 65 分钟计（machine.SEND_UNKNOWN_DWELL_S），不再误报“停留超过上限”。
 - N9：已暂停或 wf.json auto=false 的项目不报“停留超过上限”、看门狗不报停滞、心跳不判“停了”；wf schedule status 把 auto=false 标为“已静音”。
 - N6、N7（P1-B）：同步暂停提示按实际命中写标题；key 由命中内容算出，不再随时间变化。

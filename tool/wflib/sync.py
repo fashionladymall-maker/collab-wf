@@ -168,8 +168,9 @@ def _scan_text(name: str, text: str) -> list:
     return out
 
 
-def scan(files: dict) -> list:
-    """发送前用的密钥扫描，覆盖每个文本文件与 zip 内的每个文本成员。"""
+def scan_detailed(files: dict) -> list:
+    """1.7.0：与 scan() 相同，但每条命中带原因类别（secret 疑似密钥 / bad_zip 不是有效的 zip），阻断记录据此写原因，
+    不再靠文案后缀区分（1.6.9 独立审查意见）。"""
     hits = []
     for name, data in sorted(files.items()):
         if name.endswith(".zip"):
@@ -177,17 +178,22 @@ def scan(files: dict) -> list:
                 with zipfile.ZipFile(io.BytesIO(data)) as zf:
                     for m in zf.namelist():
                         try:
-                            hits += _scan_text(f"{name}:{m}", zf.read(m).decode("utf-8"))
+                            hits += [("secret", h) for h in _scan_text(f"{name}:{m}", zf.read(m).decode("utf-8"))]
                         except UnicodeDecodeError:
                             continue
             except zipfile.BadZipFile:
-                hits.append(f"{name}：不是有效的 zip")
+                hits.append(("bad_zip", f"{name}：不是有效的 zip"))
             continue
         try:
-            hits += _scan_text(name, data.decode("utf-8"))
+            hits += [("secret", h) for h in _scan_text(name, data.decode("utf-8"))]
         except UnicodeDecodeError:
             continue
     return hits
+
+
+def scan(files: dict) -> list:
+    """发送前用的密钥扫描，覆盖每个文本文件与 zip 内的每个文本成员。"""
+    return [h for _, h in scan_detailed(files)]
 
 
 def digest(files: dict) -> str:
@@ -202,11 +208,12 @@ def run(inst, dry_run=False, force=False) -> dict:
     from . import anomaly
     rec = record(inst)
     files = collect(inst)
-    hits = scan(files)
+    detailed = scan_detailed(files)   # 1.7.0：命中带原因类别
+    hits = [h for _, h in detailed]
     d = digest(files)
     res = {"ts": now_iso(), "files": len(files), "bytes": sum(len(b) for b in files.values()), "digest": d[:16]}
     if hits:
-        res.update(status="blocked", secrets=hits[:20])
+        res.update(status="blocked", secrets=hits[:20], reasons=sorted({k for k, _ in detailed}))
     elif dry_run:
         res.update(status="dry_run")
     elif d == rec.get("pushed_digest") and not force:
@@ -232,7 +239,7 @@ def run(inst, dry_run=False, force=False) -> dict:
         if res["status"] != "blocked":
             rec.pop("blocked", None)
         else:
-            rec["blocked"] = {"ts": res["ts"], "secrets": res["secrets"]}
+            rec["blocked"] = {"ts": res["ts"], "secrets": res["secrets"], "reasons": res.get("reasons") or []}
         write_json(record_path(inst), rec)
     return res
 
@@ -260,6 +267,9 @@ def notices(inst) -> list:
         hits = [str(h) for h in (b.get("secrets") or [])]
         badzip = [h for h in hits if h.endswith("不是有效的 zip")]
         secret = [h for h in hits if h not in badzip]
+        if isinstance(b.get("reasons"), list):   # 1.7.0：有结构化原因时以它为准；旧记录仍按文案判断
+            secret = hits if "secret" in b["reasons"] else []
+            badzip = hits if "bad_zip" in b["reasons"] else []
         # 1.6.9（N6、N7）：标题按实际命中写；key 由命中内容算出，同一原因不随每次 tick 的时间变成新键、反复唤醒
         key = "sync_blocked:" + hashlib.sha256("\n".join(sorted(hits)).encode("utf-8")).hexdigest()[:12]
         if secret:

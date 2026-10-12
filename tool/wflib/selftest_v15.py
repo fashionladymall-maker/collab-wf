@@ -1206,6 +1206,63 @@ def _t_v169_review_heartbeat(_ok):
         and v2[0] == "pass" and "仍在等独立审查" not in e2 and "独立审查结论：pass" in e2, e1[-400:] + " | " + e2[-200:])
 
 
+def _t_v170_conv_args(_ok):
+    from . import anomaly
+
+    class _I:
+        name = "p170"
+        state = {"conv": {"conv": "c-1"}}
+    orig = anomaly.transport_cfg
+    try:
+        anomaly.transport_cfg = lambda: {}
+        off = (anomaly.conv_args(_I()), anomaly.conv_new_args(_I()))
+        anomaly.transport_cfg = lambda: {"per_project_conv": True}
+        on = (anomaly.conv_args(_I()), anomaly.conv_new_args(_I()))
+        _I.state = {"conv": {}}
+        none = anomaly.conv_args(_I())
+    finally:
+        anomaly.transport_cfg = orig
+    _ok("1.7.0 对话参数：没声明 per_project_conv 时不传；声明后传 --conv 与 conv_new 的 --project；没登记对话时不传 --conv",
+        off == ([], []) and on == (["--conv", "c-1"], ["--project", "p170"]) and none == [], str([off, on, none]))
+
+
+def _t_v170_warning_dedupe(_ok):
+    from . import driver
+    with tempfile.TemporaryDirectory() as td:
+        a = _v169_inst(td, "v170-warn")
+        a.state.update(state="WAIT_REPLY", turn=4, turn_flags={})
+        a.save()
+        for _ in range(3):
+            driver._adapter_warning(a, "poll", {"data": {"status": "generating", "warning": "conv_mismatch"}})
+        driver._adapter_warning(a, "send", {"data": {"warning": "conv_mismatch"}})
+        driver._adapter_warning(a, "poll", {"data": {"status": "none"}})
+        ev = [json.loads(x) for x in (a.root / "workflow" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    got = [(e.get("turn"), e.get("detail")) for e in ev if e.get("type") == "auto" and e.get("rule") == "ADAPTER_WARNING"]
+    _ok("1.7.0 适配器告警：同一轮同一动作的同一告警只记一次，不同动作分别记，没有告警不记",
+        got == [(4, "poll：conv_mismatch"), (4, "send：conv_mismatch")], str(got))
+
+
+def _t_v170_sync_reasons(_ok):
+    from . import sync
+    d = sync.scan_detailed({"artifacts/x.zip": b"not a zip", "a.txt": "普通文字\n".encode("utf-8")})
+    orig = (sync.enabled, sync.record)
+    recs = []
+    try:
+        sync.enabled = lambda inst: True
+        sync.record = lambda inst: recs[-1]
+        recs.append({"blocked": {"ts": "t1", "secrets": ["artifacts/x.zip 打不开"], "reasons": ["bad_zip"]}})
+        n1 = sync.notices(None)
+        recs.append({"blocked": {"ts": "t2", "secrets": ["a.txt 第 1 行：命中", "artifacts/x.zip：不是有效的 zip"],
+                                 "reasons": ["bad_zip", "secret"]}})
+        n2 = sync.notices(None)
+    finally:
+        sync.enabled, sync.record = orig
+    _ok("1.7.0 同步阻断原因：扫描结果带类别；有结构化原因时标题以它为准（不看文案后缀），两类都有时都写明",
+        [k for k, _ in d] == ["bad_zip"] and sync.scan({"artifacts/x.zip": b"not a zip"}) == ["artifacts/x.zip：不是有效的 zip"]
+        and "不是有效的 zip" in n1[0]["title"] and "密钥" not in n1[0]["title"]
+        and "疑似密钥" in n2[0]["title"] and "无效 zip" in n2[0]["title"], json.dumps([d, n1, n2], ensure_ascii=False)[:600])
+
+
 TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单编号", _t_lists), ("证据关联", _t_link),
          ("回报原文", _t_report), ("分片", _t_chunks), ("回复归属", _t_attr), ("执行接续", _t_exec),
          ("桥接自检", _t_bridge), ("额度与事件", _t_usage_seq), ("升级核验", _t_receipt), ("文件口径", _t_tree),
@@ -1226,7 +1283,9 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.6.5 外部信号与升级", _t_v165_signals), ("1.6.5 看门狗", _t_v165_watchdog),
          ("1.6.5 执行端代决", _t_v165_executor_decision), ("1.6.6 执行端待办", _t_v166_tasks),
          ("1.6.9 暂停与静音不报停滞", _t_v169_quiet), ("1.6.9 结果不明不算停留过久", _t_v169_send_dwell),
-         ("1.6.9 同步暂停提示", _t_v169_sync_notice), ("1.6.9 审查心跳", _t_v169_review_heartbeat)]
+         ("1.6.9 同步暂停提示", _t_v169_sync_notice), ("1.6.9 审查心跳", _t_v169_review_heartbeat),
+         ("1.7.0 对话参数", _t_v170_conv_args), ("1.7.0 同步阻断原因", _t_v170_sync_reasons),
+         ("1.7.0 适配器告警去重", _t_v170_warning_dedupe)]
 
 
 def run_v15(_ok) -> None:

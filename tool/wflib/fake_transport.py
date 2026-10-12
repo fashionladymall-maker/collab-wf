@@ -30,8 +30,19 @@ def save(s):
     (D / "status.json").write_text(json.dumps(s))
 
 
+def _warn() -> dict:
+    """1.7.0：poll_warning 文件存在时，poll 的完成输出带上 warning（自检核对“需要注意”）。"""
+    w = D / "poll_warning"
+    return {"warning": w.read_text().strip()} if w.exists() else {}
+
+
 def main():
     op = sys.argv[1]
+    try:   # 1.7.0：记下每次调用的参数（自检核对 --conv、--project）；记不下也不影响替身本身
+        with open(D / "calls.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": op, "argv": sys.argv[2:]}, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
     s = load()
     if op == "send":
         ctl = D / "next_send_code"
@@ -75,7 +86,7 @@ def main():
                     dst = out / Path(line.strip()).name
                     shutil.copy(line.strip(), dst)
                     files.append(str(dst))
-        print(json.dumps({"status": "done", "reply_file": str(reply), "files": files,
+        print(json.dumps({"status": "done", "reply_file": str(reply), "files": files, **_warn(),
                           "tools": [{"name": "bash_tool", "summary": "测试"}]}))
         return
     if op == "conv_new":

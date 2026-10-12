@@ -50,7 +50,8 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf transport [test]                 检查传输适配器配置 / 黑盒一致性检查（不发送消息）
   wf effort                           档位与角色规则，以及按档位、角色的复盘统计
   wf decisions [--tsv] [--turn N]     决策日志：做了什么、为什么、证据、结果
-  wf conv [new --note …]              当前对话的体量；开新对话后记录起点
+  wf conv [new --note … [--conv <id>]]  当前对话的体量与对话 id；开新对话后记录起点（--conv 同时登记新对话）
+  wf conv bind --conv <id> --note …   只登记本项目当前所在的对话（不换对话、不清计数；1.7.0，迁移用）
   wf schedule plist | status          生成系统定时器配置（launchd）/ 检查定时器是否在运行
 
 项目与版本：
@@ -199,6 +200,11 @@ def _transport_test() -> int:
         ok("poll 在 60 秒内返回", _time.time() - t0 < 60)
         r2 = anomaly.call("poll", ["--project", "__wf_probe__", "--turn", "999999", "--ref", "", "--out", td], timeout=60)
         ok("poll 幂等（重复调用结果相同）", r2["data"].get("status") == r["data"].get("status"))
+        if cfg.get("per_project_conv"):   # 1.7.0（ISOLATION.md S1）：适配器认得 --conv，且不会因此报告完成或生成中
+            r4 = anomaly.call("poll", ["--project", "__wf_probe__", "--turn", "999999", "--ref", "", "--out", td,
+                                       "--conv", "__wf_probe_conv__"], timeout=60)
+            ok("声明了 per_project_conv：poll 接受 --conv，对不存在的轮次返回 none 或 no_ref",
+               r4["code"] == 0 and r4["data"].get("status") in ("none", "no_ref"), f"退出码 {r4['code']}，输出 {r4['raw'][:160]}")
         if cfg.get("quota"):
             out = Path(td) / "usage.json"
             r3 = anomaly.call("quota", ["--project", "__wf_probe__", "--out", out], timeout=60)
@@ -362,7 +368,8 @@ def main(argv=None):
     sub.add_parser("effort")
     x = sub.add_parser("decisions"); x.add_argument("--n", type=int, default=40); x.add_argument("--turn", type=int)
     x.add_argument("--tsv", action="store_true")
-    x = sub.add_parser("conv"); x.add_argument("action", nargs="?", default="show", choices=["show", "new"]); x.add_argument("--note")
+    x = sub.add_parser("conv"); x.add_argument("action", nargs="?", default="show", choices=["show", "new", "bind"]); x.add_argument("--note")
+    x.add_argument("--conv")   # 1.7.0（ISOLATION.md S1）：本项目的对话 id
     x = sub.add_parser("schedule"); x.add_argument("action", choices=["plist", "status"])
     x.add_argument("--interval", type=int, default=300); x.add_argument("--max-seconds", type=int, default=540)
     sub.add_parser("self-init")
@@ -993,17 +1000,30 @@ def main(argv=None):
             old = dict(cst)
             inst.state["conv"] = {"since_turn": inst.state.get("turn", 0) + 1, "since": tool_now(), "chars": 0, "turns": 0,
                                   "previous": {k: old.get(k) for k in ("since_turn", "since", "chars", "turns")}}
+            if getattr(args, "conv", None):   # 1.7.0（ISOLATION.md S1）：手工换对话时同时登记新对话
+                inst.state["conv"]["conv"] = args.conv
             # 1.6.9（N10）：与驱动器自动开新对话（driver.py）一致：上一轮的 ref 属于旧对话，不再作为 --prev-ref 交给适配器；
             # 否则新对话首轮的轮询会去查旧对话，消息已落地也确认不到，最后阻塞，而 wf resend 会重复发送
             inst.state.pop("send_ref", None)
             inst.state.pop("resend_parent", None)
-            inst.event("conv_new", note=args.note, by="user")
+            inst.event("conv_new", note=args.note, conv=getattr(args, "conv", None), by="user")
             roles.decide(inst, "context", "开始新对话", args.note, "", "计数已归零", by="user")
             print("已记录新对话的起点，计数归零。如驱动器停在等待用户决定，接着运行 wf approve --note …")
+        elif args.action == "bind":
+            # 1.7.0（ISOLATION.md S1）：只登记本项目当前所在的对话；不换对话、不清计数、不动本轮的发送意图（迁移用）
+            if not args.conv or not args.note:
+                raise WfError("用法：wf conv bind --conv <对话 id> --note \"说明\"")
+            c2 = dict(inst.state.get("conv") or {})
+            c2["conv"] = args.conv
+            inst.state["conv"] = c2
+            inst.event("conv_bind", conv=args.conv, note=args.note, by="user")
+            print(f"已登记本项目的对话 {args.conv}（只登记：不换对话、不清计数）。transport.json 声明 per_project_conv 后，"
+                  "发送、轮询与快照都会带上它")
         else:
             from wflib import policy as _pol
             pol = __import__("json").loads((inst.wf / "policy.json").read_text(encoding="utf-8")) if (inst.wf / "policy.json").exists() else {}
             print(f"当前对话：自第 {cst.get('since_turn', 1)} 轮起，{cst.get('turns', 0)} 轮，约 {cst.get('chars', 0)} 字符")
+            print(f"对话 id：{cst.get('conv') or '（未登记）'}")   # 1.7.0
             print(f"上限：{pol.get('max_conversation_turns') or '未设置'} 轮 / {pol.get('max_conversation_chars') or '未设置'} 字符")
     elif c == "schedule":
         _schedule(args)

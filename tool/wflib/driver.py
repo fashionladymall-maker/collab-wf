@@ -412,7 +412,8 @@ def _new_conversation(ctx, out, why, b) -> tuple:
         return None, "续接消息没有通过发送前检查：" + "；".join((chk["secrets"] + chk["problems"])[:3])
     st["conv_switch"] = {"turn": turn, "status": "pending", "ts": now_iso()}
     inst.save()
-    r = anomaly.call("conv_new", ["--note", f"collab-wf {inst.name} 第 {turn} 轮：{why}"])
+    r = anomaly.call("conv_new", ["--note", f"collab-wf {inst.name} 第 {turn} 轮：{why}"] + anomaly.conv_new_args(inst))
+    _adapter_warning(inst, "conv_new", r)
     data = r.get("data") or {}
     if r["code"] != 0 or data.get("ok") is not True:
         if r.get("kind") != "timeout":   # 明确失败：按约定默认对话保持不变，意图作废；超时则结果不明，保留意图
@@ -531,11 +532,13 @@ def h_send(ctx):
                             "（min_send_gap_s，W42：太早发送会接到上一条残留的生成，被误判为已接受）")
     if intent and intent.get("turn") == turn and intent.get("status") == "pending":
         pargs = ["--project", inst.name, "--turn", turn, "--ref", intent.get("ref") or "", "--out", tdir / "delivered"]
+        pargs += anomaly.conv_args(inst)   # 1.7.0（ISOLATION.md S1）：本项目的对话
         if anomaly.transport_cfg().get("poll_since"):
             # 1.5.1：没有 ref 时，让适配器按“发送时刻之后、内容与本轮消息相同的那条消息”定位（transport.json 的 poll_since）
             pargs += ["--since", intent.get("ts") or "", "--message", intent.get("file") or out.get("file") or "",
                       "--prev-ref", st.get("send_ref") or ""]   # 上一轮的 ref 原样交回，适配器可据此找到会话
         r = anomaly.call("poll", pargs, env_extra=page.poll_env(inst))   # 1.5.3：顺带写 Claude 页面快照
+        _adapter_warning(inst, "poll", r)
         page.after_poll(inst, "poll", r["data"].get("status"))
         status = r["data"].get("status")
         if r["code"] == 0 and status in ("generating", "done"):
@@ -560,9 +563,11 @@ def h_send(ctx):
     send_args = ["--project", inst.name, "--turn", turn, "--message", out.get("file"),
                  "--effort", out.get("effort") or "high",
                  "--model", out.get("model") or anomaly.transport_cfg().get("model", "")]
+    send_args += anomaly.conv_args(inst)   # 1.7.0（ISOLATION.md S1）：本项目的对话
     if st.get("resend_parent"):
         send_args += ["--parent", st["resend_parent"]]
     r = anomaly.call("send", send_args)
+    _adapter_warning(inst, "send", r)
     code = r["code"]
     if code == 0:
         # 不只信退出码：适配器必须给出“生成已开始”的正面证据，否则按“通道忙”处理（缺口 11-3、F22）
@@ -582,6 +587,21 @@ def h_send(ctx):
     if r.get("kind") in ("not_configured", "bad_output"):
         facts = {"source": "transport", "kind": r["kind"], "text": r["raw"]}
     return _anomaly(ctx, facts, r["raw"][:300])
+
+
+def _adapter_warning(inst, op, r) -> None:
+    """1.7.0（ISOLATION.md S1）：适配器输出里的 warning（例如 conv_from_default、conv_mismatch）写进本轮“需要注意”；
+    同一轮同一动作的同一告警只记一次。只记录，不改变任何处置。"""
+    w = (r.get("data") or {}).get("warning")
+    if not w:
+        return
+    flags = inst.state.setdefault("turn_flags", {})
+    seen = flags.setdefault("adapter_warnings", [])
+    key = f"{op}:{w}"
+    if key in seen:
+        return
+    seen.append(key)
+    inst.event("auto", rule="ADAPTER_WARNING", action="report", detail=f"{op}：{str(w)[:200]}", by="driver")
 
 
 def _finalize_send(ctx, out, note):
@@ -643,7 +663,9 @@ def h_wait_reply(ctx):
         return "wait", "Claude 正在处理（稍后检查）"
     tdir = inst.turn_dir()
     r = anomaly.call("poll", ["--project", inst.name, "--turn", st["turn"], "--ref", st.get("send_ref") or "",
-                              "--out", tdir / "delivered"], env_extra=page.poll_env(inst))   # 1.5.3：顺带写页面快照
+                              "--out", tdir / "delivered"] + anomaly.conv_args(inst),   # 1.7.0：本项目的对话
+                     env_extra=page.poll_env(inst))   # 1.5.3：顺带写页面快照
+    _adapter_warning(inst, "poll", r)
     page.after_poll(inst, "poll", r["data"].get("status"))
     status = r["data"].get("status")
     interval = int(ctx.pol.get("poll_interval_s", 120))

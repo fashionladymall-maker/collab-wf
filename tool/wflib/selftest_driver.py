@@ -311,6 +311,65 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
         and rep3.exists() and rep3.read_text(encoding="utf-8").startswith("【回报"), o)
     (local / "transport.json").write_text(json.dumps(tcfg))
 
+    # B4. 1.7.0（ISOLATION.md S1）：没声明 per_project_conv 时任何调用都不带 --conv（兼容旧适配器）；声明后，
+    #     自动开新对话带 --project，之后的发送与轮询带适配器返回的对话；适配器的 warning 进“需要注意”
+    calls_f = fake / "calls.jsonl"
+    n0 = len(calls_f.read_text(encoding="utf-8").splitlines()) if calls_f.exists() else 0
+    before = [json.loads(x) for x in calls_f.read_text(encoding="utf-8").splitlines()] if calls_f.exists() else []
+    (local / "transport.json").write_text(json.dumps({**tcfg, "conv_new": str(cnw), "per_project_conv": True}))
+    (fake / "poll_warning").write_text("conv_from_default")
+    a4 = setup("ctxconv", {**base_pol, "max_conversation_turns": 1, "auto_new_conversation": True})
+    _wf(env, a4, "kick", "--message", str(task))
+    _wf(env, a4, "run")
+    k = next_k() - 1
+    (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"], "发布：无\n之后：回报\n验收 1：c1 exit=0"), encoding="utf-8")
+    rc, o = _wf(env, a4, "run")
+    s4 = _state(a4)
+    cid = (s4.get("conv") or {}).get("conv")
+
+    def _proj(c):
+        a = c.get("argv") or []
+        return a[a.index("--project") + 1] if "--project" in a and a.index("--project") + 1 < len(a) else None
+
+    def _conv(c):
+        a = c.get("argv") or []
+        return a[a.index("--conv") + 1] if "--conv" in a and a.index("--conv") + 1 < len(a) else None
+    calls = [json.loads(x) for x in calls_f.read_text(encoding="utf-8").splitlines()][n0:]
+    mine = [c for c in calls if _proj(c) == "ctxconv"]
+    sends = [c for c in mine if c["op"] == "send"]
+    cn = [c for c in mine if c["op"] == "conv_new"]
+    polls_after = [c for c in mine[mine.index(cn[0]) + 1:] if c["op"] == "poll"] if cn else []
+    warns = []
+    for line in (a4 / "workflow" / "events.jsonl").read_text(encoding="utf-8").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") == "auto" and e.get("rule") == "ADAPTER_WARNING":
+            warns.append((e.get("turn"), e.get("detail")))
+    _ok("1.7.0 per_project_conv：之前的调用都不带 --conv；声明后 conv_new 带 --project，换对话后的发送与轮询带新对话；"
+        "适配器告警进“需要注意”",
+        not any("--conv" in (c.get("argv") or []) for c in before)
+        and cid and len(cn) == 1 and len(sends) == 2 and _conv(sends[0]) is None and _conv(sends[1]) == cid
+        and polls_after and all(_conv(c) == cid for c in polls_after)
+        and warns and all(w[1] == "poll：conv_from_default" for w in warns), json.dumps([cid, mine[-6:], warns], ensure_ascii=False)[:900])
+
+    # B5. 1.7.0：wf conv bind 只登记对话（计数与 send_ref 不变）；wf conv new --conv 登记新对话、计数归零、清 send_ref
+    t_before = (s4.get("conv") or {}).get("turns")
+    ref_before = s4.get("send_ref")
+    _wf(env, a4, "conv", "bind", "--conv", "conv-manual", "--note", "测试：迁移登记")
+    s5 = _state(a4)
+    _wf(env, a4, "conv", "new", "--conv", "conv-new2", "--note", "测试：手工换对话")
+    s6 = _state(a4)
+    rc7, o7 = _wf(env, a4, "conv")
+    _ok("1.7.0 wf conv bind 只登记对话（计数、send_ref 不变）；wf conv new --conv 登记新对话并归零、清 send_ref；wf conv 显示对话 id",
+        (s5.get("conv") or {}).get("conv") == "conv-manual" and (s5.get("conv") or {}).get("turns") == t_before
+        and s5.get("send_ref") == ref_before and (s6.get("conv") or {}).get("conv") == "conv-new2"
+        and (s6.get("conv") or {}).get("turns") == 0 and not s6.get("send_ref") and "conv-new2" in o7,
+        json.dumps([s5.get("conv"), s6.get("conv"), o7[-200:]], ensure_ascii=False))
+    (fake / "poll_warning").unlink()
+    (local / "transport.json").write_text(json.dumps(tcfg))
+
     # B4. 1.6.5（W42）：上一条回复刚落地时不立即发下一条，等满 min_send_gap_s
     gp = setup("gap", {**base_pol, "min_send_gap_s": 3600})
     _wf(env, gp, "kick", "--message", str(task))
