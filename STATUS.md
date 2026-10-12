@@ -24,7 +24,6 @@
 
 ## 待办
 - [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T104-1：已只读回核：VERSION/PROJECT/WORKFLOW及公开工具包SHA与作者完全一致；wf version实际1.7.6，fingerprint278a；T104-2：身份核对完成：实际cid2af8fbfd-d873-42b8-817f-cf5bd24947c2；human uuid01a130e1-36e3-7f2
-- [executor] 执行端待办 T104-4：补研究 pstack，只研究、不改代码：给出实际使用的仓库地址、提交号、取证时间和关键文件的 sha256；摘录角色分工、准入与退出、审查与合并授权、平台期与熔断相关原文的要点，包括 DESIGN.md 第 4 节提到的 autonomous-run、autopilot-full、shipping、07-overnight；对照 DESIGN.md 第 4 节和 PROCESS.md 第 10 节
 - [executor] 执行端待办 T104-6：执行端 1–5 都做完后，先用 wf note --kind info 写明：T100-2 已被用户边界取代，没有标 done，等 cancelled 或 superseded 状态上线后再正式关闭。然后用 wf kick --kind report 发回报，不必等旧待办超时
 
 ## 最新产物
