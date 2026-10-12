@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 105 轮 · 发送（SEND）
+第 105 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.7.6
@@ -9,7 +9,7 @@
 
 ## 最近一轮
 - 第 104 轮验收通过（2026-10-12T16:36:46+00:00）
-- 本方最新消息：`turns/turn-104.md`
+- 本方最新消息：`turns/turn-105.md`
 - Claude 最新回复：`replies/reply-104.md`
 
 ## 目标
