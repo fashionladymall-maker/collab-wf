@@ -23,11 +23,8 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T104-1：已只读回核：VERSION/PROJECT/WORKFLOW及公开工具包SHA与作者完全一致；wf version实际1.7.6，fingerprint278a
-- [executor] 执行端待办 T104-2：核对发送身份，只引用已发生的事：wf conv 的原文，确认 collab-wf-dev 当前绑定的对话是否为 2af8fbfd…；第 104 轮发送的 ref 与本回复的 reply_parent 是否一致；本回复的结束原因原文。另列出第 101–104 轮在 turns.jsonl 中的 turn、status、ref、对话 id 字段，以及 wf audit 里相关的批准与状态转换事件，不含
-- [executor] 执行端待办 T104-3：补交同步证据原文，不写凭据和接口细节：local/sync/collab-wf-dev.json 中的 last、pushed_digest、failures；推送 ec6b3c0 和 79dd38a 两次的同步日志行，以及各自是 tick 触发还是手工触发；14:58 那次 dry-run（ff5232c5fa0c56c9）和安全删除拦截的原文，以及后来是如何放行的；bootstrap-2026
+- [user] 目标已达成：全部目标判据已通过，自动化停在这里；本轮执行端待办已完成：T104-1：已只读回核：VERSION/PROJECT/WORKFLOW及公开工具包SHA与作者完全一致；wf version实际1.7.6，fingerprint278a；T104-2：身份核对完成：实际cid2af8fbfd-d873-42b8-817f-cf5bd24947c2；human uuid01a130e1-36e3-7f2
 - [executor] 执行端待办 T104-4：补研究 pstack，只研究、不改代码：给出实际使用的仓库地址、提交号、取证时间和关键文件的 sha256；摘录角色分工、准入与退出、审查与合并授权、平台期与熔断相关原文的要点，包括 DESIGN.md 第 4 节提到的 autonomous-run、autopilot-full、shipping、07-overnight；对照 DESIGN.md 第 4 节和 PROCESS.md 第 10 节
-- [executor] 执行端待办 T104-5：整理 Amy 偏离的事实时间线，不恢复、不删备份：每个动作的时间、执行者、所依据的用户原话原文（以 wf said 的记录为准）、影响范围（目录、注册与映射、定时任务、信号、待办）；备份的位置和可恢复性，只核对是否存在及大小；以及 T100-1、T100-2、T100-3 的当前状态。结果写进 wf task done
 - [executor] 执行端待办 T104-6：执行端 1–5 都做完后，先用 wf note --kind info 写明：T100-2 已被用户边界取代，没有标 done，等 cancelled 或 superseded 状态上线后再正式关闭。然后用 wf kick --kind report 发回报，不必等旧待办超时
 
 ## 最新产物
