@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 89 轮 · 目标达成（DONE）
+第 90 轮 · 阻塞（BLOCKED）
 
 ## 版本
 - 工具：collab-wf 1.6.9
@@ -23,9 +23,7 @@
 - ✓ G4 工具版本由驱动器自己构建并装上：通过
 
 ## 待办
-- [user] 目标已达成：全部目标判据已通过，自动化停在这里
-- [executor] 执行端待办 T89-1：T88-1 的 r5 与回归输出放在 workflow/evidence/ 下（被忽略的目录）；已经放在项目树其他位置的，移过去（W52）。wf task done 写明最终位置
-- [executor] 执行端待办 T89-2：读 ISOLATION.md 第 3 节，确认适配器能否按约定实现：projects 映射、--conv 优先、conv_new --project 只改本项目、per_project_conv 开关、从默认对话退回时告警。有异议或需要改的接口形状写进 wf task done，作为 1.7.0 的输入
+- [executor] 流程阻塞，需要人处理：[OUTGOING_STRUCTURE] 回报结构不完整，没有发送：先核对标题行“【回报 · 第 N 轮 · vX.Y】”与 ①②③ 三段是否齐全，再查工具。 缺少标题行：【回报 · 第 N 轮 · vX.Y】；缺少 ① 段；缺少 ② 段；缺少 ③ 段；没有写明档位（例如“档位：high”）
 - [executor] Amy安装包搬运进行中；新WorkBuddy独立任务仍未建立：安装包正从旧机拉取到执行端（约420MB，已过半，随后校验并安装到目标机）；新WorkBuddy独立任务的界面投递连续失败，仍未建立，不能声称已建立；多项目通道隔离未解决，本项目已用 wf.json 的 auto:false 静默，不与其他项目共用会话。
 
 ## 最新产物
