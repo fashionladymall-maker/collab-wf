@@ -1410,6 +1410,62 @@ def _t_v175_pause(_ok):
         str([o0[-120:], o1[-80:], it1.get("command"), o2[-120:], un[-1:] if un else None, o4[-160:], o5[-160:]])[:900])
 
 
+def _t_v176_compose(_ok):
+    import time as _t
+    from . import driver, machine
+    from .core import read_json
+    with tempfile.TemporaryDirectory() as td:
+        a = _v169_inst(td, "v176-c")
+        a.state.update(state="VERIFY", turn=4, compose_reason="continue", turn_flags={})
+        a.save()
+        machine.go(a, "COMPOSE", by="test", reason="测试")
+        cleared = "compose_reason" not in a.state and a.state["turn"] == 5
+        a.turn_dir(4).mkdir(parents=True, exist_ok=True)
+        (a.turn_dir(4) / "intake.json").write_text(json.dumps({"effort": "high", "blocks_missing": ["本轮结论"]}), encoding="utf-8")
+        a.state.update(compose_reason="continue", continue_streak=1, pending_tell=[{"ts": "2026-10-12T15:00:00", "text": "测试：块规格补充"}])
+        a.save()
+        driver.h_compose(driver.Ctx(a, {}, _t.time() + 60))
+        body = (a.outbox / "turn-005.md").read_text(encoding="utf-8") if (a.outbox / "turn-005.md").exists() else ""
+        after = dict(a.state)
+        b = _v169_inst(td, "v176-b")
+        b.state.update(state="INTAKE", turn=9, continue_streak=3, turn_flags={})
+        b.save()
+        r = driver._anomaly(driver.Ctx(b, {}, _t.time() + 60), {"source": "intake", "kind": "missing_blocks"}, "测试")
+        bst = read_json(b.root / "workflow" / "state.json", {}) or {}
+    _ok("1.7.6 续接：进入新一轮时清掉续接标记；续接消息带块规格与没识别到的块、用过即清；wf tell 的说明附在消息末尾；"
+        "连续 3 轮续接后停下",
+        cleared and "【本轮结论】【本机执行】【本轮回报清单】【需要用户决定】【下一轮建议档位】【驱动指令】" in body
+        and "上一轮没有识别到：【本轮结论】" in body and "测试：块规格补充" in body and "执行端补充说明" in body
+        and "compose_reason" not in after and "pending_tell" not in after
+        and r[0] == "user" and bst.get("state") == "BLOCKED" and "连续 3 轮续接" in (bst.get("block_reason") or ""),
+        str([cleared, body[-400:], r, bst.get("state"), bst.get("block_reason")])[:900])
+
+
+def _t_v176_alias_repo(_ok):
+    from . import ops, sync
+    rep = "【结论】\n已完成。\n\n【本机执行】\n```\necho hi\n```\n\n【本轮回报清单】\n1. 看输出\n\n【需要用户决定】\n无\n\n【下一轮建议档位】\nhigh\n"
+    p = ops.parse_reply(rep)
+    p2 = ops.parse_reply("【本轮结论】\n好\n【结论】正文里的旧写法\n【本机执行】\n无\n【本轮回报清单】\n无\n【需要用户决定】\n无\n【下一轮建议档位】\nhigh\n")
+
+    class _I:
+        name = "pa"
+    orig = sync.cfg
+    try:
+        sync.cfg = lambda: {"sync": "x", "sync_projects": ["pa", "pb"], "sync_repo": "o/old"}
+        r0 = (sync.repo_for(_I()), sync.enabled(_I()))
+        sync.cfg = lambda: {"sync": "x", "sync_projects": ["pa", "pb"], "sync_repo": "o/old", "sync_repos": {"pb": "o/pb"}}
+        r1 = (sync.repo_for(_I()), sync.enabled(_I()))
+        sync.cfg = lambda: {"sync": "x", "sync_projects": ["pa"], "sync_repos": {"pa": "o/pa/"}}
+        r2 = (sync.repo_for(_I()), sync.enabled(_I()))
+    finally:
+        sync.cfg = orig
+    _ok("1.7.6 块名别名：【结论】按【本轮结论】识别并提示，规定块名在时不改；按项目仓库：有 sync_repos 时只认本项目条目，没有条目不同步",
+        p["blocks_missing"] == [] and any("别名" in w for w in p["warnings"]) and p["commands"] == ["echo hi"]
+        and p2["blocks_missing"] == [] and not any("别名" in w for w in p2["warnings"])
+        and r0 == ("o/old", True) and r1 == ("", False) and r2 == ("o/pa", True),
+        str([p["blocks_missing"], p["warnings"], p2["warnings"], r0, r1, r2])[:700])
+
+
 def _t_v170_sync_reasons(_ok):
     from . import sync
     d = sync.scan_detailed({"artifacts/x.zip": b"not a zip", "a.txt": "普通文字\n".encode("utf-8")})
@@ -1455,7 +1511,8 @@ TESTS = [("解析容错", _t_blocks), ("驱动指令", _t_directives), ("清单�
          ("1.7.0 对话参数", _t_v170_conv_args), ("1.7.0 同步阻断原因", _t_v170_sync_reasons),
          ("1.7.0 适配器告警去重", _t_v170_warning_dedupe), ("1.7.2 每项目定时任务", _t_v172_schedule),
          ("1.7.3 信号按项目", _t_v173_signals), ("1.7.3 分项目视图与审查键", _t_v173_views_key),
-         ("1.7.4 审查键 kind 与 plist 转义", _t_v174_kind_xml), ("1.7.5 执行端发起的暂停", _t_v175_pause)]
+         ("1.7.4 审查键 kind 与 plist 转义", _t_v174_kind_xml), ("1.7.5 执行端发起的暂停", _t_v175_pause),
+         ("1.7.6 续接与补充说明", _t_v176_compose), ("1.7.6 块名别名与按项目仓库", _t_v176_alias_repo)]
 
 
 def run_v15(_ok) -> None:

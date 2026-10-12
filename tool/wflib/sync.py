@@ -46,8 +46,20 @@ def cfg() -> dict:
     return anomaly.transport_cfg()
 
 
+def repo_for(inst) -> str:
+    """1.7.6：项目对应的仓库。transport.json 有 sync_repos（项目 → owner/仓库）时只认它（没有条目就是没有仓库，
+    绝不推到别的项目的仓库）；没有 sync_repos 时沿用全局 sync_repo。"""
+    c = cfg()
+    m = c.get("sync_repos")
+    if isinstance(m, dict):
+        return str(m.get(inst.name) or "").strip().strip("/")
+    return str(c.get("sync_repo") or "").strip().strip("/")
+
+
 def enabled(inst) -> bool:
     c = cfg()
+    if isinstance(c.get("sync_repos"), dict) and not repo_for(inst):   # 1.7.6：按项目分仓库时，没有条目的项目不同步
+        return False
     return bool(c.get("sync")) and inst.name in (c.get("sync_projects") or [])
 
 
@@ -226,7 +238,10 @@ def run(inst, dry_run=False, force=False) -> dict:
             p = stage / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(data)
-        r = anomaly.call("sync", ["--project", inst.name, "--turn", inst.state.get("turn", 0), "--dir", stage],
+        rargs = ["--project", inst.name, "--turn", inst.state.get("turn", 0), "--dir", stage]
+        if isinstance(cfg().get("sync_repos"), dict):   # 1.7.6：按项目分仓库时告诉同步程序推到哪个仓库
+            rargs += ["--repo", repo_for(inst)]
+        r = anomaly.call("sync", rargs,
                          timeout=cfg().get("sync_timeout_s", 300))
         if r.get("code") == 0:
             res.update(status="pushed", detail=(r.get("data") or {}).get("commit") or "")

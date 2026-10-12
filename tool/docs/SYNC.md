@@ -15,6 +15,8 @@
 "sync_timeout_s": 300
 ```
 
+1.7.6：按项目分仓库时再加 `"sync_repos": {"collab-wf-dev": "owner/collab-wf", "amy-local": "owner/amy-local"}`。有这一项时，每个项目只推到自己的仓库，同步程序多收到一个 `--repo owner/仓库` 参数；不在其中的项目不同步。仓库的创建与公开或私有由用户决定。
+
 sync 写程序路径时，无论通道是不是模块方式，都直接运行该程序（1.6.2 起；此前模块方式会把 sync 交给通道适配器，报“未知动作：sync”）；写 true 时由模块方式的适配器按子命令 sync 接收。只有列在 sync_projects 里的项目会同步。
 
 ## 3. 何时同步

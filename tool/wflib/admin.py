@@ -212,7 +212,7 @@ def _bootstrap_short(inst: Instance, reason: str, ver: str, head: str, s: dict, 
     生成前先同步一次，保证链接里是最新内容。没有开启同步时返回 None，长消息照旧。"""
     from . import sync
     c = sync.cfg()
-    repo = str(c.get("sync_repo") or "").strip().strip("/")
+    repo = sync.repo_for(inst)   # 1.7.6：按项目分仓库时用本项目的仓库
     if not repo or not sync.enabled(inst):
         return None
     try:

@@ -233,9 +233,28 @@ def parse_directives(body: str) -> dict:
     return d
 
 
+BLOCK_ALIASES = {"结论": "本轮结论", "本轮小结": "本轮结论", "回报清单": "本轮回报清单", "需要你决定": "需要用户决定",
+                 "用户决定": "需要用户决定", "建议档位": "下一轮建议档位", "下一轮档位": "下一轮建议档位"}
+
+
+def _alias_blocks(text: str) -> tuple:
+    """1.7.6：行首的块标题写成常见别名（例如【结论】）而规定的块名不在行首时，按规定的块名识别，并给出提示。"""
+    warnings = []
+    for a, canon in BLOCK_ALIASES.items():
+        if re.search(r"^[ \t>#*\-•]*【" + re.escape(canon) + "】", text, re.M):
+            continue
+        pat = re.compile(r"^([ \t>#*\-•]*)【" + re.escape(a) + "】", re.M)
+        if pat.search(text):
+            text = pat.sub(lambda m, c=canon: m.group(1) + "【" + c + "】", text, count=1)
+            warnings.append(f"块标题「{a}」按别名识别为「{canon}」；请用规定的块名")
+    return text, warnings
+
+
 def parse_reply(text: str) -> dict:
     # 1.5.0：块标题须位于行首，正文中顺带提到的块名不再顶掉真正的块（fidelity.split_blocks）
+    text, alias_w = _alias_blocks(text)   # 1.7.6
     blocks, warnings = fidelity.split_blocks(text, BLOCKS + ["驱动指令"])
+    warnings = alias_w + warnings
     cmds = []
     for code in re.findall(r"```(?:bash|sh|shell|zsh)?\n(.*?)```", blocks.get("本机执行", ""), re.S):
         buf = ""

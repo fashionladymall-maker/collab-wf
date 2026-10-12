@@ -201,9 +201,14 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
     act = r["action"]
     if r.get("max") and n > r["max"]:
         act = r.get("then", "block")
+    streak_block = act == "continue" and int(st.get("continue_streak", 0)) >= 3
+    if streak_block:   # 1.7.6：续接连续 3 轮仍缺固定块就停下等人看，不再空耗额度（amy-local 第 7–11 轮）
+        act = "block"
     inst.event("auto", rule=r["id"], action=act, attempt=n, detail=detail[:300],
                facts={k: v for k, v in facts.items() if k != "text"} or None, by="driver")
     why = r.get("why", "")
+    if streak_block:
+        why = f"连续 {st.get('continue_streak')} 轮续接后回复仍缺固定块，停下等人看（1.7.6）。" + why
     if act == "retry":
         b = r.get("backoff_s", [60])
         delay = b[min(n - 1, len(b) - 1)]
@@ -224,6 +229,7 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
     if act == "continue":
         machine.go(inst, "COMPOSE", by="driver", reason=f"[{r['id']}] {why}")
         inst.state["compose_reason"] = "continue"
+        inst.state["continue_streak"] = int(inst.state.get("continue_streak", 0)) + 1   # 1.7.6
         inst.save()
         return "progress", f"[{r['id']}] 请 Claude 从断点继续"
     target = "AWAITING_USER" if act == "await_user" else "BLOCKED"
@@ -368,9 +374,17 @@ def _compose_text(ctx):
                 "请给出本节点的【本机执行】【本轮回报清单】与【驱动指令】。\n")
         return body, "task", ch["effort"]
     if reason == "continue":
-        last_eff = (read_json(inst.turn_dir(st["turn"] - 1) / "intake.json", {}) or {}).get("effort") or "high"
+        prev = read_json(inst.turn_dir(st["turn"] - 1) / "intake.json", {}) or {}
+        last_eff = prev.get("effort") or "high"
+        miss = "、".join(f"【{b}】" for b in (prev.get("blocks_missing") or [])) or "（见上一轮回复）"
+        # 1.7.6：续接消息带上块规格与上一轮没识别到的块（amy-local 第 7–11 轮：块名写成【结论】，续接消息又不说规格，反复续接）
         body = (f"【续接 · 第 {st['turn']} 轮 · {ver}】档位：{last_eff}\n\n上一轮回复在中途中断或缺少固定块"
-                f"（这条消息由驱动器自动发出）。请从断点继续，并给出完整的六个固定块。\n\n附：仓库指纹 {fp['digest']}\n")
+                f"（这条消息由驱动器自动发出）。请从断点继续，并给出完整的六个固定块。\n\n"
+                f"上一轮没有识别到：{miss}。\n"
+                "固定块的标题必须逐字如下，各自独占一行的开头：\n"
+                "【本轮结论】【本机执行】【本轮回报清单】【需要用户决定】【下一轮建议档位】【驱动指令】\n"
+                "【本机执行】里的命令放在代码块中、每条一行；没有内容的块写“无”。\n\n"
+                f"附：仓库指纹 {fp['digest']}\n")
         return body, "task", last_eff
     return None, None, None
 
@@ -438,6 +452,25 @@ def _new_conversation(ctx, out, why, b) -> tuple:
     return new_out, ""
 
 
+def _append_tell(inst, out) -> None:
+    """1.7.6：执行端用 wf tell 排队的说明，附在下一条待发消息（回报、续接、计划节点、任务）的末尾；附上后清空队列。
+    之后照常经过发送前检查（密钥扫描）。"""
+    tells = inst.state.get("pending_tell") or []
+    if not tells or not out:
+        return
+    p = Path(out["file"])
+    try:
+        txt = p.read_text(encoding="utf-8")
+    except OSError:
+        return
+    add = "\n\n===== 执行端补充说明（wf tell）=====\n" + "\n".join(
+        f"- {str(t.get('ts', ''))[:16]} {t.get('text', '')}" for t in tells) + "\n"
+    p.write_text(txt.rstrip("\n") + add, encoding="utf-8")
+    inst.state.pop("pending_tell", None)
+    inst.event("tell_attached", n=len(tells), msg_turn=out.get("turn"), by="driver")
+    inst.save()
+
+
 def h_compose(ctx):
     inst, st = ctx.inst, ctx.st
     out = st.get("outgoing")
@@ -459,7 +492,10 @@ def h_compose(ctx):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(body, encoding="utf-8")
         out = st["outgoing"] = {"turn": st["turn"], "file": str(p), "kind": kind, "effort": effort}
+        if st.get("compose_reason") in ("continue", "checkpoint"):   # 1.7.6：用过即清，不再让之后每一轮都变成续接消息
+            st.pop("compose_reason", None)
         inst.save()
+    _append_tell(inst, out)   # 1.7.6：执行端用 wf tell 留给 Claude 的说明，附在这条待发消息末尾
     chk = ops.check_outgoing(Path(out["file"]), out["kind"])
     if chk["secrets"]:
         return _anomaly(ctx, {"source": "compose", "kind": "secret"}, "；".join(chk["secrets"]))

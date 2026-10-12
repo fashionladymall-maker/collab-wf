@@ -50,6 +50,9 @@ def go(inst: Instance, to: str, by="executor", reason=None, force=False, **extra
     if to == "COMPOSE" and st.get("compose_reason") != "resend":
         st["turn"] = int(st.get("turn", 0)) + 1
         st["turn_flags"] = {}
+        st.pop("compose_reason", None)   # 1.7.6：续接、计划节点的标记只属于设置它的那一次，不带进新的一轮
+    if to == "REVIEW":
+        st.pop("continue_streak", None)   # 1.7.6：回复固定块齐全，续接计数归零
     if to not in ("BLOCKED", "AWAITING_USER", "QUOTA_WAIT"):
         st.pop("return_to", None)
     if to in ("BLOCKED", "AWAITING_USER", "QUOTA_WAIT"):

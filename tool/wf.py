@@ -44,6 +44,7 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf explain                          现在卡在哪、为什么、需要谁做什么
   wf kick --message <任务文件>         发起一轮新任务，交给驱动器
   wf kick --kind report               由本轮证据生成标准回报（含终端原文与“需要注意”），交给驱动器发送（1.7.1）
+  wf tell --text "…"                  给 Claude 的补充说明，附在下一条发出的消息末尾（1.7.6）
   wf approve --note "…"               用户批准待执行的内容或解除熔断
   wf pause / wf unpause --note / wf undo --note    暂停、恢复、回退上一个版本并暂停
   wf audit [--n 40]                   自动执行过的一切：做了什么、依据什么、结果如何
@@ -392,6 +393,7 @@ def main(argv=None):
     x.add_argument("--effort", default="high", choices=ops.EFFORTS)
     x = sub.add_parser("approve"); x.add_argument("--code", required=True); x.add_argument("--said", "--note", dest="said"); _by_args(x)
     x = sub.add_parser("pause"); x.add_argument("--note", default=""); _by_args(x)   # 1.7.5：--by executor 记明是执行端发起
+    x = sub.add_parser("tell"); x.add_argument("--text", required=True)   # 1.7.6
     x = sub.add_parser("said"); x.add_argument("--text", required=True); x.add_argument("--kind", default="chat")
     x = sub.add_parser("notify"); x.add_argument("action", choices=["test", "status"])
     x = sub.add_parser("sync"); x.add_argument("--dry-run", action="store_true"); x.add_argument("--force", action="store_true")
@@ -943,6 +945,19 @@ def main(argv=None):
         if not r["ok"]:
             raise WfError(r["note"])
         print(r["note"])
+    elif c == "tell":
+        # 1.7.6：执行端给 Claude 的补充说明，附在下一条发出的消息末尾（回报、续接、计划节点都带）
+        inst = _p(args)
+        t = (args.text or "").strip()
+        if not t:
+            raise WfError('用法：wf tell --text "…"')
+        q = list(inst.state.get("pending_tell") or [])
+        q.append({"ts": tool_now(), "text": t[:4000]})
+        inst.state["pending_tell"] = q
+        inst.event("tell", text=t[:500], by="executor")
+        busy = inst.state.get("state") in ("SEND", "WAIT_REPLY")
+        print(f"已排队（共 {len(q)} 条）：附在下一条发给 Claude 的消息末尾" +
+              ("；本轮消息已在发送或等待回复，会附在下一条" if busy else ""))
     elif c == "pause":
         inst = _p(args)
         by = "executor" if getattr(args, "by", None) == "executor" else "user"   # 1.7.5（P1-A）：记下是谁发起的
