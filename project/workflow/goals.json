@@ -1,106 +1,168 @@
 {
-  "_说明": "里程碑 M1“无人值守稳定运行”（collab-wf-dev v1.2）。exec 类目标由驱动器在每轮验收后运行；全部通过即进入“目标达成”并停下，交给用户验收。G3 按历史最长连续无人工动作的轮数计（m1_check.py v1.2），分 3、6、8、10 四级：达成后不会因为之后的人工动作（例如每 20 轮一次的开新对话）而失效，目标进度只增不减；相邻两级最多差 4 轮，配合 policy 的 max_rounds_without_goal_progress=12，不会在攒满之前被目标熔断误停。",
+  "_说明": "阶段目标（1.8.0 格式）。当前阶段 M2“专业基线（第一批）”取代 M1；M1 的 7 项已结束，只作历史（history），不计入当前进度。exec 类由驱动器在每轮验收后运行，机器判据用 wf self-check --probes（在临时 local/ 里对已安装的代码跑行为探针，只读）；还没实现的探针不会出现在输出里，对应目标保持未通过——判据先写死、不放宽。最终验收只认用户原话（M2-U1）。",
+  "phase": {
+    "id": "M2",
+    "title": "专业基线（第一批）：交接、动态目标与防循环",
+    "supersedes": "M1",
+    "since": "2026-10-13",
+    "requirements": [
+      "P0-A",
+      "P0-B",
+      "P0-C",
+      "P0-D",
+      "P0-E",
+      "P0-F",
+      "P0-G",
+      "P0-H"
+    ],
+    "scope": "collab-wf 工具本身；不含 Amy 的业务开发"
+  },
   "goals": [
     {
-      "id": "G1",
-      "title": "工具文件与版本清单完全一致",
+      "id": "M2-B1",
+      "title": "阶段目标：看板与 STATUS 先显示当前阶段，旧阶段只作历史",
       "kind": "exec",
-      "check": "wf self-check",
+      "check": "wf self-check --probes",
       "pass": {
-        "exit": 0,
         "contains": [
-          "完全一致"
+          "探针 阶段目标：通过"
         ]
       },
-      "means": "装上的就是版本包，没有残留文件或手改",
-      "on_fail": "执行端核对工具目录，必要时 wf self-rollback 到上一个版本"
+      "means": "目标随需求阶段化，旧 7/7 不再代表新范围（P0-B）",
+      "on_fail": "交给 Claude 修复"
     },
     {
-      "id": "G2",
-      "title": "体检健康：驱动器心跳正常、没有错误项",
+      "id": "M2-B2",
+      "title": "待办可取消、可被取代，完成必须写结果",
       "kind": "exec",
-      "check": "wf doctor",
+      "check": "wf self-check --probes",
       "pass": {
-        "exit": 0,
         "contains": [
-          "✓ 驱动器心跳"
-        ],
-        "not_contains": [
-          "✗"
+          "探针 待办取消：通过"
         ]
       },
-      "means": "定时器在跑、版本匹配、PROJECT.md 有效",
-      "on_fail": "按 wf doctor 的提示处理（执行端）"
+      "means": "不用 done 冒充取消（P0-B、P1-N）",
+      "on_fail": "交给 Claude 修复"
     },
     {
-      "id": "G3a",
-      "title": "历史上出现过连续 3 轮无人工动作",
+      "id": "M2-E1",
+      "title": "NO_REF 不再循环",
       "kind": "exec",
-      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 3",
+      "check": "wf self-check --probes",
       "pass": {
-        "exit": 0,
         "contains": [
-          "M1 无人值守：通过"
+          "探针 NO_REF：通过"
         ]
       },
-      "means": "驱动器能独立完成连续的轮次",
-      "on_fail": "看 m1_check 列出的最近一次中断原因，交给 Claude 消除"
+      "means": "批准解决不了没有 ref，只能补登记或整轮收尾（P0-E）",
+      "on_fail": "交给 Claude 修复"
     },
     {
-      "id": "G3b",
-      "title": "历史上出现过连续 6 轮无人工动作",
+      "id": "M2-F1",
+      "title": "回复完整性：识别工具上限并有界续接",
       "kind": "exec",
-      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 6",
+      "check": "wf self-check --probes",
       "pass": {
-        "exit": 0,
         "contains": [
-          "M1 无人值守：通过"
+          "探针 回复完整性：通过"
         ]
       },
-      "means": "无人值守可以持续",
-      "on_fail": "同 G3a"
+      "means": "不把因上限结束的回复当作完整（P0-F）",
+      "on_fail": "交给 Claude 修复"
     },
     {
-      "id": "G3c",
-      "title": "历史上出现过连续 8 轮无人工动作",
+      "id": "M2-H1",
+      "title": "同步凭证：没有提交号不算推送",
       "kind": "exec",
-      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 8",
+      "check": "wf self-check --probes",
       "pass": {
-        "exit": 0,
         "contains": [
-          "M1 无人值守：通过"
+          "探针 同步凭证：通过"
         ]
       },
-      "means": "无人值守可以跨过大半个对话",
-      "on_fail": "同 G3a"
+      "means": "pushed、unchanged 都有提交号作证（P0-H 工具侧）",
+      "on_fail": "交给 Claude 修复"
     },
     {
-      "id": "G3d",
-      "title": "历史上出现过连续 10 轮无人工动作",
+      "id": "M2-A1",
+      "title": "交接短消息钉在提交上、只链已推送的文件",
       "kind": "exec",
-      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py unattended --rounds 10",
+      "check": "wf self-check --probes",
       "pass": {
-        "exit": 0,
         "contains": [
-          "M1 无人值守：通过"
+          "探针 交接短消息：通过"
         ]
       },
-      "means": "无人值守稳定",
-      "on_fail": "同 G3a"
+      "means": "新对话读到的就是核验过的那一版（P0-A 工具侧）",
+      "on_fail": "交给 Claude 修复"
     },
     {
-      "id": "G4",
-      "title": "工具版本由驱动器自己构建并装上",
+      "id": "M2-F2",
+      "title": "回复发现延迟有界",
       "kind": "exec",
-      "check": "/Users/admin/.workbuddy-ai/binaries/python/versions/3.13.12/bin/python3 workflow/m1_check.py auto-update",
+      "check": "wf self-check --probes",
       "pass": {
-        "exit": 0,
         "contains": [
-          "M1 自动安装工具版本：通过"
+          "探针 回复发现延迟：通过"
         ]
       },
-      "means": "交付到安装的整条链不需要人",
-      "on_fail": "看自动安装被拒绝的原因（底线文件、行为检查、自检），交给 Claude"
+      "means": "回复结束后在延迟预算内被接上（P0-F，W66）",
+      "on_fail": "1.8.1 交付后复查"
+    },
+    {
+      "id": "M2-C1",
+      "title": "默认工程门禁基线与角色准入退出",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 门禁基线：通过"
+        ]
+      },
+      "means": "不靠用户提醒的默认治理（P0-C）",
+      "on_fail": "交付后复查"
+    },
+    {
+      "id": "M2-D1",
+      "title": "经验闭环：台账缺项不得标已解决",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 经验闭环：通过"
+        ]
+      },
+      "means": "失败一定落到机制与回归（P0-D）",
+      "on_fail": "交付后复查"
+    },
+    {
+      "id": "M2-G1",
+      "title": "共享资源仲裁 S4",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 共享仲裁：通过"
+        ]
+      },
+      "means": "同一账号上多个项目不互饿、可审计（P0-G）",
+      "on_fail": "交付后复查"
+    },
+    {
+      "id": "M2-U1",
+      "title": "用户验收 M2",
+      "kind": "manual",
+      "means": "上面各项通过、并各有一次真实运行态证据后，由用户本人确认",
+      "on_fail": "按用户意见补齐"
+    }
+  ],
+  "history": [
+    {
+      "id": "M1",
+      "title": "无人值守稳定运行",
+      "status": "done",
+      "closed": "2026-10-12",
+      "summary": "7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）"
     }
   ]
 }
