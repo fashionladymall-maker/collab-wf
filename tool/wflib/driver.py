@@ -165,8 +165,8 @@ def explain(inst: Instance) -> dict:
         if left:
             return {"where": where, "why": f"全部目标判据已通过；另有 {len(left)} 项执行端待办未完成："
                     + "；".join(f"{t['id']} {t['text'][:30]}" for t in left[:3]), "who": "执行端",
-                    "what": "做完一项 wf task done <编号> --note \"结果\"；目标已达成，做完不会自动回报，需要继续时 wf kick"}
-        return {"where": where, "why": "全部目标判据已通过", "who": "用户", "what": "验收结果；需要继续时 wf kick"}
+                    "what": "做完一项 wf task done <编号> --note \"结果\"；目标已达成，做完不会自动回报，需要交给 Claude 时 wf kick --kind report（由证据生成带原文的回报；说明先用 wf note --kind info 写）"}
+        return {"where": where, "why": "全部目标判据已通过", "who": "用户", "what": "验收结果；需要交给 Claude 时 wf kick --kind report（由证据生成带原文的回报；说明先用 wf note --kind info 写）"}
     if s["state"] == "WAIT_REPLY":
         return {"where": where, "why": "Claude 正在处理消息", "who": "Claude", "what": "无需操作，驱动器会定时检查"}
     if s["state"] in ("WAIT_SCHEDULE", "QUOTA_WAIT"):

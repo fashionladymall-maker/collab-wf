@@ -1,6 +1,6 @@
 # ISOLATION.md —— 多项目并行与全链路隔离（设计 v1）
 
-collab-wf-dev 第 89 轮（v2.8）。需求来源：执行端第 87–88 轮转述的用户原话与需求包乙（R1–R5、本机实测 15 项、判据 I1–I8，第 88 轮回报全文）。本文件是设计与分阶段计划；代码随各阶段的工具版本交付，验收以 I1–I8 的本机实测为准。
+collab-wf-dev 第 89 轮（v2.8）起草，第 91 轮（v2.9）更新：S1 已实现并迁移。需求来源：执行端第 87–88 轮转述的用户原话与需求包乙（R1–R5、本机实测 15 项、判据 I1–I8，第 88 轮回报全文）。本文件是设计与分阶段计划；代码随各阶段的工具版本交付，验收以 I1–I8 的本机实测为准。
 
 ## 1. 原则
 
@@ -52,13 +52,15 @@ collab-wf-dev 第 89 轮（v2.8）。需求来源：执行端第 87–88 轮转�
 - 本项目状态的 conv.conv 记当前对话。驱动器自动开新对话时已经从适配器的返回值记下；手工换对话时用 `wf conv new --note … --conv <id>`。只登记、不换对话、不清计数时用新命令 `wf conv bind --conv <id> --note …`（迁移用）。
 - 每次 send、poll、snapshot 都带 `--conv <id>`（有值时）；conv_new 带 `--project <名>`。只有 transport.json 声明 `"per_project_conv": true` 时才这样传：适配器升级之前不传，避免它把不认识的参数当错误。
 - `wf transport test` 增加两项黑盒检查：给了 --conv 时动作日志里用的就是它；`conv_new --project A` 之后 projects 里其他项目的条目不变。
-- 适配器（执行端）：--conv 优先；projects[--project] 其次；都没有才用默认对话，并在输出 JSON 里加 `"warning": "conv_from_default"`，工具把它写进回报的“需要注意”。poll 发现 --prev-ref 所属对话与 --conv 不同时同样告警。
+- 适配器（执行端）：选对话的完整顺序是 --conv > projects[--project] > --prev-ref 所属对话 > 默认对话；--prev-ref 只给定位下界，不决定对话（执行端第 90 轮意见，已写进工具 TRANSPORT.md 附录“1.7.0”）。退到默认对话时在输出 JSON 里加 `"warning": "conv_from_default"`，--prev-ref 所属对话与选定对话不同时加 `"warning": "conv_mismatch"`；工具把 warning 写进回报的“需要注意”。
 
 迁移：
 
 1. 执行端备份适配器配置，写入 projects.collab-wf-dev = 当前默认对话。
 2. 装上 1.7.0 后，执行端运行一次 `wf conv bind --conv <当前对话> --note "迁移到按项目绑定"`（只登记，不换对话、不清计数、不动本轮的发送意图）。
 3. amy-local：执行端用 conv_new --project amy-local 为它建自己的对话（或把它已有的对话写进 projects.amy-local）；I1 本机实测通过后，才把 amy-local 的 wf.json 改回 auto:true。
+
+第 91 轮迁移结果（执行端回报）：适配器已按上面的顺序升级；projects.collab-wf-dev 已登记、默认对话未变；wf conv bind 已登记；per_project_conv 已打开，wf transport test 新增项通过；conv_new --project amy-local 新建了 amy-local 的对话，collab-wf-dev 的条目不变；amy-local 仍 auto:false。待闭合：回报里 conv_new 输出的对话 id 与配置里登记的不一致，需按原文核对；真实发送用本项目对话的核对放在第 92 轮。
 
 回滚：适配器在没有 --conv、projects 里也没有条目时退回旧的默认对话；工具回到 1.6.9 后不再传 --conv，行为与现在相同；适配器配置用备份恢复；amy-local 回到 auto:false。
 
@@ -118,11 +120,11 @@ WF_LOCAL_DIR 保留：它让演练与自检整体用另一套 local/（wf drill�
 | 阶段 | 工具版本 | 内容 | 验收 | 回滚 |
 |---|---|---|---|---|
 | S1 会话按项目绑定 | 1.7.0 | --conv、conv_new --project、wf conv bind、transport test 两项、TRANSPORT.md 约定 | I1；之后 amy-local 才改回 auto:true | 适配器退回默认对话；工具回到 1.6.9 |
-| S2 按项目寻址 | 1.7.1 | 分项目 inbox 视图、wf ask --project、信号分目录、审查键 | I2、I4、I7（执行端：I6、审查程序参数化） | 兼容读取旧位置；工具回到 1.7.0 |
-| S3 每项目调度 | 1.7.2 | wf tick --project、wf schedule plist --project、schedule status 按项目 | I3、I5 | 重新加载全局定时任务 |
-| S4 共用资源仲裁 | 1.7.3 | 发送槽、arbiter.jsonl、看板一栏、transport.json 的项目覆盖 | I8 | shared_max_inflight 设为不限，行为同现在 |
+| S2 按项目寻址 | 1.7.2 | 分项目 inbox 视图、wf ask --project、信号分目录、审查键 | I2、I4、I7（执行端：I6、审查程序参数化） | 兼容读取旧位置；工具回到 1.7.1 |
+| S3 每项目调度 | 1.7.3 | wf tick --project、wf schedule plist --project、schedule status 按项目 | I3、I5 | 重新加载全局定时任务 |
+| S4 共用资源仲裁 | 1.7.4 | 发送槽、arbiter.jsonl、看板一栏、transport.json 的项目覆盖 | I8 | shared_max_inflight 设为不限，行为同现在 |
 
-S2 与 S3 可以对调：如果更急的是“一个卡住不拖累另一个”，就先做 S3。每个阶段的构建器都附自检，原有检查不删改，floor.py 不动；P2-F 的演练（无会话退化、多项目并行）放在对应阶段的验收里做。
+1.7.1 用于目标达成后由证据生成回报（与隔离无关，插在 S1 之后）。S2 与 S3 可以对调：如果更急的是“一个卡住不拖累另一个”，就先做 S3。每个阶段的构建器都附自检，原有检查不删改，floor.py 不动；P2-F 的演练（无会话退化、多项目并行）放在对应阶段的验收里做。
 
 ## 9. 不在本设计内
 

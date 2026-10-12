@@ -453,6 +453,20 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _ok("1.6.7 ③ DONE 下待办做完：wf task done 说明不会自动回报，结果写进“目标已达成”提示；仍停在 DONE、不发送",
         rc8 == 0 and "不会自动回报" in o8 and rc9 == 30 and _state(dt)["state"] == "DONE"
         and "测试：DONE 下已做完" in oa9 and f"task:{tid7}" not in oa9 and _sent("dtask") == n7, o8 + o9 + oa9)
+    # B7⑤ 1.7.1：DONE 下 wf kick --kind report 不带 --message：由证据生成标准回报（含 ② 原文、执行端备注与待办结果），驱动器接着发出
+    rc13, o13 = _wf(env, dt, "kick")
+    _wf(env, dt, "note", "--kind", "info", "测试：执行端的说明")
+    rc11, o11 = _wf(env, dt, "kick", "--kind", "report")
+    t11 = _state(dt).get("turn") or 0
+    rep11 = dt / "workflow" / "outbox" / f"turn-{t11:03d}.md"
+    txt11 = rep11.read_text(encoding="utf-8") if rep11.exists() else ""
+    rc12, o12 = _wf(env, dt, "run")
+    _ok("1.7.1 DONE 下 wf kick --kind report：由证据生成标准回报（② 原文、执行端说明、待办结果），驱动器接着发出；"
+        "任务类 kick 仍必须带 --message",
+        rc11 == 0 and txt11.startswith("【回报 · 第") and "② 关键数字与终端原文" in txt11 and "echo hi" in txt11
+        and "测试：执行端的说明" in txt11 and "测试：DONE 下已做完" in txt11 and "④ 需要注意" in txt11
+        and _sent("dtask") == n7 + 1 and _state(dt)["state"] in ("WAIT_REPLY", "SEND") and rc13 != 0 and "--message" in o13,
+        o11 + o12 + o13 + txt11[:600])
     dn = _done_setup("dnone")
     k = next_k() - 1
     (fake / "replies" / f"{k}.md").write_text(_reply(["echo hi"], ["输出"], "发布：无\n之后：空闲\n验收 1：c1 exit=0"),

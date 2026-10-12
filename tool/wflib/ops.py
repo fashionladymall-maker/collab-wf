@@ -429,7 +429,8 @@ def verify_items_for(inst: Instance, turn: int) -> list:
 
 def compose_report(inst: Instance, out=None, by="executor", effort=None) -> Path:
     st = inst.state
-    if st["state"] not in ("VERIFY", "EXECUTE", "APPLY", "REVIEW", "INTAKE", "WAIT_SCHEDULE", "IDLE"):
+    # 1.7.1：目标达成（DONE）后也能由证据生成回报，不必手写（collab-wf-dev 第 89–91 轮）
+    if st["state"] not in ("VERIFY", "EXECUTE", "APPLY", "REVIEW", "INTAKE", "WAIT_SCHEDULE", "IDLE", "DONE"):
         raise WfError(f"当前是 {st['state']}，回报草稿在一轮执行之后生成。")
     exec_turn = st["turn"]
     d = inst.turn_dir(exec_turn)

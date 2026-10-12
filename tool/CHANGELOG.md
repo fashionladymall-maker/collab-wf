@@ -1,5 +1,13 @@
 # CHANGELOG（collab-wf）
 
+## 1.7.1 — 2026-10-12
+
+目标达成后由证据生成回报（collab-wf-dev 第 89–91 轮）。
+- wf kick --kind report 可以不带 --message：由本轮证据生成标准回报（终端原文、需要注意、执行端备注与待办结果），驱动器接着发送；任务类 kick 仍必须带 --message。
+- wf report 在 DONE 下可用。
+- DONE 与待办做完时的提示改为推荐上面的命令。
+- DRIVER.md 第 28 节。自检新增 1 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.7.0 — 2026-10-12
 
 多项目隔离第一阶段 S1：会话按项目绑定（collab-wf-dev 第 88–90 轮，ISOLATION.md 第 3 节）。

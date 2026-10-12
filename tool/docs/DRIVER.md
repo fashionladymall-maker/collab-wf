@@ -326,3 +326,12 @@ collab-wf-dev 第 88–90 轮；设计见该项目的 ISOLATION.md 第 3 节，�
 - wf transport test：声明了 per_project_conv 时多一项，poll 带一个不存在的 --conv 时仍返回 none 或 no_ref。I1（一个项目换对话不影响另一个）由执行端在真实通道上实测。
 - 迁移顺序（执行端第 90 轮意见）：先升级适配器（不认识的参数不报错，按 projects[--project] 选对话），再装 1.7.0、`wf conv bind` 登记当前对话，最后在 transport.json 打开 per_project_conv。
 - 同版一并修：同步阻断记录带结构化原因（reasons：secret / bad_zip），提示标题以它为准；第 26 节 unreviewed 文件名的写法。
+
+## 28. 1.7.1 目标达成后由证据生成回报
+
+collab-wf-dev 第 89–91 轮：目标达成（DONE）后不自动回报，执行端只能手写正文经 `wf kick --message` 发出——这样的回报没有 ② 的终端原文与 ④ 需要注意，出现过格式与实际输出对不上的“原文”、同一个对话 id 前后两处写法不同。原因是 DONE 下 `wf report` 不能用、`wf kick` 又必须带 --message。
+
+- `wf kick --kind report`（不带 --message）：在空闲、等待计划节点或 DONE 时，由本轮证据生成标准回报（与驱动器自动回报同一个函数：终端原文按预算完整嵌入、需要注意、执行端备注与待办结果），驱动器下次运行时发送。
+- 要补充说明：先 `wf note --kind info "…"`（偏离用 --kind deviation，需要决定的用 --kind decision），再运行上面的命令；备注会出现在 ① 里。
+- `wf report` 在 DONE 下同样可用。`wf kick --message <文件>` 的行为不变（任务类必须带 --message）。
+- DONE 与待办做完时的提示（wf explain、wf task done）改为推荐这条命令。

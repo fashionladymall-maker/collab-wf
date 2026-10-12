@@ -42,6 +42,7 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf tick [--max-seconds 900]         推进全部项目（多项目调度）
   wf explain                          现在卡在哪、为什么、需要谁做什么
   wf kick --message <任务文件>         发起一轮新任务，交给驱动器
+  wf kick --kind report               由本轮证据生成标准回报（含终端原文与“需要注意”），交给驱动器发送（1.7.1）
   wf approve --note "…"               用户批准待执行的内容或解除熔断
   wf pause / wf unpause --note / wf undo --note    暂停、恢复、回退上一个版本并暂停
   wf audit [--n 40]                   自动执行过的一切：做了什么、依据什么、结果如何
@@ -340,7 +341,7 @@ def main(argv=None):
     x = sub.add_parser("run"); x.add_argument("--max-seconds", type=float, default=600); x.add_argument("--max-steps", type=int, default=40)
     x = sub.add_parser("tick"); x.add_argument("--max-seconds", type=float, default=900)
     sub.add_parser("explain")
-    x = sub.add_parser("kick"); x.add_argument("--message", required=True); x.add_argument("--kind", default="task", choices=["task", "report"])
+    x = sub.add_parser("kick"); x.add_argument("--message"); x.add_argument("--kind", default="task", choices=["task", "report"])
     x.add_argument("--effort", default="high", choices=ops.EFFORTS)
     x = sub.add_parser("approve"); x.add_argument("--code", required=True); x.add_argument("--said", "--note", dest="said"); _by_args(x)
     x = sub.add_parser("pause"); x.add_argument("--note", default="")
@@ -781,7 +782,7 @@ def main(argv=None):
             left = tasks.open_items(inst)
             tail = ("，驱动器下次运行时自动生成回报" if inst.state.get("await_executor") is not None else
                     "；目标已达成，自动化停在这里，不会自动回报：结果已写进 inbox 的“目标已达成”提示与 wf task，"
-                    "需要交给 Claude 时 wf kick" if inst.state.get("state") == "DONE" else "")   # 1.6.7
+                    "需要交给 Claude 时 wf kick --kind report（由证据生成带原文的回报；说明先用 wf note --kind info 写）" if inst.state.get("state") == "DONE" else "")   # 1.6.7；1.7.1 提示改为由证据生成
             print(f"已完成 {t['id']}；" + (f"还有 {len(left)} 项未完成" if left else "全部待办已完成" + tail))
         else:
             rows = inst.state.get("executor_tasks") or []
@@ -817,6 +818,14 @@ def main(argv=None):
         st = inst.state
         if st["state"] not in ("IDLE", "WAIT_SCHEDULE", "DONE"):
             raise WfError(f"当前是 {st['state']}，只有空闲、等待计划节点或目标达成时可以发起新任务。")
+        if not args.message:
+            # 1.7.1：回报不必手写——由本轮证据生成标准回报（② 终端原文、④ 需要注意、执行端备注与待办结果），驱动器接着发送
+            if args.kind != "report":
+                raise WfError("用法：wf kick --message <任务文件>；回报可以不带 --message：wf kick --kind report")
+            p = ops.compose_report(inst, by="executor")
+            print(f"已由证据生成第 {inst.state['turn']} 轮回报：{p}\n驱动器下次运行时发送（wf run 可立即推进）；"
+                  "要补充说明，先 wf note --kind info \"…\" 再运行本命令")
+            return
         chk = ops.check_outgoing(Path(args.message), args.kind)
         if chk["secrets"]:
             raise WfError("任务消息中疑似含有凭据，拒绝发起：\n  " + "\n  ".join(chk["secrets"]))
