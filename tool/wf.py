@@ -425,6 +425,7 @@ def main(argv=None):
     x.add_argument("--interval", type=int, default=300); x.add_argument("--max-seconds", type=int, default=540)
     sub.add_parser("self-init")
     x = sub.add_parser("self-check"); x.add_argument("--probes", action="store_true")   # 1.8.2：本机行为探针
+    sub.add_parser("ledger")   # 1.8.7（P0-D）：失败模式台账检查（只读）
     sub.add_parser("self-manifest")
     x = sub.add_parser("self-update"); x.add_argument("zip"); x.add_argument("--skip-test", action="store_true")
     x.add_argument("--auto", action="store_true")   # 1.5.8：驱动器自动安装；改动护栏文件的版本会被拒绝（DRIVER.md 第 18 节）
@@ -1195,6 +1196,17 @@ def main(argv=None):
             if r["extra"]:
                 print("说明：wf 不会自动删除这些文件。按 docs/AUDIT.md 的结论处理：通道适配器移到工具目录之外，其余确认无用后删除。")
         sys.exit(0 if r.get("ok") else 1)
+    elif c == "ledger":
+        from wflib import ledger
+        r = ledger.check(_p(args))
+        if args.json:
+            out(r)
+        else:
+            print(f"失败模式台账 {r['rows']} 条：" + "、".join(f"{k} {v}" for k, v in sorted(r["by_status"].items())))
+            print(f"不符合口径的 {len(r['violations'])} 条" + ("" if r["violations"] else "（全部符合）"))
+            for v in r["violations"]:
+                print(f"  ✗ {v['id']}：{v['why']}")
+        sys.exit(1 if r["violations"] else 0)
     elif c == "self-manifest":
         print(f"已写入 {release.write_manifest()}")
     elif c == "self-init":

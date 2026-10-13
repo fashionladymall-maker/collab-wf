@@ -493,6 +493,28 @@ def _append_tell(inst, out) -> None:
     inst.save()
 
 
+def _append_receipt(inst, out) -> None:
+    # 1.8.7（W83）：每条发出的消息末尾附一个回执码（同一轮重发沿用同一个）。回复在驱动指令里写“回执：<码>”，
+    # 驱动器据此确认这条回复回应的就是本轮消息；对话分叉时，另一条回复写不出本轮的码。
+    if not out or not out.get("file"):
+        return
+    rc = inst.state.get("receipt") or {}
+    if rc.get("turn") != out.get("turn"):
+        import secrets
+        rc = {"turn": out.get("turn"), "code": secrets.token_hex(4)}
+        inst.state["receipt"] = rc
+    p = Path(out["file"])
+    try:
+        txt = p.read_text(encoding="utf-8")
+    except OSError:
+        return
+    tag = f"回执码：{rc['code']}"
+    if tag not in txt:
+        p.write_text(txt.rstrip("\n") + f"\n\n{tag}（请在驱动指令里写一行“回执：{rc['code']}”，驱动器据此确认回复对应本条消息）\n",
+                     encoding="utf-8")
+    inst.save()
+
+
 def h_compose(ctx):
     inst, st = ctx.inst, ctx.st
     out = st.get("outgoing")
@@ -519,6 +541,7 @@ def h_compose(ctx):
         inst.save()
     _append_tell(inst, out)   # 1.7.6：执行端用 wf tell 留给 Claude 的说明，附在这条待发消息末尾
     _append_limit_carry(inst, out)   # 1.8.2（P0-F）：上一条回复因上限结束时，请 Claude 先从断点补齐
+    _append_receipt(inst, out)   # 1.8.7（W83）：回执码，回复要原样写回
     chk = ops.check_outgoing(Path(out["file"]), out["kind"])
     if chk["secrets"]:
         return _anomaly(ctx, {"source": "compose", "kind": "secret"}, "；".join(chk["secrets"]))
@@ -780,6 +803,10 @@ def h_wait_reply(ctx):
             return "wait", f"取回的不是本轮消息的回复（{why}），第 {n} 次，稍后再查"
         st.pop("stale_polls", None)
         inst.event("reply_unverified" if verdict == "unverified" else "reply_checked", note=why or None, by="driver")
+        mu, fu = r["data"].get("message_uuid"), r["data"].get("files_message_uuid")
+        if mu and fu and mu != fu:   # 1.8.7（W83）：正文与交付文件来自不同消息时不收下（第 113 轮比对用了另一条回复）
+            return _anomaly(ctx, {"source": "driver", "kind": "reply_files_mismatch"},
+                            f"回复正文来自消息 {mu}，交付文件来自消息 {fu}，不是同一条回复，不收下（W83）")
         st["delivered"] = [str(Path(f)) for f in r["data"].get("files", []) if Path(f).exists()]
         if r["data"].get("other_deliveries"):
             # 同一轮里有多次生成各自交付了文件（例如一次被安全防护拦下后续写、一次正常回复）。
@@ -916,6 +943,33 @@ def _append_limit_carry(inst, out) -> None:
     inst.event("limit_carry_attached", turn=c.get("turn"), msg_turn=out.get("turn"), by="driver")
 
 
+def _receipt_and_deliveries(inst, d: dict) -> str:
+    import hashlib
+    st = inst.state
+    rc = st.get("receipt") or {}
+    if rc.get("turn") == st.get("turn") and rc.get("code"):
+        if d.get("receipt") and d["receipt"] != rc["code"]:
+            return f"回复写的回执 {d['receipt']} 与本轮发出的 {rc['code']} 不一致：这条回复回应的不是本轮消息"
+        if not d.get("receipt"):
+            ops.add_note(inst, "deviation", "回复没有写回执（1.8.7 起应写“回执：<回执码>”）：本轮照常，但无法确认回复对应本轮消息",
+                         by="driver")
+    dels = d.get("deliveries") or {}
+    if not dels:
+        return ""
+    have = {Path(f).name: Path(f) for f in (st.get("delivered") or [])}
+    bad = []
+    for _, x in sorted(dels.items(), key=lambda kv: int(kv[0])):
+        f = have.get(x["name"])
+        if not f or not f.is_file():
+            bad.append(f"{x['name']} 没有送达")
+        elif hashlib.sha256(f.read_bytes()).hexdigest() != x["sha256"]:
+            bad.append(f"{x['name']} 的 sha256 与声明不符")
+    rel = d.get("release")
+    if rel and rel not in {x["name"] for x in dels.values()}:
+        bad.append(f"要落地的 {rel} 没有写在交付行里")
+    return "交付核对不通过：" + "；".join(bad) if bad else ""
+
+
 def h_intake(ctx):
     inst, st = ctx.inst, ctx.st
     reply = inst.turn_dir() / "reply.md"
@@ -926,6 +980,9 @@ def h_intake(ctx):
     if res["blocks_missing"]:
         return _anomaly(ctx, {"source": "intake", "kind": "missing_blocks"}, "缺少：" + "、".join(res["blocks_missing"]))
     d = res.get("directives") or {}
+    bad = _receipt_and_deliveries(inst, d)   # 1.8.7（W83）：评审之前核对回执与交付
+    if bad:
+        return _anomaly(ctx, {"source": "driver", "kind": "reply_binding_mismatch"}, bad + "，不落地、不执行（W83）")
     if d.get("errors"):
         ops.add_note(inst, "deviation", "【驱动指令】有无法解析的行：" + "；".join(d["errors"]), by="driver")
         st["force_report"] = True

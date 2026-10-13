@@ -189,10 +189,10 @@ def list_execs(inst: Instance, turn=None) -> list:
 def parse_directives(body: str) -> dict:
     """解析【驱动指令】块。每行“键：值”，键为 发布 / 之后 / 验收 N / 执行端 N / 指纹 / 超时 / 失败后继续。"""
     d = {"release": None, "after": None, "until": None, "wait_reason": None, "checks": {}, "fingerprint": None,
-         "timeout": None, "continue_on_error": False, "errors": [], "executor_tasks": {}}
+         "timeout": None, "continue_on_error": False, "errors": [], "executor_tasks": {}, "receipt": None, "deliveries": {}}
     for raw in body.splitlines():
         line = fidelity.directive_line(raw)   # 1.5.0：容忍行首编号、加粗与“本轮之后”
-        m = re.match(r"^(发布|之后|验收\s*\d+|执行端\s*\d+|指纹|超时|失败后继续)\s*[:：]\s*(.*)$", line)
+        m = re.match(r"^(发布|之后|验收\s*\d+|执行端\s*\d+|指纹|超时|失败后继续|回执|交付\s*\d+)\s*[:：]\s*(.*)$", line)   # 1.8.7：回执、交付 N
         if not m:
             continue
         d["_keys"] = d.get("_keys", 0) + 1
@@ -242,6 +242,15 @@ def parse_directives(body: str) -> dict:
                 d["timeout"] = float(re.sub(r"[^\d.]", "", val))
             except ValueError:
                 d["errors"].append(f"无法解析：{line}")
+        elif key == "回执":   # 1.8.7（W83）
+            d["receipt"] = val.split()[0] if val else None
+        elif key.startswith("交付"):   # 1.8.7（W83）：交付 N：<文件名> <sha256>
+            n = int(re.sub(r"\D", "", key))
+            parts = val.split()
+            if len(parts) >= 2 and re.fullmatch(r"[0-9a-f]{64}", parts[-1]):
+                d["deliveries"][str(n)] = {"name": parts[0], "sha256": parts[-1]}
+            else:
+                d["errors"].append(f"交付 {n} 应写成“交付 N：<文件名> <sha256>”：{line}")
         elif key == "失败后继续":
             d["continue_on_error"] = val.startswith(("是", "yes", "true"))
     if body.strip() and not d.get("_keys"):

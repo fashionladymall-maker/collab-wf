@@ -617,12 +617,95 @@ def _t_single_driver(_ok):
         code == 10 and "另一个驱动器" in str(info.get("note")), json.dumps([code, info.get("note")], ensure_ascii=False))
 
 
+def _t_ledger(_ok):
+    from . import ledger, policy
+    text = ("## 失败模式台账\n| 编号 | 日期 | 现象 | 根因 | 处置 | 状态 |\n|---|---|---|---|---|---|\n"
+            "| A1 | d | 现象 | 根因 | 1.8.2：新 inode 加原子替换，负向探针 | 已解决（探针覆盖） |\n"
+            "| A2 | d | 现象 | 根因 | 加了一条约定 | 已解决 |\n"
+            "| A3 | d | 现象 | 待核对 | 1.8.5，自检 | 已解决 |\n"
+            "| A4 | d | 现象 | 根因 | 约定 | 已规避（约定） |\n"
+            "| A5 | d | 现象 | 根因 | 1.9 | 好像好了 |\n"
+            "| A6 | d | 只有三列 |\n\n## 协作约定\n")
+    r = ledger.check_rows(ledger.parse(text))
+    bad = {v["id"] for v in r["violations"]}
+    ro = not (policy.classify("wf ledger", {}) or {}).get("manual")
+    _ok("1.8.7 经验闭环检查：标“已解决”却缺根因、版本或回归证据的条目被列出；约定类写“已规避”不算违规；"
+        "状态写法不认识、列数不对也列出；wf ledger 是只读命令",
+        r["rows"] == 6 and bad == {"A2", "A3", "A5", "A6"} and ro, str([r, ro])[:600])
+
+
+def _t_reply_source(_ok):
+    from . import anomaly, driver
+    orig = anomaly.call
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v186-r", {"state": "WAIT_REPLY", "turn": 5, "send_ref": "R5", "sent_at": "2026-10-12T00:00:00+00:00"})
+        rf = Path(td) / "reply.md"
+        rf.write_text(REPLY6, encoding="utf-8")
+
+        def fake(op, args, timeout=None, env_extra=None):
+            if op == "poll":
+                return {"code": 0, "raw": "", "data": {"status": "done", "reply_file": str(rf), "files": [], "reply_parent": "R5",
+                                                       "message_uuid": "m-1", "files_message_uuid": "m-2"}}
+            return {"code": 0, "raw": "", "data": {}}
+        try:
+            anomaly.call = fake
+            r = driver.h_wait_reply(driver.Ctx(a, {}, time.time() + 60))
+            stt = a.state.get("state")
+        finally:
+            anomaly.call = orig
+    _ok("1.8.7 回复与交付同源：适配器报告正文与交付文件来自不同消息时，不收下回复、安全停下",
+        r[0] == "user" and stt in ("BLOCKED", "AWAITING_USER"), json.dumps([r, stt], ensure_ascii=False))
+
+
+def _t_receipt(_ok):
+    from . import driver, ops
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v187-r", {"state": "COMPOSE", "turn": 4})
+        f = a.outbox / "turn-004.md"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("【回报 · 第 4 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+        out = {"turn": 4, "file": str(f)}
+        driver._append_receipt(a, out)
+        driver._append_receipt(a, out)
+        body = f.read_text(encoding="utf-8")
+        code = (a.state.get("receipt") or {}).get("code") or ""
+        d_ok = ops.parse_directives(f"发布：无\n回执：{code}\n之后：回报\n")
+        d_bad = ops.parse_directives("发布：无\n回执：deadbeef\n之后：回报\n")
+        e1 = driver._receipt_and_deliveries(a, d_ok)
+        e2 = driver._receipt_and_deliveries(a, d_bad)
+    _ok("1.8.7 回执核对：发出的消息末尾附回执码（同一轮只附一次）；回复写回同一个码时放行，写错就在评审前停下",
+        body.count("回执码：") == 1 and len(code) == 8 and d_ok["receipt"] == code and e1 == "" and "不一致" in e2,
+        json.dumps([body[-120:], code, e1, e2], ensure_ascii=False))
+
+
+def _t_delivery_check(_ok):
+    import hashlib
+    from . import driver, ops
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v187-d", {"state": "INTAKE", "turn": 6})
+        dd = Path(td) / "delivered"
+        dd.mkdir()
+        z = dd / "proj-v1.zip"
+        z.write_bytes(b"zip bytes")
+        h = hashlib.sha256(b"zip bytes").hexdigest()
+        a.state["delivered"] = [str(z)]
+        a.save()
+        good = ops.parse_directives(f"发布：proj-v1.zip\n交付 1：proj-v1.zip {h}\n之后：回报\n")
+        wrong = ops.parse_directives(f"发布：proj-v1.zip\n交付 1：proj-v1.zip {'0' * 64}\n之后：回报\n")
+        miss = ops.parse_directives(f"发布：proj-v1.zip\n交付 1：other.py {h}\n之后：回报\n")
+        r = [driver._receipt_and_deliveries(a, x) for x in (good, wrong, miss)]
+    _ok("1.8.7 交付核对：声明的交付文件 sha256 一致才放行；不符、没送达、要落地的版本包没声明，都在评审前停下",
+        r[0] == "" and "不符" in r[1] and "没有送达" in r[2] and "没有写在交付行里" in r[2], json.dumps(r, ensure_ascii=False))
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
          ("人工目标前置", _t_manual_prereq), ("决定与投递分开", _t_owner_split), ("产物挑选", _t_artifacts_pick),
          ("计划过时", _t_plan_stale), ("手工执行防重", _t_exec_guard), ("安装互斥", _t_update_mutex),
-         ("回复发现延迟", _t_reply_latency), ("待发消息核对", _t_outgoing_missing), ("驱动器单实例", _t_single_driver)]
+         ("回复发现延迟", _t_reply_latency), ("待发消息核对", _t_outgoing_missing), ("驱动器单实例", _t_single_driver),
+         ("经验闭环", _t_ledger), ("回复与交付同源", _t_reply_source),
+         ("回执核对", _t_receipt), ("交付核对", _t_delivery_check)]
 
 
 def run_v18(_ok) -> None:
