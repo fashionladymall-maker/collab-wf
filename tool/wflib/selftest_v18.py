@@ -457,10 +457,91 @@ def _t_artifacts_pick(_ok):
         "artifacts/proj-v1.zip" in names and "artifacts/collab-wf-9.9.9.zip" not in names, str(names))
 
 
+def _t_plan_stale(_ok):
+    import re as _re
+    import shlex
+    from . import driver, ops
+    from .core import Instance
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v184-s", {"state": "EXECUTE", "turn": 3})
+        (a.root / "pause_now.py").write_text(
+            "import json\np='workflow/state.json'\nd=json.load(open(p,encoding='utf-8'))\n"
+            "d['paused']={'note':'测试','by':'executor'}\njson.dump(d,open(p,'w',encoding='utf-8'),ensure_ascii=False)\n",
+            encoding="utf-8")
+        py = shlex.quote(sys.executable)
+        a.turn_dir().mkdir(parents=True, exist_ok=True)
+        (a.turn_dir() / "intake.json").write_text(json.dumps({"commands": [f"{py} pause_now.py", "echo two"], "directives": {}}),
+                                                  encoding="utf-8")
+        pol = {"allow": ["^" + _re.escape(py) + r" pause_now\.py$", r"^echo two$"]}
+        a.state["exec_binding"] = driver._plan_binding(a, with_fp=False)
+        a.save()
+        r1 = driver.h_execute(driver.Ctx(a, pol, time.time() + 120))
+        (a.root / "PROJECT.md").write_text("# PROJECT.md\n人工改动\n", encoding="utf-8")   # 暂停期间别处改了项目
+        s = Instance(a.root)
+        s.state.pop("paused", None)
+        s.save()
+        r2 = driver.h_execute(driver.Ctx(a, pol, time.time() + 120))
+        n2, st2, fr = len(ops.list_execs(a)), a.state.get("state"), a.state.get("force_report")
+        notes = (a.turn_dir() / "notes.jsonl").read_text(encoding="utf-8") if (a.turn_dir() / "notes.jsonl").exists() else ""
+        b = _inst(td, "v184-t", {"state": "EXECUTE", "turn": 4, "exec_binding": {"turn": 4, "tool": "0.0.0", "fp": None}})
+        b.turn_dir().mkdir(parents=True, exist_ok=True)
+        (b.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["echo two"], "directives": {}}), encoding="utf-8")
+        r3 = driver.h_execute(driver.Ctx(b, pol, time.time() + 120))
+        n3 = len(ops.list_execs(b))
+    _ok("1.8.4 计划过时：暂停期间项目被别处改动，恢复后剩下的命令不执行、记 PLAN_STALE 并回报；"
+        "计划批准后工具版本被换掉，一条也不执行",
+        r1[0] == "user" and r2[0] == "progress" and n2 == 1 and st2 == "VERIFY" and fr and "PLAN_STALE" in notes
+        and r3[0] == "progress" and n3 == 0 and "工具版本" in r3[1],
+        json.dumps([r1, r2, n2, st2, fr, r3, n3], ensure_ascii=False)[:700])
+
+
+def _t_exec_guard(_ok):
+    from datetime import datetime, timezone
+    from . import ops
+    from .core import WfError
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            a = _inst(td, "v184-g", {"state": "EXECUTE", "turn": 2,
+                                     "driver": {"inflight": {"pid": p.pid, "started": datetime.now(timezone.utc).isoformat()}}})
+            refused = False
+            try:
+                ops.run_exec(a, "echo hi", by="executor")
+            except WfError:
+                refused = True
+            a.state["paused"] = {"note": "测试", "by": "executor"}
+            a.save()
+            rc = ops.run_exec(a, "echo hi", by="executor")
+    finally:
+        p.kill()
+        p.wait()
+    _ok("1.8.4 手工执行防重：驱动器正在推进时，手工 wf exec 被拒绝；暂停后可以手工执行", refused and rc == 0, str([refused, rc]))
+
+
+def _t_update_mutex(_ok):
+    import fcntl
+    from . import release
+    from .core import LOCAL, WfError
+    lp = LOCAL / "locks" / "self-update.lock"
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lp, "a+")
+    msg = ""
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            release.self_update(Path("/nonexistent/collab-wf-9.9.9.zip"))
+        except WfError as e:
+            msg = str(e)
+    finally:
+        fh.close()
+    _ok("1.8.4 安装互斥：已有一个 self-update 在进行时，第二个立即失败、不排队、不安装", "另一个" in msg, msg)
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
-         ("人工目标前置", _t_manual_prereq), ("决定与投递分开", _t_owner_split), ("产物挑选", _t_artifacts_pick)]
+         ("人工目标前置", _t_manual_prereq), ("决定与投递分开", _t_owner_split), ("产物挑选", _t_artifacts_pick),
+         ("计划过时", _t_plan_stale), ("手工执行防重", _t_exec_guard), ("安装互斥", _t_update_mutex)]
 
 
 def run_v18(_ok) -> None:

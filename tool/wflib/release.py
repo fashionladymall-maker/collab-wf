@@ -345,7 +345,29 @@ def _review_tool(src: Path, zip_path) -> tuple:
     return data["verdict"], "；".join(data.get("notes", [])[:5])
 
 
+_UPDATE_LOCK = []
+
+
+def _hold_update_lock() -> None:
+    # 1.8.4（W78）：同一时间只允许一个 self-update（第 110 轮驱动器与执行端各跑了一次）。拿不到锁立即失败，不排队；
+    # 锁随进程结束释放。self_update 的函数体保持不变（底线行为检查要看到它调用 guard_changes 与 floor.probe）。
+    import fcntl
+    from .core import LOCAL
+    if _UPDATE_LOCK:
+        return
+    lp = LOCAL / "locks" / "self-update.lock"
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lp, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise WfError("另一个 wf self-update 正在进行（同一时间只允许一个），本次没有安装（W78）")
+    _UPDATE_LOCK.append(fh)
+
+
 def self_update(zip_path, skip_test=False, allow_same=False, auto=False) -> dict:
+    _hold_update_lock()   # 1.8.4（W78）
     if not (WF_HOME / ".git").exists():
         raise WfError("工具尚未初始化版本库，先运行 wf self-init")
     if _dirty(WF_HOME, SELF_PROTECT):

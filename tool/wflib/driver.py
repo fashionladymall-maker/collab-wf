@@ -1093,8 +1093,30 @@ def _auto_approve_neutral(ctx, before: dict, version) -> None:
         decide(inst, "approve", f"自动批准 {kind}.json（不扩大权限）", f"随 {version} 落地", f"workflow/{kind}.json", "已批准")
 
 
+def _plan_binding(inst, with_fp=True) -> dict:
+    from .core import tool_version
+    return {"turn": inst.state.get("turn"), "tool": tool_version(),
+            "fp": ops.fingerprint(inst.root)["digest"] if with_fp else None}
+
+
+def _plan_stale(inst) -> str:
+    # 1.8.4（W77）：本轮命令计划批准后、或上一条命令结束后，工具版本或项目指纹被别处改了（例如暂停期间人工装了新版本），
+    # 就不再按旧计划往下执行。驱动器自己的命令造成的变化在每条命令结束时记下，不算。
+    b = inst.state.get("exec_binding") or {}
+    if not b:
+        return ""
+    cur = _plan_binding(inst, with_fp=b.get("fp") is not None)
+    diff = []
+    if b.get("tool") != cur["tool"]:
+        diff.append(f"工具版本 {b.get('tool')} → {cur['tool']}")
+    if b.get("fp") is not None and b.get("fp") != cur["fp"]:
+        diff.append(f"项目指纹 {b.get('fp')} → {cur['fp']}")
+    return "、".join(diff)
+
+
 def h_apply(ctx):
     inst, st = ctx.inst, ctx.st
+    st["exec_binding"] = _plan_binding(inst, with_fp=False)   # 1.8.4（W77）：计划批准时的工具版本（项目指纹随落地会变，先不记）
     path = st.get("release_path")
     if not path:
         machine.go(inst, "EXECUTE", by="driver", reason="没有待落地的版本")
@@ -1202,6 +1224,15 @@ def h_execute(ctx):
         inst.save()   # 1.8.2：每条命令之前与磁盘合并，看到其他进程的 wf pause（第 106 轮：暂停后下一条 self-update 仍被执行）
         if inst.state.get("paused"):
             return "user", (f"已暂停：第 {i + 1} 条命令之前停下，恢复后从这里继续（{inst.state['paused'].get('note') or ''}）")
+        stale = _plan_stale(inst)
+        if stale:   # 1.8.4（W77）：计划已过时，剩下的命令不执行，照常回报由 Claude 重新下计划
+            ops.add_note(inst, "deviation", f"[PLAN_STALE] 第 {i + 1} 条起的命令没有执行：{stale}（被别处改动）。"
+                                            "按旧计划继续可能重复或覆盖人工已做的事，交给 Claude 重新下计划", by="driver")
+            inst.state.pop("exec_binding", None)
+            inst.state["force_report"] = True
+            inst.save()
+            machine.go(inst, "VERIFY", by="driver", reason="计划已过时，停止执行（W77）")
+            return "progress", f"计划已过时（{stale}），第 {i + 1} 条起不再执行"
         st = inst.state
         if policy.classify(cmds[i], ctx.pol).get("manual"):
             ops.add_note(inst, "info", f"第 {i + 1} 条「{cmds[i]}」是手动步骤，驱动器未执行（F21）", by="driver")
@@ -1222,6 +1253,7 @@ def h_execute(ctx):
         st.pop("exec_inflight", None)
         i += 1
         st["exec_next"] = i
+        st["exec_binding"] = _plan_binding(inst)   # 1.8.4（W77）：记下本条命令结束后的环境
         inst.save()
         if not _exec_ok(inst, d, f"#{i}", rc):   # 1.5.2（W21）：有判据的命令以判据为准
             if rc not in (0, None):   # 1.5.7：退出码为 0、只是没通过判据时由验收报 CHECK_FAIL，不再报“命令执行失败，退出码 0”

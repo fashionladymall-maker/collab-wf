@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 112 轮 · 等待 Claude（WAIT_REPLY）
+第 112 轮 · 执行与取证（EXECUTE）
 
 ## 版本
-- 工具：collab-wf 1.8.3
-- 项目：v3.4；21684ee (HEAD -> main, tag: v3.4) release v3.4
-- 仓库指纹：65099e907f7a7831（10 个文件）
+- 工具：collab-wf 1.8.4
+- 项目：v3.5；9f99a87 (HEAD -> main, tag: v3.5) release v3.5
+- 仓库指纹：60f513de10318e5b（10 个文件）
 
 ## 最近一轮
 - 第 110 轮验收通过（2026-10-13T00:51:37+00:00）
 - 本方最新消息：`turns/turn-112.md`
-- Claude 最新回复：`replies/reply-111.md`
+- Claude 最新回复：`replies/reply-112.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -32,5 +32,5 @@
 - 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.8.3.zip`
+- `artifacts/collab-wf-1.8.4.zip`
 - `artifacts/collab-wf-dev-v3.5.zip`

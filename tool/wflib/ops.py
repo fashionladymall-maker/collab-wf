@@ -103,6 +103,12 @@ def mark_replied(inst: Instance, reply_file=None, tools=None, usage_session=None
 
 def run_exec(inst: Instance, cmd: str, label=None, timeout=None, by="executor") -> int:
     st = inst.state
+    if by != "driver" and not st.get("paused"):   # 1.8.4（W78）：驱动器正在推进时，手工 wf exec 会重复执行同一批命令
+        from .heartbeat import driver_health
+        hb = driver_health(inst)
+        if hb.get("status") == "running" and hb.get("pid") and int(hb["pid"]) != os.getpid():
+            raise WfError(f"驱动器（PID {hb['pid']}）正在推进本项目，手工 wf exec 会和它重复执行同一批命令（第 110 轮实测）。"
+                          "需要手工操作时先 wf pause --by executor --note …，等驱动器停下再执行")
     if st["state"] in ("REVIEW", "APPLY"):
         if not st.get("turn_flags", {}).get("review_accepted"):
             raise WfError("本轮评审尚未接受。先运行 wf review，确认后 wf review --accept。")
