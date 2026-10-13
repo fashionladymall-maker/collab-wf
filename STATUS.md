@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 115 轮 · 落地版本（APPLY）
+第 116 轮 · 执行与取证（EXECUTE）
 
 ## 版本
 - 工具：collab-wf 1.8.5
-- 项目：v3.6；0f4fd8f (HEAD -> main, tag: v3.6) release v3.6
-- 仓库指纹：c2af395dfb3d78fa（10 个文件）
+- 项目：v3.7；a41ae6c (HEAD -> main, tag: v3.7) release v3.7
+- 仓库指纹：47b9f533d91ecbff（10 个文件）
 
 ## 最近一轮
-- 第 114 轮验收通过（2026-10-13T02:28:17+00:00）
-- 本方最新消息：`turns/turn-115.md`
-- Claude 最新回复：`replies/reply-115.md`
+- 第 115 轮验收未通过（6 项）（2026-10-13T02:49:34+00:00）
+- 本方最新消息：`turns/turn-116.md`
+- Claude 最新回复：`replies/reply-116.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -29,8 +29,8 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- 无
+- [executor] 执行端待办 T115-3：1.8.6 装好、驱动器跑完目标检查后，运行 wf goals（预期 7/11）、wf self-check --probes（预期 20/20），并写下独立审查结论原文；确认下一条发出的消息末尾带有“回执码”。原文都写进 wf task done
 
 ## 最新产物
-- `artifacts/collab-wf-1.8.5.zip`
+- `artifacts/collab-wf-1.8.7.zip`
 - `artifacts/collab-wf-dev-v3.7.zip`
