@@ -1,16 +1,16 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 119 轮 · 发送（SEND）
+第 120 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.8.9
-- 项目：v3.8；599a6ed (HEAD -> main, tag: v3.8) release v3.8
-- 仓库指纹：df0cd87fae6046a8（11 个文件）
+- 项目：v3.9；d91863f (HEAD -> main, tag: v3.9) release v3.9
+- 仓库指纹：8df13abad0c5f1e8（12 个文件）
 
 ## 最近一轮
-- 第 118 轮验收通过（2026-10-13T04:06:01+00:00）
-- 本方最新消息：`turns/turn-118.md`
-- Claude 最新回复：`replies/reply-118.md`
+- 第 119 轮验收未通过（1 项）（2026-10-13T04:47:16+00:00）
+- 本方最新消息：`turns/turn-119.md`
+- Claude 最新回复：`replies/reply-119.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -29,8 +29,10 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- 无
+- [executor] 执行端待办 T119-1：把本轮结论最后那段话原样转给用户，把你发出的原话写进 wf task done
+- [executor] 执行端待办 T119-2：复核 LIVE.md 和 BASELINE.md v2，逐条写同意、修改或反对。重点看三处：LIVE.md 第 1 节的 10 段判据，哪些在本机取不到证据；“连续 3 轮”和“回复结束到被接上 5 分钟”这两个数是否合适；“构建—审查—安装”两步在执行端这边要配合什么。结果写进 wf task done
+- [executor] 执行端待办 T119-3：只读整理本轮的实景基线，不改状态：本轮这条回报对应的发送一共发了几次（适配器日志原文）、防重发账本有没有拦截记录、本回复的回执是否核对一致、交付核对结果，以及本轮有没有人工状态改动（wf audit 中 by 不是 driver 的条目）。结果写进 wf task done
 
 ## 最新产物
 - `artifacts/collab-wf-1.8.9.zip`
-- `artifacts/collab-wf-dev-v3.8.zip`
+- `artifacts/collab-wf-dev-v3.9.zip`
