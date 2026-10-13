@@ -67,7 +67,7 @@ def pending(inst: Instance) -> list:
     elif gs["approved"]:
         from . import goals
         for g in goals.progress(inst)["items"]:
-            if g["kind"] == "manual" and not g["ok"]:
+            if g["kind"] == "manual" and not g["ok"] and g.get("ready", True):   # 1.8.3（W75）：前置未满足不通知
                 out.append(_item(f"confirm:{g['id']}", f"confirm:{g['id']}:{gs['current']}", f"确认目标 {g['id']}",
                                  g["title"], ["确认 {code}"], f"wf goals confirm {g['id']} --code {{code}} --said …",
                                  f"目标 {g['id']} 一直算未完成：{g.get('on_fail') or ''}", "workflow/goals.json"))

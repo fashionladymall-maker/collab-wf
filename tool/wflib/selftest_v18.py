@@ -390,9 +390,77 @@ def _t_pause_between(_ok):
         json.dumps([r1, n1, nxt, r2, n2, st2], ensure_ascii=False)[:600])
 
 
+def _t_manual_prereq(_ok):
+    from . import asks, goals, policy
+    from .core import WfError
+    with tempfile.TemporaryDirectory() as td:
+        inst = _inst(td, "v183-m", {"state": "IDLE", "turn": 2})
+        g = {"phase": {"id": "M9", "title": "测试"}, "goals": [
+            {"id": "E1", "title": "机器", "kind": "exec", "check": "true", "pass": {"exit": 0}, "means": "m", "on_fail": "f"},
+            {"id": "U1", "title": "用户验收", "kind": "manual", "depends_on": "all_exec", "means": "m", "on_fail": "f"}]}
+        (inst.wf / "goals.json").write_text(json.dumps(g, ensure_ascii=False), encoding="utf-8")
+        policy.approve(inst, "goals", "测试", by="test")
+        u1 = next(i for i in goals.progress(inst)["items"] if i["id"] == "U1")
+        k1 = [str(x.get("kind")) for x in asks.pending(inst)]
+        refused = False
+        try:
+            goals.confirm(inst, "U1", "测试")
+        except WfError:
+            refused = True
+        goals.run_checks(inst, by="test")
+        u2 = next(i for i in goals.progress(inst)["items"] if i["id"] == "U1")
+        k2 = [str(x.get("kind")) for x in asks.pending(inst)]
+        bad = goals.validate({"goals": [dict(g["goals"][1], depends_on=["NOPE"])]})
+    _ok("1.8.3 人工目标的前置：前置没满足时不算完成、不出现确认事项、wf goals confirm 拒绝；前置满足后才出现确认事项；"
+        "depends_on 写错时校验不通过",
+        u1.get("ready") is False and not u1["ok"] and "前置未满足" in u1["detail"] and "confirm:U1" not in k1
+        and refused and u2.get("ready") is True and "confirm:U1" in k2 and any("depends_on" in x for x in bad),
+        json.dumps([u1, k1, refused, u2, k2, bad], ensure_ascii=False)[:800])
+
+
+def _t_owner_split(_ok):
+    from datetime import datetime, timedelta, timezone
+    from . import notify, tasks
+    rc = notify.route({"kind": "confirm:U1", "key": "x", "why": "w"})
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "inbox.json"
+        old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(timespec="seconds")
+        path.write_text(json.dumps({"items": [{"key": "p|task:T1-1", "since": old}]}), encoding="utf-8")
+        items = notify._write_inbox_locked([], path, [{"key": "p|task:T1-1", "project": "p", "for": "executor",
+                                                        "title": "t", "why": "w", "action": "", "code": ""}])
+        inst = _inst(td, "v183-o", {"state": "IDLE", "turn": 1})
+        tasks.add(inst, 1, {"1": "测试待办"})
+        rows = notify.collect_inbox([inst])
+    x = items[0]
+    _ok("1.8.3 决定与投递分开：每一项都带 decision_owner 与 delivery_owner（一律执行端）；升级只让用户看见、决定归属不变；"
+        "确认人工目标的决定归属是用户",
+        rc == "user" and x.get("for") == "user" and x.get("escalated") and x.get("notify_user")
+        and x.get("delivery_owner") == "executor" and x.get("decision_owner") == "executor" and rows
+        and all(r.get("delivery_owner") == "executor" and r.get("decision_owner") for r in rows),
+        json.dumps([rc, x, rows], ensure_ascii=False)[:800])
+
+
+def _t_artifacts_pick(_ok):
+    import zipfile as _zf
+    from . import sync
+    with tempfile.TemporaryDirectory() as td:
+        inst = _inst(td, "v183-a", {"state": "IDLE", "turn": 2})
+        d = inst.evidence / "turn-002" / "delivered"
+        d.mkdir(parents=True)
+        with _zf.ZipFile(d / "proj-v1.zip", "w") as z:
+            z.writestr("proj-v1/PROJECT.md", "# P\n")
+        time.sleep(0.05)
+        with _zf.ZipFile(d / "collab-wf-9.9.9.zip", "w") as z:
+            z.writestr("collab-wf/VERSION", "9.9.9\n")
+        names = [n for n in sync.collect(inst) if n.startswith("artifacts/")]
+    _ok("1.8.3 同步只把项目版本包放进 artifacts：Claude 附来比对的工具包不当成项目版本包",
+        "artifacts/proj-v1.zip" in names and "artifacts/collab-wf-9.9.9.zip" not in names, str(names))
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
-         ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between)]
+         ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
+         ("人工目标前置", _t_manual_prereq), ("决定与投递分开", _t_owner_split), ("产物挑选", _t_artifacts_pick)]
 
 
 def run_v18(_ok) -> None:

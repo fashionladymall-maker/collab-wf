@@ -127,6 +127,15 @@ def status_md(inst, turns, replies, artifacts) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _is_project_zip(z: Path) -> bool:
+    # 1.8.3（W76）：顶层目录里有 PROJECT.md 的 zip 才是项目版本包；Claude 附来比对的工具包不算
+    try:
+        with zipfile.ZipFile(z) as zf:
+            return any(n.count("/") == 1 and n.endswith("/PROJECT.md") for n in zf.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
 def collect(inst) -> dict:
     """返回 {仓库内路径: bytes}。"""
     from . import ops, release
@@ -159,9 +168,10 @@ def collect(inst) -> dict:
             replies.append(name)
     artifacts = []
     tz = _newest(list(inst.outbox.glob("collab-wf-[0-9]*.zip")) if inst.outbox.exists() else [])
-    pz = _newest(list(inst.evidence.glob("turn-*/delivered/*.zip")) if inst.evidence.exists() else [])
+    pz = _newest([z for z in (inst.evidence.glob("turn-*/delivered/*.zip") if inst.evidence.exists() else [])
+                  if _is_project_zip(z)])   # 1.8.3（W76）
     for z in (tz, pz):
-        if z:
+        if z and f"artifacts/{z.name}" not in files:   # 同名不重复列出
             files[f"artifacts/{z.name}"] = z.read_bytes()
             artifacts.append(z.name)
     files["STATUS.md"] = status_md(inst, turns, replies, artifacts).encode("utf-8")

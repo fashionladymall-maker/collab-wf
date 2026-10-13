@@ -102,6 +102,8 @@ def route(it: dict) -> str:
     kind, key = str(it.get("kind") or ""), str(it.get("key") or "")
     if kind == "unpause" and it.get("initiator") == "executor":   # 1.7.5（P1-A）：执行端发起的暂停由执行端解除
         return "executor"
+    if kind.startswith("confirm:"):   # 1.8.3：确认人工目标只认用户本人（wf goals confirm 是护栏命令）
+        return "user"
     if kind == "unpause" or key.startswith("done:"):
         return "user"
     return "user" if any(m in str(it.get("why") or "") for m in USER_MARKS) else "executor"
@@ -117,6 +119,8 @@ def collect_inbox(projects) -> list:
                      "why": it["why"], "action": it["command"], "code": it["code"]} for it in asks.pending(inst)]
             rows += [{"key": f"{inst.name}|{n['key']}", "project": inst.name, "for": route(n), "title": n["title"],
                       "why": n["why"], "action": n.get("action") or "", "code": ""} for n in asks.notices(inst)]
+            for r in rows:   # 1.8.3（W70）：decision_owner＝谁来决定；delivery_owner＝投递给谁，一律是执行端（它转告用户）
+                r["decision_owner"], r["delivery_owner"] = r["for"], "executor"
         except Exception:   # noqa: BLE001  某个项目读不出来，不影响其他项目
             continue
         out += rows
@@ -125,7 +129,8 @@ def collect_inbox(projects) -> list:
         for s in signals.load():
             out.append({"key": f"signal|{s['key']}", "project": s.get("project") or "", "for": s.get("for") or "executor",
                         "title": s.get("title") or "", "why": s.get("why") or "", "action": s.get("action") or "",
-                        "code": "", "source": s.get("source") or "external"})
+                        "code": "", "source": s.get("source") or "external",
+                        "decision_owner": s.get("for") or "executor", "delivery_owner": "executor"})
     except Exception:   # noqa: BLE001  信号读不出来不影响其余待办
         pass
     return out
@@ -184,10 +189,13 @@ def _write_inbox_locked(projects, path, items) -> list:
     items = collect_inbox(projects) if items is None else [dict(x) for x in items]
     for x in items:
         x["since"] = (old.get(x["key"]) or {}).get("since") or now_iso()
+        x.setdefault("decision_owner", x.get("for") or "executor")   # 1.8.3：升级之前的决定归属
+        x.setdefault("delivery_owner", "executor")
         # 1.6.5（用户第 53 轮）：交给执行端的事超过 2 小时还在，升级给用户；额度等待本来就会持续数小时，除外
         if x.get("for") == "executor" and (secs_since(x["since"]) or 0) > ESCALATE_S \
                 and not str(x.get("key") or "").split("|", 1)[-1].startswith("quota:"):
-            x["for"], x["escalated"] = "user", True
+            # 1.8.3（W70）：升级只是让用户看见（notify_user）；for 为兼容旧读者仍改为 user，但决定归属不变、投递对象仍是执行端
+            x["for"], x["escalated"], x["notify_user"] = "user", True, True
             x["title"] = f"{x.get('title') or ''}（交给执行端超过 {ESCALATE_S // 3600} 小时仍未处理，已转给用户）"
     write_json(path, {"updated": now_iso(), "items": items})
     return items

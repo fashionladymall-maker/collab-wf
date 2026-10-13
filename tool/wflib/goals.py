@@ -59,7 +59,23 @@ def validate(g: dict) -> list:
             issues.append("history 是历史阶段的列表，每项需要 id 与 title")
         elif isinstance(ph, dict) and any(h.get("id") == ph.get("id") for h in hist):
             issues.append("当前阶段的编号不能与历史阶段重复")
+    ids = {x.get("id") for x in g["goals"]}
+    for x in g["goals"]:   # 1.8.3（W75）：人工目标的前置
+        dep = x.get("depends_on")
+        if dep is None:
+            continue
+        if x.get("kind") != "manual":
+            issues.append(f"{x.get('id')}：depends_on 只用于人工目标")
+        elif dep != "all_exec" and (not isinstance(dep, list) or not dep or any(d not in ids or d == x.get("id") for d in dep)):
+            issues.append(f"{x.get('id')}：depends_on 要么是 \"all_exec\"，要么是本文件里其他目标编号的列表")
     return issues
+
+
+def _deps(g: dict, x: dict) -> list:
+    dep = x.get("depends_on")
+    if dep == "all_exec":
+        return [y["id"] for y in g["goals"] if y.get("kind") == "exec"]
+    return list(dep) if isinstance(dep, list) else []
 
 
 def judge(cond: dict, exit_code: int, out: str) -> tuple:
@@ -90,6 +106,9 @@ def confirm(inst: Instance, gid: str, note: str) -> dict:
     x = next(x for x in g["goals"] if x["id"] == gid)
     if x["kind"] != "manual":
         raise WfError(f"{gid} 是可执行判据，由检查命令判定，不能人工确认")
+    early = [i for i in progress(inst)["items"] if i["id"] == gid and i.get("ready") is False]
+    if early:   # 1.8.3（W75）
+        raise WfError(f"{gid} 现在还不能确认：{early[0]['detail']}")
     st = policy.status(inst, "goals")
     if not st["approved"]:
         raise WfError("目标尚未批准或批准后被改动，先 wf goals approve")
@@ -156,6 +175,15 @@ def progress(inst: Instance) -> dict:
             detail = f"用户已确认：{c.get('note')}" if ok else "等待用户确认"
         items.append({"id": x["id"], "title": x["title"], "kind": x["kind"], "ok": ok, "detail": detail,
                       "means": x.get("means"), "on_fail": x.get("on_fail")})
+    okmap = {i["id"]: i["ok"] for i in items}
+    for x, i in zip(g["goals"], items):   # 1.8.3（W75）：前置没满足的人工目标不算完成、不通知、不能确认
+        deps = _deps(g, x) if x["kind"] == "manual" else []
+        if deps:
+            miss = [d for d in deps if not okmap.get(d)]
+            i["ready"] = not miss
+            if miss:
+                i["ok"] = False
+                i["detail"] = "前置未满足：" + "、".join(miss) + "（未到确认的时候，不通知）"
     done = sum(1 for i in items if i["ok"])
     return {"defined": True, "approved": st["approved"], "changed_since_approval": st["changed_since_approval"],
             "items": items, "done": done, "total": len(items), "reached": st["approved"] and done == len(items),
