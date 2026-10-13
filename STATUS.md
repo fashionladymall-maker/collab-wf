@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 128 轮 · 组织消息（COMPOSE）
+第 128 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.9.1
