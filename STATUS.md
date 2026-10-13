@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 123 轮 · 发送（SEND）
+第 123 轮 · 等待计划节点（WAIT_SCHEDULE）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -8,9 +8,9 @@
 - 仓库指纹：29a0181934f5d903（12 个文件）
 
 ## 最近一轮
-- 第 122 轮验收未通过（5 项）（2026-10-13T09:12:37+00:00）
-- 本方最新消息：`turns/turn-122.md`
-- Claude 最新回复：`replies/reply-122.md`
+- 第 123 轮验收通过（2026-10-13T09:30:40+00:00）
+- 本方最新消息：`turns/turn-123.md`
+- Claude 最新回复：`replies/reply-123.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -31,7 +31,9 @@
 
 ## 待办
 - [executor] 执行端待办 T122-2：1.9.2 装上后，运行 wf live-check --rounds 3（预期仍未通过；它现在按事件身份判人工，并要求父子 uuid、ended_at、project 字段），记下原文；再写明适配器的 message_uuid、parent、ended_at、project 字段，以及审查结论复用、按 depends_on 唤醒这几项，各自做到哪一步。结果写进 wf task done
+- [executor] 执行端待办 T123-1：在下一轮安装之前完成审查：用 workflow/outbox/collab-wf-1.9.3.zip（sha256 ad541aea…）对照已安装的 1.9.1 审读 diff，通过审查程序提交结论，并让审查程序在下一次 wf self-update --auto 请求同一个版本包时立即返回这次结论（绑定版本包 sha、diff sha、模型、规则版本；block 不得复用成通过）。做不到复用的话
+- [executor] 执行端待办 T123-2：只读核实两件事：一是构建过程中用户的 Mac 是否还弹出了系统通知；二是 16:59 那条 auto2 通知完整的出错原文，确认它来自自检的临时项目，与正式项目无关。再写明适配器的 message_uuid、parent、ended_at、project 字段，以及按 depends_on 唤醒、批量投递这几项各自做到哪一步，做不到的写明阻塞原因。结果写进 wf task done
 
 ## 最新产物
-- `artifacts/collab-wf-1.9.2.zip`
+- `artifacts/collab-wf-1.9.3.zip`
 - `artifacts/collab-wf-dev-v3.10.zip`
