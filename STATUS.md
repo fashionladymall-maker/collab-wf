@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 123 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 124 轮 · 组织消息（COMPOSE）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -30,9 +30,8 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T122-2：1.9.2 装上后，运行 wf live-check --rounds 3（预期仍未通过；它现在按事件身份判人工，并要求父子 uuid、ended_at、project 字段），记下原文；再写明适配器的 message_uuid、parent、ended_at、project 字段，以及审查结论复用、按 depends_on 唤醒这几项，各自做到哪一步。结果写进 wf task done
-- [executor] 执行端待办 T123-2：只读核实两件事：一是构建过程中用户的 Mac 是否还弹出了系统通知；二是 16:59 那条 auto2 通知完整的出错原文，确认它来自自检的临时项目，与正式项目无关。再写明适配器的 message_uuid、parent、ended_at、project 字段，以及按 depends_on 唤醒、批量投递这几项各自做到哪一步，做不到的写明阻塞原因。结果写进 wf task done
+- 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.9.3.zip`
+- `artifacts/collab-wf-1.9.1-0f9305c.zip`
 - `artifacts/collab-wf-dev-v3.10.zip`
