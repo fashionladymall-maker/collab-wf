@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 117 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 118 轮 · 落地版本（APPLY）
 
 ## 版本
 - 工具：collab-wf 1.8.8
@@ -9,8 +9,8 @@
 
 ## 最近一轮
 - 第 117 轮验收通过（2026-10-13T03:34:34+00:00）
-- 本方最新消息：`turns/turn-117.md`
-- Claude 最新回复：`replies/reply-117.md`
+- 本方最新消息：`turns/turn-118.md`
+- Claude 最新回复：`replies/reply-118.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -29,9 +29,8 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T117-1：1.8.8 装好、驱动器跑完目标检查后，运行 wf goals（预期 9/11，M2-G1 通过）和 wf self-check --probes（预期 24/24），附独立审查结论原文。原文写进 wf task done
-- [executor] 执行端待办 T117-2：按决策顺位决定是否在 transport.json 开启 review_required，写明理由。同时说明 W84 的通道修复进度：本轮这条回复对应的发送一共发了几次，发送时用的父消息是哪一条，取回复时取的是哪一条（只写 uuid 与次数）。结果写进 wf task done
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.8.8.zip`
-- `artifacts/collab-wf-dev-v3.7.zip`
+- `artifacts/collab-wf-dev-v3.8.zip`
