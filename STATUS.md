@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 124 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 126 轮 · 等待计划节点（WAIT_SCHEDULE）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -8,9 +8,9 @@
 - 仓库指纹：29a0181934f5d903（12 个文件）
 
 ## 最近一轮
-- 第 124 轮验收通过（2026-10-13T09:58:18+00:00）
-- 本方最新消息：`turns/turn-124.md`
-- Claude 最新回复：`replies/reply-124.md`
+- 第 126 轮验收通过（2026-10-13T10:32:07+00:00）
+- 本方最新消息：`turns/turn-126.md`
+- Claude 最新回复：`replies/reply-126.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -30,9 +30,9 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T124-1：回核交接，结果写进 wf task done。一是本条回复的核对结果：同步仓库 5337436 下 12 个项目文件、仓库指纹 29a0181934f5d903、1.9.1 工具 67 个文件与清单一致。二是发送身份：本条回复所在对话、send_ref 与 reply_parent 是否逐字对应第 124 轮这条消息。两项都一致才算交接闭合；任何一项不一致，写明原文，不要改状态。
-- [executor] 执行端待办 T124-2：先核对 inbox 里的 signal|review:collab-wf.tool.collab-wf-1.9.3 是否已被 T123-1 提交的 concerns 结论满足。如果已满足，就用 wf signal clear 清掉，并在 wf task done 里写明键与结论文件名；如果没满足，写明还缺什么。
-- [executor] 驱动器停了：最近一次运行在 18 分钟前，系统定时器可能没有运行。执行端用 wf schedule status 检查，按 docs/PROCESS.md 第 1 节第 3 步安装定时器
+- [executor] 执行端待办 T125-1：c1 跑完后，只读核对本次安装是否在安装前拿到了审查结论。要写明的内容：
+- [executor] 执行端待办 T126-1：在项目目录和工具目录之外建一个临时目录，把 workflow/outbox/collab-wf-1.9.3.zip 解压进去，确认 sha256 仍是 ad541aea5686da4b4c479b643e01d6db248a4dfa2227c10aae61bbdf79fa48d3。然后用 3.13.12 的 python3 运行解出目录里的 wf.py selftest，条件如下：
+- [executor] 执行端待办 T126-2：T125-1 照原样完成，用第 126 轮 c01 这次安装尝试的审查记录即可。
 
 ## 最新产物
 - `artifacts/collab-wf-1.9.1-0f9305c.zip`
