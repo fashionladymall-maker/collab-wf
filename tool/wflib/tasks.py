@@ -112,3 +112,22 @@ def close(inst: Instance, tid: str, kind: str, reason: str, by: str = "executor"
         return t
     ids = "、".join(t["id"] for t in open_items(inst)) or "无"
     raise WfError(f"没有这个待办：{tid}。未完成的待办：{ids}")
+
+
+def progress(inst: Instance, tid: str, note: str, by: str = "executor") -> dict:
+    # 1.9.0（W88）：执行端做到一半被打断（额度、模型、会话）时留下检查点：做到哪一步、下一步、证据在哪。不关闭待办。
+    note = (note or "").strip()
+    if not note:
+        raise WfError("检查点要写内容：wf task progress <编号> --note \"做到哪一步、下一步、证据在哪\"")
+    want = (tid or "").strip().upper()
+    for t in inst.state.get("executor_tasks") or []:
+        if str(t.get("id", "")).upper() != want:
+            continue
+        if status_of(t) != "open":
+            raise WfError(f"{t['id']} 已关闭（{STATUS_CN[status_of(t)]}），不再记检查点")
+        t.setdefault("checkpoints", []).append({"ts": now_iso(), "note": note[:500], "by": by})
+        t["checkpoints"] = t["checkpoints"][-20:]
+        inst.event("task_progress", id=t["id"], note=note[:200], by=by)
+        inst.save()
+        return t
+    raise WfError(f"没有这个待办：{tid}")

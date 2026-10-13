@@ -235,6 +235,8 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
             delay = min(delay, int(ctx.pol.get("send_unknown_poll_s", 120) or 120))
         st["retry_at"] = (now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
         inst.save()
+        if r["id"] == "SEND_UNKNOWN_WAIT":   # 1.9.0（W89）：这里只是再核对，不重发
+            return "wait", f"[{r['id']}] {why} {delay} 秒后再核对是否已送达（不重发，第 {n} 次）"
         return "wait", f"[{r['id']}] {why} {delay} 秒后重试（第 {n} 次）"
     if act == "quota_wait":
         until = parse_iso(facts.get("resets_at")) or (now() + timedelta(hours=1))
@@ -673,6 +675,10 @@ def h_send(ctx):
         st["send_intent"].update(status="accepted", ref=r["data"].get("ref"))
         st.pop("resend_parent", None)
         return _finalize_send(ctx, out, "通道已接受")
+    if code == 4:   # 1.9.0（W89）：暂时性错误或超时，发送结果不明，按“结果不明”轮询确认（此前标成 NET，读起来像要重发）
+        inst.save()
+        return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
+                        "适配器报暂时性错误或超时，发送结果不明：保留发送意图、轮询确认，不重发（W89）")
     if code == 2 and r["data"].get("status") == "heartbeat_only":   # 1.8.9（W84）：同上，退出码 2 加只有心跳也按结果不明处理
         inst.save()
         return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
@@ -987,6 +993,28 @@ def _receipt_and_deliveries(inst, d: dict) -> str:
     return "交付核对不通过：" + "；".join(bad) if bad else ""
 
 
+def _binding_status(inst, d: dict) -> dict:
+    import hashlib
+    st = inst.state
+    rc = st.get("receipt") or {}
+    if not (rc.get("turn") == st.get("turn") and rc.get("code")):
+        receipt = "n/a"
+    elif not d.get("receipt"):
+        receipt = "missing"
+    else:
+        receipt = "ok" if d["receipt"] == rc["code"] else "mismatch"
+    dels = d.get("deliveries") or {}
+    if not dels:
+        deliveries = "none"
+    else:
+        have = {Path(f).name: Path(f) for f in (st.get("delivered") or [])}
+        good = all(have.get(x["name"]) and have[x["name"]].is_file()
+                   and hashlib.sha256(have[x["name"]].read_bytes()).hexdigest() == x["sha256"] for x in dels.values())
+        rel = d.get("release")
+        deliveries = "ok" if good and (not rel or rel in {x["name"] for x in dels.values()}) else "bad"
+    return {"receipt": receipt, "deliveries": deliveries}
+
+
 def h_intake(ctx):
     inst, st = ctx.inst, ctx.st
     reply = inst.turn_dir() / "reply.md"
@@ -998,6 +1026,7 @@ def h_intake(ctx):
         return _anomaly(ctx, {"source": "intake", "kind": "missing_blocks"}, "缺少：" + "、".join(res["blocks_missing"]))
     d = res.get("directives") or {}
     bad = _receipt_and_deliveries(inst, d)   # 1.8.7（W83）：评审之前核对回执与交付
+    inst.event("reply_binding", by="driver", **_binding_status(inst, d))   # 1.9.0：留给实景验收（LIVE.md 判据 2、3）
     if bad:
         return _anomaly(ctx, {"source": "driver", "kind": "reply_binding_mismatch"}, bad + "，不落地、不执行（W83）")
     if d.get("errors"):

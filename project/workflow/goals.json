@@ -149,6 +149,20 @@
       "on_fail": "交付后复查"
     },
     {
+      "id": "M2-R1",
+      "title": "实景：连续 3 个正式轮次全链路达标（LIVE.md）",
+      "kind": "exec",
+      "check": "wf live-check --rounds 3",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "——通过"
+        ]
+      },
+      "means": "在用户真实环境里，发送、归属、交付、审查、执行、待办、回报、同步逐段都有证据（verified，不是探针）",
+      "on_fail": "按 wf live-check 列出的不达标段处理；计数从下一轮重来"
+    },
+    {
       "id": "M2-U1",
       "title": "用户验收 M2",
       "kind": "manual",

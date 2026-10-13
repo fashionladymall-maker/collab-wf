@@ -339,6 +339,13 @@ def run(inst, dry_run=False, force=False) -> dict:
         else:
             rec["blocked"] = {"ts": res["ts"], "secrets": res["secrets"], "reasons": res.get("reasons") or []}
         write_json(record_path(inst), rec)
+        try:   # 1.9.0（LIVE.md 判据 10）：每次同步的结果按轮次留一条
+            from .core import append_jsonl
+            append_jsonl(SYNC_DIR / f"{inst.name}.history.jsonl",
+                         {"ts": res["ts"], "turn": inst.state.get("turn"), "status": res["status"],
+                          "commit": res.get("commit") or "", "digest": res.get("digest")})
+        except OSError:
+            pass
     res["names"] = sorted(files)   # 1.8.2：这次（或与上次推送相同的）文件清单，只返回、不写进记录；短消息只链接其中的文件
     return res
 

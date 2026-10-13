@@ -20,7 +20,7 @@ from .core import Instance, WfError, now_iso, read_json, write_json
 from .floor import CODE_SUFFIXES, DIFF_FLOOR, GUARDRAIL, META, STOP_FLOOR  # noqa: F401
 # 只读的 wf 命令：驱动器可以在白名单允许时自动执行。其余 wf 命令会改变工作流状态，
 # 由驱动器内部再调用会与驱动器自身的状态写入互相覆盖（F21），所以驱动器永远不执行它们，只列为手动步骤。
-WF_READONLY = re.compile(r"^\s*wf\s+(version|fingerprint|doctor|status|explain|step|help|audit|decisions|effort|projects|ledger|"
+WF_READONLY = re.compile(r"^\s*wf\s+(version|fingerprint|doctor|status|explain|step|help|audit|decisions|effort|projects|ledger|live-check|"
                          r"bridge-check|goals\s*$|goals\s+show|policy\s*$|policy\s+show|conv\s*$|conv\s+show|"
                          r"transport(\s+(check|test))?\s*$|schedule\s+(status|plist))(\s|$)")
 # 命令链与重定向（META）：一律需要用户批准，定义在 floor.py

@@ -1,5 +1,14 @@
 # CHANGELOG（collab-wf）
 
+## 1.9.0 — 2026-10-13
+
+实景验收的测量（collab-wf-dev 第 119–120 轮；W87–W90，LIVE.md）。
+- 新增只读命令 wf live-check：按 LIVE.md 逐轮核对 10 段判据，连续达标 3 轮才通过。
+- 新增留痕：reply_binding 事件、安装前审查结论留档、同步历史。
+- wf task progress：执行端待办的检查点。
+- 发送退出码 4 按结果不明处理，文案改为“再核对，不重发”；wf bridge-check 默认读 transport.json 的 log。
+- DRIVER.md 第 41 节。自检新增 3 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.8.9 — 2026-10-13
 
 只有心跳不重发（collab-wf-dev 第 118 轮；W84）。

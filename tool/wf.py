@@ -412,7 +412,7 @@ def main(argv=None):
                                                                                  choices=["executor", "user"])
     x.add_argument("--action-text", dest="action_text", default=""); x.add_argument("--ttl", type=int, default=0)
     x = sub.add_parser("watchdog"); x.add_argument("--write", action="store_true")
-    x = sub.add_parser("task"); x.add_argument("action", nargs="?", default="list", choices=["list", "done", "cancel", "supersede"])
+    x = sub.add_parser("task"); x.add_argument("action", nargs="?", default="list", choices=["list", "done", "cancel", "supersede", "progress"])
     x.add_argument("tid", nargs="?"); x.add_argument("--note", default="")
     x.add_argument("--reason", default=""); x.add_argument("--by-task", dest="by_task", default="")   # 1.8.2
     x = sub.add_parser("transport"); x.add_argument("action", nargs="?", default="check", choices=["check", "test"])
@@ -425,6 +425,7 @@ def main(argv=None):
     x.add_argument("--interval", type=int, default=300); x.add_argument("--max-seconds", type=int, default=540)
     sub.add_parser("self-init")
     x = sub.add_parser("self-check"); x.add_argument("--probes", action="store_true")   # 1.8.2：本机行为探针
+    x = sub.add_parser("live-check"); x.add_argument("--rounds", type=int, default=3)   # 1.9.0（W87）：实景验收的测量（只读）
     sub.add_parser("ledger")   # 1.8.7（P0-D）：失败模式台账检查（只读）
     sub.add_parser("self-manifest")
     x = sub.add_parser("self-update"); x.add_argument("zip"); x.add_argument("--skip-test", action="store_true")
@@ -751,8 +752,12 @@ def main(argv=None):
             acts = sorted(ops.BRIDGE_ACTIONS)
             out({"actions": acts}) if args.json else print(" ".join(acts))
             return
-        if not args.log:
-            raise WfError("用法：wf bridge-check --log <日志>，或 wf bridge-check --list-actions")
+        if not args.log:   # 1.9.0：没给 --log 时读 transport.json 的 log（第 119 轮的命令因此失败，W90）
+            from wflib import anomaly as _an
+            lg = (_an.transport_cfg() or {}).get("log")
+            if not lg:
+                raise WfError("用法：wf bridge-check --log <日志>（transport.json 也没有配 log），或 wf bridge-check --list-actions")
+            args.log = str(Path(lg).expanduser())
         res = ops.bridge_check(Path(args.log), args.hours, args.grace_s)
         if args.json:
             out(res)
@@ -845,7 +850,12 @@ def main(argv=None):
     elif c == "task":
         from wflib import tasks
         inst = _p(args)
-        if args.action in ("cancel", "supersede"):   # 1.8.2（P0-B）：不再需要的待办如实关闭，不用 done 冒充
+        if args.action == "progress":   # 1.9.0（W88）：检查点，不关闭待办
+            if not args.tid:
+                raise WfError("用法：wf task progress <编号> --note \"做到哪一步、下一步、证据在哪\"")
+            t = tasks.progress(inst, args.tid, args.note)
+            print(f"已记下 {t['id']} 的检查点（共 {len(t['checkpoints'])} 个）；待办仍未关闭")
+        elif args.action in ("cancel", "supersede"):   # 1.8.2（P0-B）：不再需要的待办如实关闭，不用 done 冒充
             if not args.tid:
                 raise WfError(f"用法：wf task {args.action} <编号> --reason \"原因\""
                               + ("（可加 --by-task <取代它的待办编号>）" if args.action == "supersede" else ""))
@@ -872,6 +882,9 @@ def main(argv=None):
                     sym = {"done": "✓", "open": "○", "cancelled": "✗", "superseded": "↷"}[tasks.status_of(t)]   # 1.8.2
                     print(f"{sym} {t['id']}  {t['text']}" + (f"  —— {t['note']}" if t.get("note") else "")
                           + (f"  —— 已{tasks.STATUS_CN[tasks.status_of(t)]}：{t.get('reason')}" if t.get("reason") else ""))
+                    if t.get("checkpoints"):   # 1.9.0（W88）
+                        cp = t["checkpoints"][-1]
+                        print(f"      最近检查点 {str(cp.get('ts'))[:16]}：{str(cp.get('note'))[:120]}")
                 if not rows:
                     print("没有执行端待办")
     elif c == "watchdog":
@@ -1196,6 +1209,18 @@ def main(argv=None):
             if r["extra"]:
                 print("说明：wf 不会自动删除这些文件。按 docs/AUDIT.md 的结论处理：通道适配器移到工具目录之外，其余确认无用后删除。")
         sys.exit(0 if r.get("ok") else 1)
+    elif c == "live-check":
+        from wflib import live
+        r = live.check(_p(args), args.rounds)
+        if args.json:
+            out(r)
+        else:
+            for rd in r["rounds"]:
+                print(f"第 {rd['turn']} 轮：{'全部达标' if rd['ok'] else '不达标'}")
+                for cr in rd["criteria"]:
+                    print(f"  {'✓' if cr['ok'] else '✗'} {cr['n']}. {cr['why']}")
+            print(f"实景验收：连续达标 {r['streak']} 轮（需要 {r['need']} 轮）——" + ("通过" if r["passed"] else "未通过"))
+        sys.exit(0 if r["passed"] else 1)
     elif c == "ledger":
         from wflib import ledger
         r = ledger.check(_p(args))

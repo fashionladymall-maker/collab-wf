@@ -793,6 +793,101 @@ def _t_heartbeat_no_resend(_ok):
         all(x[2] and x[3] == "progress" and x[4] == "WAIT_REPLY" and x[5] == 1 for x in res), json.dumps(res, ensure_ascii=False))
 
 
+def _t_live_check(_ok):
+    from datetime import datetime, timedelta, timezone
+    from . import anomaly, live
+    from .core import LOCAL
+    orig = anomaly.transport_cfg
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, f"v190-l{os.getpid()}", {"state": "IDLE", "turn": 8})
+        base = datetime(2026, 10, 13, 6, 0, tzinfo=timezone.utc)
+        iso = lambda dt: dt.isoformat(timespec="seconds")
+        turns, events, alog, hist = [], [], [], []
+        for i, t in enumerate((5, 6, 7)):
+            t0 = base + timedelta(minutes=30 * i)
+            turns += [{"turn": t, "status": "sent", "from": "driver", "ts_sent": iso(t0)},
+                      {"turn": t, "status": "done", "ts_done": iso(t0 + timedelta(minutes=10))}]
+            events.append({"seq": i, "type": "reply_binding", "turn": t, "receipt": "ok", "deliveries": "ok", "by": "driver"})
+            alog += [{"action": "send", "turn": t, "ts": iso(t0), "project": a.name},
+                     {"action": "done", "turn": t, "ts": iso(t0 + timedelta(minutes=9)), "project": a.name}]
+            hist.append({"turn": t, "status": "pushed", "commit": "abc1234def"})
+            (a.evidence / f"turn-{t:03d}").mkdir(parents=True, exist_ok=True)
+            (a.evidence / f"turn-{t:03d}" / "intake.json").write_text("{}", encoding="utf-8")
+        zname = f"collab-wf-9.9.{os.getpid()}"
+        events.append({"seq": 9, "type": "exec", "turn": 7, "cmd": f"wf self-update --auto workflow/outbox/{zname}.zip", "by": "driver"})
+        (LOCAL / "reviews").mkdir(parents=True, exist_ok=True)
+        (LOCAL / "reviews" / f"{zname}.result.json").write_text(json.dumps({"verdict": "pass"}), encoding="utf-8")
+        (LOCAL / "sync").mkdir(parents=True, exist_ok=True)
+        hp = LOCAL / "sync" / f"{a.name}.history.jsonl"
+        hp.write_text("".join(json.dumps(h) + "\n" for h in hist), encoding="utf-8")
+        a.turns_path.write_text("".join(json.dumps(r) + "\n" for r in turns), encoding="utf-8")
+        a.events_path.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8")
+        lp = Path(td) / "bridge.jsonl"
+        lp.write_text("".join(json.dumps(x) + "\n" for x in alog), encoding="utf-8")
+        try:
+            anomaly.transport_cfg = lambda: {"log": str(lp)}
+            r1 = live.check(a, 3)
+            lp.write_text("".join(json.dumps(x) + "\n" for x in alog + [{"action": "send", "turn": 6, "ts": iso(base), "project": a.name}]),
+                          encoding="utf-8")
+            r2 = live.check(a, 3)
+            anomaly.transport_cfg = lambda: {}
+            r3 = live.check(a, 3)
+        finally:
+            anomaly.transport_cfg = orig
+            hp.unlink()
+    _ok("1.9.0 实景测量：三轮证据齐全且达标时通过；有一轮发了两次，连续计数从那一轮之后重来、不通过；没有适配器日志时如实判为无法核对",
+        r1["passed"] and r1["streak"] == 3 and not r2["passed"] and r2["streak"] == 1
+        and not r3["passed"] and any("无法核对" in c["why"] for rd in r3["rounds"] for c in rd["criteria"]),
+        json.dumps([r1["streak"], r2["streak"], r3["streak"], [c for rd in r2["rounds"] for c in rd["criteria"] if not c["ok"]]],
+                   ensure_ascii=False)[:700])
+
+
+def _t_task_progress(_ok):
+    from . import tasks
+    from .core import WfError
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v190-p", {"state": "VERIFY", "turn": 3})
+        tasks.add(a, 3, {"1": "长任务"})
+        t = tasks.progress(a, "T3-1", "做完第一步；下一步核对日志；证据在 outputs/x.txt")
+        empty = False
+        try:
+            tasks.progress(a, "T3-1", "")
+        except WfError:
+            empty = True
+        still_open = [x["id"] for x in tasks.open_items(a)] == ["T3-1"]
+    _ok("1.9.0 待办检查点：执行端被打断时可以留下检查点，待办仍保持未关闭；空检查点被拒绝",
+        len(t.get("checkpoints") or []) == 1 and empty and still_open, str([t.get("checkpoints"), empty, still_open]))
+
+
+def _t_send_code4(_ok):
+    from . import anomaly, driver
+    orig, calls = anomaly.call, []
+
+    def fake(op, args, timeout=None, env_extra=None):
+        calls.append(op)
+        if op == "send":
+            return {"code": 4, "raw": "超时", "data": {}}
+        return {"code": 0, "raw": "", "data": {"status": "done", "ref": "R"}}
+    try:
+        anomaly.call = fake
+        with tempfile.TemporaryDirectory() as td:
+            a = _inst(td, "v190-c4", {"state": "SEND", "turn": 2})
+            f = a.outbox / "turn-002.md"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+            a.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
+            a.save()
+            r1 = driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+            kept = (a.state.get("send_intent") or {}).get("status") == "pending"
+            a.state.pop("retry_at", None)
+            a.save()
+            r2 = driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+    finally:
+        anomaly.call = orig
+    _ok("1.9.0 发送暂时性错误：按结果不明保留意图、提示“再核对，不重发”，确认已送达就接上，只发一次",
+        kept and "不重发" in r1[1] and r2[0] == "progress" and calls.count("send") == 1, json.dumps([r1, r2, calls], ensure_ascii=False))
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
@@ -802,7 +897,8 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
          ("经验闭环", _t_ledger), ("回复与交付同源", _t_reply_source),
          ("回执核对", _t_receipt), ("交付核对", _t_delivery_check),
          ("共享仲裁", _t_arbiter), ("安装前审查必需", _t_review_gate),
-         ("心跳不重发", _t_heartbeat_no_resend)]
+         ("心跳不重发", _t_heartbeat_no_resend),
+         ("实景测量", _t_live_check), ("待办检查点", _t_task_progress), ("发送暂时性错误", _t_send_code4)]
 
 
 def run_v18(_ok) -> None:

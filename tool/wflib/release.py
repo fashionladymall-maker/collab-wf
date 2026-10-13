@@ -345,6 +345,20 @@ def _review_tool(src: Path, zip_path) -> tuple:
     return data["verdict"], "；".join(data.get("notes", [])[:5])
 
 
+def _record_review(zip_path, verdict, notes) -> None:
+    # 1.9.0（LIVE.md 判据 4）：这次自动安装在安装前拿到的审查结论，按版本包留一条；只记录，不改变处置
+    import hashlib
+    from .core import LOCAL, now_iso
+    try:
+        rd = LOCAL / "reviews"
+        rd.mkdir(parents=True, exist_ok=True)
+        write_json(rd / f"{Path(zip_path).stem}.result.json",
+                   {"ts": now_iso(), "verdict": verdict, "notes": str(notes)[:500],
+                    "zip_sha256": hashlib.sha256(Path(zip_path).read_bytes()).hexdigest()})
+    except OSError:
+        pass
+
+
 def _review_gate(verdict, notes) -> None:
     # 1.8.8（P1-L）：transport.json 写了 "review_required": true 时，审查没有结论（没配审查或审查不在场、超时）就不安装，
     # 而不是按“未审查”继续；结论为 pass 或 concerns 照常，block 照旧拒绝。默认不开启，行为与 1.8.7 相同。
@@ -402,6 +416,7 @@ def self_update(zip_path, skip_test=False, allow_same=False, auto=False) -> dict
                 raise WfError("候选版本没有通过底线行为检查，自动安装已拒绝：" + "；".join(probs[:5]))
             verdict, notes = _review_tool(src, zip_path)
             _review_gate(verdict, notes)   # 1.8.8（P1-L）
+            _record_review(zip_path, verdict, notes)   # 1.9.0（LIVE.md 判据 4）
             if verdict == "block":
                 raise WfError(f"另一个模型系列审查认为应阻止，自动安装已拒绝：{notes}")
         if not skip_test:

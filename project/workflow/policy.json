@@ -31,7 +31,25 @@
   "max_conversation_turns": 20,
   "send_unknown_wait": true,
   "max_leaf_refusals": 0,
-  "gates": [],
+  "gates": [
+    {
+      "name": "tool-files",
+      "cmd": "wf self-check",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "完全一致"
+        ]
+      }
+    },
+    {
+      "name": "probes",
+      "cmd": "wf self-check --probes",
+      "pass": {
+        "exit": 0
+      }
+    }
+  ],
   "landed_confirm_polls": 45,
   "landed_poll_s": 60,
   "landed_timeout_s": 2700,
