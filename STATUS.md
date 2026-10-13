@@ -30,7 +30,6 @@
 
 ## 待办
 - [executor] 确认目标 M2-U1：用户验收 M2
-- [executor] 执行端待办 T106-2：同步程序（P0-H 执行端侧）：接受 --repo；拿不到锁或跳过时返回非 0，且不输出提交号；缓存、锁、日志按项目、目标仓库、分支分开。改好后先做一次 wf sync --dry-run，再做一次真实推送，确认 local/sync/collab-wf-dev.json 里出现 pushed_commit。结果写进 wf task done
 - [executor] 执行端待办 T106-3：先运行 wf goals，核对 M2 目标是否已被自动批准。如果没有，按决策顺位审阅 goals.json 后，用 wf goals approve --by executor --reason 代批。再运行 wf self-check --probes，把它和 wf goals 的原文都写进 wf task done
 - [executor] 执行端待办 T108-1：1.8.2 装好后，写下独立审查结论的原文，并注明是安装前给出、超时未审查，还是迟到给出；运行 wf self-check --probes 并写下原文；用 wf task supersede T107-1 --reason "由 1.8.2 取代" --by-task T108-1 关闭上一轮那项待办。三份原文都写进 wf task done
 
