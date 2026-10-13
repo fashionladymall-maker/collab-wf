@@ -807,12 +807,17 @@ def _t_live_check(_ok):
             t0 = base + timedelta(minutes=30 * i)
             turns += [{"turn": t, "status": "sent", "from": "driver", "ts_sent": iso(t0)},
                       {"turn": t, "status": "done", "ts_done": iso(t0 + timedelta(minutes=10))}]
-            events.append({"seq": i, "type": "reply_binding", "turn": t, "receipt": "ok", "deliveries": "ok", "by": "driver"})
+            events += [{"seq": i, "type": "reply_binding", "turn": t, "receipt": "ok", "deliveries": "ok", "by": "driver"},
+                       {"seq": 20 + i, "type": "reply_checked", "turn": t, "by": "driver"},
+                       {"seq": 40 + i, "type": "round_result", "turn": t, "ok": True, "by": "driver"}]   # 1.9.1
             alog += [{"action": "send", "turn": t, "ts": iso(t0), "project": a.name},
                      {"action": "done", "turn": t, "ts": iso(t0 + timedelta(minutes=9)), "project": a.name}]
-            hist.append({"turn": t, "status": "pushed", "commit": "abc1234def"})
+            hist.append({"turn": t, "status": "pushed", "commit": "abc1234def", "ts": iso(t0 + timedelta(minutes=12))})
             (a.evidence / f"turn-{t:03d}").mkdir(parents=True, exist_ok=True)
-            (a.evidence / f"turn-{t:03d}" / "intake.json").write_text("{}", encoding="utf-8")
+            cm = [f"wf self-update --auto workflow/outbox/collab-wf-9.9.{os.getpid()}.zip"] if t == 7 else []
+            (a.evidence / f"turn-{t:03d}" / "intake.json").write_text(json.dumps({"commands": cm}), encoding="utf-8")
+            (a.evidence / f"turn-{t:03d}" / "reply_meta.json").write_text(
+                json.dumps({"ended_at": iso(t0 + timedelta(minutes=9))}), encoding="utf-8")
         zname = f"collab-wf-9.9.{os.getpid()}"
         events.append({"seq": 9, "type": "exec", "turn": 7, "cmd": f"wf self-update --auto workflow/outbox/{zname}.zip", "by": "driver"})
         (LOCAL / "reviews").mkdir(parents=True, exist_ok=True)
@@ -888,6 +893,21 @@ def _t_send_code4(_ok):
         kept and "不重发" in r1[1] and r2[0] == "progress" and calls.count("send") == 1, json.dumps([r1, r2, calls], ensure_ascii=False))
 
 
+def _t_task_markers(_ok):
+    from . import notify, tasks
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v191-m", {"state": "VERIFY", "turn": 4})
+        tasks.add(a, 4, {"1": "核对日志", "2": "（依赖 1）根据日志改参数", "3": "（不阻塞）连续 3 轮不做手工改动"})
+        ts = {t["id"]: t for t in a.state["executor_tasks"]}
+        block = [t["id"] for t in tasks.blocking_items(a)]
+        rows = {r["key"].split("|")[-1]: r for r in notify.collect_inbox([a])}
+    _ok("1.9.1 待办标记：（不阻塞）的待办不让驱动器等它、照样进 inbox；（依赖 M）写成明确的 depends_on 字段，inbox 原样带出",
+        ts["T4-2"].get("depends_on") == ["T4-1"] and ts["T4-2"]["text"] == "根据日志改参数" and ts["T4-3"].get("nonblocking")
+        and block == ["T4-1", "T4-2"] and rows.get("task:T4-2", {}).get("depends_on") == ["T4-1"]
+        and rows.get("task:T4-3", {}).get("nonblocking") is True,
+        json.dumps([ts, block, list(rows)], ensure_ascii=False)[:700])
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
@@ -898,7 +918,8 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
          ("回执核对", _t_receipt), ("交付核对", _t_delivery_check),
          ("共享仲裁", _t_arbiter), ("安装前审查必需", _t_review_gate),
          ("心跳不重发", _t_heartbeat_no_resend),
-         ("实景测量", _t_live_check), ("待办检查点", _t_task_progress), ("发送暂时性错误", _t_send_code4)]
+         ("实景测量", _t_live_check), ("待办检查点", _t_task_progress), ("发送暂时性错误", _t_send_code4),
+         ("待办标记", _t_task_markers)]
 
 
 def run_v18(_ok) -> None:

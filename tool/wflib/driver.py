@@ -336,7 +336,7 @@ def _wait_executor(ctx, until):
     """1.6.6：等执行端把待办做完；全部做完、或到了最迟时间，自动生成本轮回报。"""
     from . import tasks as _tasks
     inst, st = ctx.inst, ctx.st
-    left = _tasks.open_items(inst)
+    left = _tasks.blocking_items(inst)   # 1.9.1（W91）：不阻塞的待办不等
     if left and until and now() < until:
         return "wait", f"等执行端完成 {len(left)} 项待办：" + "；".join(f"{t['id']} {t['text'][:30]}" for t in left[:3])
     st.pop("await_executor", None)
@@ -882,14 +882,14 @@ LIMIT_STREAK_MAX = 3
 
 def _reply_meta(inst, data: dict) -> None:
     sr, cs = data.get("stop_reason"), data.get("completion_state")
-    if sr is None and cs is None:
+    if sr is None and cs is None and not data.get("ended_at"):
         inst.state.pop("reply_completion", None)   # 适配器没给：行为与 1.7.x 相同
         return
     if cs not in COMPLETION_STATES:
         cs = ("continuation_required" if sr in LIMIT_STOPS else "normal" if sr in ("end_turn", "stop_sequence")
               else "refused" if sr == "refusal" else "unknown")
     meta = {"turn": inst.state.get("turn"), "stop_reason": sr, "completion_state": cs,
-            "message_uuid": data.get("message_uuid"), "parent": data.get("parent"),
+            "message_uuid": data.get("message_uuid"), "parent": data.get("parent"), "ended_at": data.get("ended_at"),
             "conv": (inst.state.get("conv") or {}).get("conv"), "ts": now_iso()}
     inst.state["reply_completion"] = meta
     d = inst.turn_dir()
@@ -1496,7 +1496,7 @@ def h_verify(ctx):
     after = d.get("after") or "report"   # 1.6.7：执行端待办已在目标判定之前登记
     if round_failed or exec_failed:
         after = "report"
-    left = _tasks.open_items(inst)
+    left = _tasks.blocking_items(inst)   # 1.9.1（W91）
     if after in ("idle", "executor") and left:
         # 1.6.6（第 58 轮）：有执行端待办时不进空闲：等它们做完自动生成回报（此前要执行端记得 wf kick，漏了就停在空闲）
         lim = int(ctx.pol.get("executor_task_timeout_s", 0) or 0) or _tasks.TIMEOUT_S

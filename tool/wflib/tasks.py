@@ -27,6 +27,7 @@ def add(inst: Instance, turn: int, items: dict) -> list:
         if tid in have:
             continue
         t = {"id": tid, "turn": turn, "text": str(items[n])[:500], "since": now_iso(), "done": None, "note": ""}
+        _markers(t, turn)   # 1.9.1（W91）：（不阻塞）、（依赖 M）
         cur.append(t)
         added.append(t)
     done = [t for t in cur if status_of(t) != "open"]   # 1.8.2：已完成、已取消、已取代都算已关闭
@@ -131,3 +132,26 @@ def progress(inst: Instance, tid: str, note: str, by: str = "executor") -> dict:
         inst.save()
         return t
     raise WfError(f"没有这个待办：{tid}")
+
+
+def _markers(t: dict, turn: int) -> None:
+    # 1.9.1（W91）：待办正文开头可以写“（不阻塞）”与“（依赖 1、2）”。不阻塞的待办不让驱动器等它（持续性的义务不要写成
+    # 要等它做完的待办——第 120 轮的 T120-2 要等未来 3 轮才能完成，驱动器却等它关闭才发下一轮，互相卡死）；
+    # 依赖写成明确的字段 depends_on，唤醒程序据此判断先后，不再从说明文字里猜（第 121 轮执行端修过的误判）。
+    import re
+    txt = t["text"]
+    while True:
+        m = re.match(r"^\s*[（(]\s*(不阻塞|依赖\s*([0-9、,，\s]+))\s*[）)]\s*", txt)
+        if not m:
+            break
+        if m.group(1) == "不阻塞":
+            t["nonblocking"] = True
+        else:
+            t["depends_on"] = [f"T{turn}-{k}" for k in re.findall(r"\d+", m.group(2))]
+        txt = txt[m.end():]
+    t["text"] = txt
+
+
+def blocking_items(inst: Instance) -> list:
+    # 1.9.1（W91）：驱动器“等执行端”只等这些；不阻塞的待办照样进 inbox、照样要关闭，但不挡下一轮
+    return [t for t in open_items(inst) if not t.get("nonblocking")]

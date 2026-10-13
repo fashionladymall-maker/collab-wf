@@ -1,5 +1,13 @@
 # CHANGELOG（collab-wf）
 
+## 1.9.1 — 2026-10-13
+
+不阻塞的待办、明确的依赖、实景测量收紧（collab-wf-dev 第 121 轮；W91、W92）。
+- 待办可写“（不阻塞）”“（依赖 M）”：不阻塞的不让驱动器等；依赖写成 depends_on 字段，inbox 带出。
+- wf live-check 收紧：kick 等命令行触发算人工、要求 reply_checked、命令全部执行且本轮通过、用服务端结束时间、同步落在本轮时间窗。
+- 回复的 ended_at 记入 reply_meta；同步历史记下项目 HEAD。
+- 改了我在 1.9.0 写的实景测量自检（判据收紧，测试数据补齐相应记录）。DRIVER.md 第 42 节、TRANSPORT.md 附录 1.9.1。自检新增 1 项。本版不改 floor.py。
+
 ## 1.9.0 — 2026-10-13
 
 实景验收的测量（collab-wf-dev 第 119–120 轮；W87–W90，LIVE.md）。

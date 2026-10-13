@@ -108,6 +108,7 @@ def notices(inst: Instance) -> list:
     for t in (inst.state.get("executor_tasks") or []):   # 1.6.6：写给执行端的待办，做完前一直在 inbox 里
         if _task_status(t) == "open":   # 1.8.2：取消、被取代的不再出现
             out.append({"key": f"task:{t['id']}", "title": f"执行端待办 {t['id']}", "why": t.get("text") or "",
+                        "depends_on": t.get("depends_on") or None, "nonblocking": t.get("nonblocking") or None,
                         "action": f"做完后：wf task done {t['id']} --note \"结果\"；不再需要时：wf task cancel {t['id']} --reason \"原因\""})
     from .heartbeat import driver_health   # 1.5.6：驱动器停了要让用户知道（手写循环会静默退出）
     hb = driver_health(inst)

@@ -118,7 +118,8 @@ def collect_inbox(projects) -> list:
             rows = [{"key": f"{inst.name}|{it['code']}", "project": inst.name, "for": route(it), "title": it["title"],
                      "why": it["why"], "action": it["command"], "code": it["code"]} for it in asks.pending(inst)]
             rows += [{"key": f"{inst.name}|{n['key']}", "project": inst.name, "for": route(n), "title": n["title"],
-                      "why": n["why"], "action": n.get("action") or "", "code": ""} for n in asks.notices(inst)]
+                      "why": n["why"], "action": n.get("action") or "", "code": "",
+                      "depends_on": n.get("depends_on"), "nonblocking": n.get("nonblocking")} for n in asks.notices(inst)]
             for r in rows:   # 1.8.3（W70）：decision_owner＝谁来决定；delivery_owner＝投递给谁，一律是执行端（它转告用户）
                 r["decision_owner"], r["delivery_owner"] = r["for"], "executor"
         except Exception:   # noqa: BLE001  某个项目读不出来，不影响其他项目

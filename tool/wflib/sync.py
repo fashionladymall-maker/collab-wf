@@ -343,7 +343,8 @@ def run(inst, dry_run=False, force=False) -> dict:
             from .core import append_jsonl
             append_jsonl(SYNC_DIR / f"{inst.name}.history.jsonl",
                          {"ts": res["ts"], "turn": inst.state.get("turn"), "status": res["status"],
-                          "commit": res.get("commit") or "", "digest": res.get("digest")})
+                          "commit": res.get("commit") or "", "digest": res.get("digest"),
+                          "head": (git(inst.root, "rev-parse", "HEAD")[1] or "").strip()[:40] if (inst.root / ".git").exists() else ""})
         except OSError:
             pass
     res["names"] = sorted(files)   # 1.8.2：这次（或与上次推送相同的）文件清单，只返回、不写进记录；短消息只链接其中的文件
