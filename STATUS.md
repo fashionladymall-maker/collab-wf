@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 108 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 109 轮 · 阻塞（BLOCKED）
 
 ## 版本
 - 工具：collab-wf 1.8.2
@@ -29,9 +29,8 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
+- [executor] 流程阻塞，需要人处理：[SEND_REJECTED] 通道明确拒绝了消息（非暂时性）。需要人工查看。 {"reason": "消息文件不存在：None"}
 - [executor] 确认目标 M2-U1：用户验收 M2
-- [executor] 执行端待办 T106-3：先运行 wf goals，核对 M2 目标是否已被自动批准。如果没有，按决策顺位审阅 goals.json 后，用 wf goals approve --by executor --reason 代批。再运行 wf self-check --probes，把它和 wf goals 的原文都写进 wf task done
-- [executor] 执行端待办 T108-1：1.8.2 装好后，写下独立审查结论的原文，并注明是安装前给出、超时未审查，还是迟到给出；运行 wf self-check --probes 并写下原文；用 wf task supersede T107-1 --reason "由 1.8.2 取代" --by-task T108-1 关闭上一轮那项待办。三份原文都写进 wf task done
 
 ## 最新产物
 - `artifacts/collab-wf-1.8.2.zip`
