@@ -32,7 +32,6 @@
 ## 待办
 - [executor] 执行端待办 T122-2：1.9.2 装上后，运行 wf live-check --rounds 3（预期仍未通过；它现在按事件身份判人工，并要求父子 uuid、ended_at、project 字段），记下原文；再写明适配器的 message_uuid、parent、ended_at、project 字段，以及审查结论复用、按 depends_on 唤醒这几项，各自做到哪一步。结果写进 wf task done
 - [executor] 执行端待办 T123-2：只读核实两件事：一是构建过程中用户的 Mac 是否还弹出了系统通知；二是 16:59 那条 auto2 通知完整的出错原文，确认它来自自检的临时项目，与正式项目无关。再写明适配器的 message_uuid、parent、ended_at、project 字段，以及按 depends_on 唤醒、批量投递这几项各自做到哪一步，做不到的写明阻塞原因。结果写进 wf task done
-- [executor] 独立审查 collab-wf-1.9.3.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/collab-wf.tool.collab-wf-1.9.3.request.json
 
 ## 最新产物
 - `artifacts/collab-wf-1.9.3.zip`
