@@ -71,12 +71,27 @@ def _linger_due(st: dict, ctx):
     return wait if wait + 15 <= ctx.time_left() else None
 
 
+def _other_driver_alive(inf: dict) -> bool:
+    # 进程还在、命令行里有 wf，且登记不超过 1 小时（防进程号被复用、防崩溃留下的旧登记永远挡住）
+    if (secs_since(inf.get("started")) or 0) > 3600:
+        return False
+    try:
+        os.kill(int(inf["pid"]), 0)
+    except (ProcessLookupError, PermissionError, ValueError, TypeError, KeyError):
+        return False
+    r = subprocess.run(["ps", "-p", str(inf["pid"]), "-o", "command="], capture_output=True, text=True)
+    return "wf" in r.stdout
+
+
 def _run_locked(inst, max_seconds, max_steps, linger=False):
     # transport.json 中的环境变量对驱动器自身也生效（例如本机删除守卫的状态目录，F16）：落地版本在本进程内删除文件
     os.environ.update({k: str(v) for k, v in (anomaly.transport_cfg().get("env") or {}).items()})
     st = inst.state
     drv = st.setdefault("driver", {})
     prev = drv.get("inflight")
+    if prev and prev.get("pid") and prev.get("pid") != os.getpid() and _other_driver_alive(prev):
+        # 1.8.5（W82）：项目锁在 local/ 里；两个驱动器用了不同的 local/（WF_LOCAL_DIR）时锁拦不住，用项目状态里的进程号再拦一次
+        return 10, {"note": f"另一个驱动器（PID {prev['pid']}）正在推进这个项目，本次跳过（W82）", "did": [], "explain": explain(inst)}
     if prev and prev.get("pid") != os.getpid():
         inst.event("driver_interrupted", note=f"上一次驱动（PID {prev.get('pid')}，{prev.get('started')}）未正常结束，已从记录处接续",
                    by="driver")
@@ -201,6 +216,10 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
     act = r["action"]
     if r.get("max") and n > r["max"]:
         act = r.get("then", "block")
+    if r["id"] == "SEND_UNKNOWN_WAIT":   # 1.8.5（W66）：按墙钟等满 send_unknown_window_s（默认 1 小时），不按次数
+        it = st.get("send_intent") or {}
+        since = secs_since(it.get("ts")) if it.get("ts") else None
+        act = "retry" if since is None or since < int(ctx.pol.get("send_unknown_window_s", 3600) or 3600) else r.get("then", "block")
     streak_block = act == "continue" and int(st.get("continue_streak", 0)) >= 3
     if streak_block:   # 1.7.6：续接连续 3 轮仍缺固定块就停下等人看，不再空耗额度（amy-local 第 7–11 轮）
         act = "block"
@@ -212,6 +231,8 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
     if act == "retry":
         b = r.get("backoff_s", [60])
         delay = b[min(n - 1, len(b) - 1)]
+        if r["id"] == "SEND_UNKNOWN_WAIT":   # 1.8.5（W66）：确认间隔有上限（默认 120 秒），回复结束后最迟这么久就被发现
+            delay = min(delay, int(ctx.pol.get("send_unknown_poll_s", 120) or 120))
         st["retry_at"] = (now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
         inst.save()
         return "wait", f"[{r['id']}] {why} {delay} 秒后重试（第 {n} 次）"
@@ -581,10 +602,13 @@ def h_send(ctx):
         status = r["data"].get("status")
         if r["code"] == 0 and status in ("generating", "done"):
             intent.update(status="accepted", ref=r["data"].get("ref") or intent.get("ref"))
-            return _finalize_send(ctx, out, "发送曾被中断，经轮询确认消息已被接受")
+            return _finalize_send(ctx, out, "发送曾被中断，经轮询确认消息已被接受", immediate=(status == "done"))
         # 1.5.1：policy 的 send_unknown_wait 为真时先自动等待并反复确认（长回复可达半小时以上），绝不自动重发
         return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
                         f"发送意图 {intent.get('ts')} 结果不明；轮询返回 {status or r['raw'][:120]}")
+    if not out.get("file"):   # 1.8.5（W81）：状态在“发送”却没有待发消息（第 109 轮），不调用适配器，安全停下并说明
+        return _anomaly(ctx, {"source": "driver", "kind": "outgoing_missing"},
+                        "状态在“发送”，但没有待发消息（outgoing 为空），没有调用适配器。处置：wf unblock --to COMPOSE 重新组织本轮消息")
     rate = anomaly.transport_cfg().get("rate") or {}
     if rate.get("max_sends"):
         win = int(rate.get("window_s", 600))
@@ -642,7 +666,7 @@ def _adapter_warning(inst, op, r) -> None:
     inst.event("auto", rule="ADAPTER_WARNING", action="report", detail=f"{op}：{str(w)[:200]}", by="driver")
 
 
-def _finalize_send(ctx, out, note):
+def _finalize_send(ctx, out, note, immediate=False):
     inst, st = ctx.inst, ctx.st
     model = out.get("model") or anomaly.transport_cfg().get("model")
     append_jsonl(LOCAL / "send_log.jsonl", {"ts": now_iso(), "project": inst.name, "turn": st["turn"]})
@@ -656,7 +680,8 @@ def _finalize_send(ctx, out, note):
     st["last_sent"] = {"turn": st["turn"], "file": out.get("file"), "kind": out.get("kind"), "effort": out.get("effort")}
     st["send_intent"] = None
     st["outgoing"] = None
-    st["poll_after"] = (now() + timedelta(seconds=int(ctx.pol.get("first_poll_after_s", 60)))).isoformat(timespec="seconds")
+    # 1.8.5（W66）：确认送达时回复已经结束（done），立即去取，不再等 first_poll_after_s
+    st["poll_after"] = (now() + timedelta(seconds=0 if immediate else int(ctx.pol.get("first_poll_after_s", 60)))).isoformat(timespec="seconds")
     inst.save()
     return "progress", note
 

@@ -355,7 +355,7 @@ def _hold_update_lock() -> None:
     from .core import LOCAL
     if _UPDATE_LOCK:
         return
-    lp = LOCAL / "locks" / "self-update.lock"
+    lp = WF_HOME / "local" / "locks" / "self-update.lock"   # 1.8.5（W82）：放在工具目录里，不随 WF_LOCAL_DIR 变
     lp.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lp, "a+")
     try:

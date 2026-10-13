@@ -522,7 +522,7 @@ def _t_update_mutex(_ok):
     import fcntl
     from . import release
     from .core import LOCAL, WfError
-    lp = LOCAL / "locks" / "self-update.lock"
+    lp = WF_HOME / "local" / "locks" / "self-update.lock"   # 1.8.5：锁改放在工具目录里
     lp.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lp, "a+")
     msg = ""
@@ -537,11 +537,92 @@ def _t_update_mutex(_ok):
     _ok("1.8.4 安装互斥：已有一个 self-update 在进行时，第二个立即失败、不排队、不安装", "另一个" in msg, msg)
 
 
+def _t_reply_latency(_ok):
+    from datetime import datetime, timedelta, timezone
+    from . import anomaly, driver
+    from .core import parse_iso
+    orig = anomaly.call
+    res = {}
+
+    def fake(op, args, timeout=None, env_extra=None):
+        return {"code": 0, "raw": "", "data": dict(fake.data)} if op == "poll" else {"code": 0, "raw": "", "data": {}}
+    pol = {"send_unknown_wait": True, "send_unknown_poll_s": 60, "first_poll_after_s": 120}
+    try:
+        anomaly.call = fake
+        with tempfile.TemporaryDirectory() as td:
+            def mk(name, age_s):
+                ts = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat(timespec="seconds")
+                a = _inst(td, name, {"state": "SEND", "turn": 3, "send_intent": {"turn": 3, "status": "pending", "ts": ts}})
+                f = a.outbox / "turn-003.md"
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("【回报 · 第 3 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+                a.state["outgoing"] = {"turn": 3, "file": str(f), "kind": "report", "effort": "high"}
+                a.save()
+                return a
+            fake.data = {"status": "none"}
+            a = mk("v185-a", 200)
+            r1 = driver.h_send(driver.Ctx(a, pol, time.time() + 60))
+            ra = parse_iso(a.state.get("retry_at"))
+            res["gap"] = (ra - datetime.now(timezone.utc)).total_seconds() if ra else None
+            b = mk("v185-b", 4000)
+            driver.h_send(driver.Ctx(b, pol, time.time() + 60))
+            res["late"] = b.state.get("state")
+            fake.data = {"status": "done", "ref": "R3"}
+            c = mk("v185-c", 300)
+            r3 = driver.h_send(driver.Ctx(c, pol, time.time() + 60))
+            pa = parse_iso(c.state.get("poll_after"))
+            res["pickup"] = (pa - datetime.now(timezone.utc)).total_seconds() if pa else None
+            res["c_state"] = c.state.get("state")
+    finally:
+        anomaly.call = orig
+    _ok("1.8.5 回复发现延迟有界：发送结果不明时确认间隔不超过 send_unknown_poll_s、按墙钟等满窗口才阻塞；"
+        "确认时回复已结束就立即去取，不再等 first_poll_after_s",
+        r1[0] == "wait" and res["gap"] is not None and res["gap"] <= 61 and res["late"] == "BLOCKED"
+        and r3[0] == "progress" and res["c_state"] == "WAIT_REPLY" and res["pickup"] is not None and res["pickup"] <= 1,
+        json.dumps([r1, r3, res], ensure_ascii=False, default=str)[:700])
+
+
+def _t_outgoing_missing(_ok):
+    from . import anomaly, driver
+    orig, calls = anomaly.call, []
+
+    def fake(op, args, timeout=None, env_extra=None):
+        calls.append(op)
+        return {"code": 0, "raw": "", "data": {}}
+    try:
+        anomaly.call = fake
+        with tempfile.TemporaryDirectory() as td:
+            a = _inst(td, "v185-o", {"state": "SEND", "turn": 9, "outgoing": None})
+            r = driver.h_send(driver.Ctx(a, {}, time.time() + 60))
+            stt = a.state.get("state")
+    finally:
+        anomaly.call = orig
+    _ok("1.8.5 待发消息核对：状态在“发送”却没有待发消息时，不调用适配器，安全停下并说明",
+        "send" not in calls and r[0] == "user" and stt in ("BLOCKED", "AWAITING_USER"), json.dumps([r, calls, stt], ensure_ascii=False))
+
+
+def _t_single_driver(_ok):
+    from datetime import datetime, timezone
+    from . import driver
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "wf.py"])
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            a = _inst(td, "v185-d", {"state": "IDLE", "turn": 1,
+                                     "driver": {"inflight": {"pid": p.pid, "started": datetime.now(timezone.utc).isoformat()}}})
+            code, info = driver.run(a, max_seconds=5)
+    finally:
+        p.kill()
+        p.wait()
+    _ok("1.8.5 驱动器单实例：项目状态里登记的另一个驱动器还在运行时，本次跳过（即使两边的 local/ 不同）",
+        code == 10 and "另一个驱动器" in str(info.get("note")), json.dumps([code, info.get("note")], ensure_ascii=False))
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
          ("人工目标前置", _t_manual_prereq), ("决定与投递分开", _t_owner_split), ("产物挑选", _t_artifacts_pick),
-         ("计划过时", _t_plan_stale), ("手工执行防重", _t_exec_guard), ("安装互斥", _t_update_mutex)]
+         ("计划过时", _t_plan_stale), ("手工执行防重", _t_exec_guard), ("安装互斥", _t_update_mutex),
+         ("回复发现延迟", _t_reply_latency), ("待发消息核对", _t_outgoing_missing), ("驱动器单实例", _t_single_driver)]
 
 
 def run_v18(_ok) -> None:
