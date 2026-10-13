@@ -698,6 +698,64 @@ def _t_delivery_check(_ok):
         r[0] == "" and "不符" in r[1] and "没有送达" in r[2] and "没有写在交付行里" in r[2], json.dumps(r, ensure_ascii=False))
 
 
+def _t_arbiter(_ok):
+    from . import anomaly, arbiter, driver
+    from .core import Instance, LOCAL
+    shared = LOCAL / "shared"
+    for n in ("arbiter.json", "arbiter.jsonl"):
+        if (shared / n).exists():
+            (shared / n).unlink()
+    orig, calls = anomaly.call, []
+    with tempfile.TemporaryDirectory() as td:
+        a, b, c = (_inst(td, f"v188-{x}", {"state": "SEND", "turn": 1}) for x in "abc")
+        g1, g2, g3 = arbiter.acquire(a, 1), arbiter.acquire(b, 1), arbiter.acquire(c, 1)
+        arbiter.release(a, "测试")
+        g4, g5 = arbiter.acquire(c, 1), arbiter.acquire(b, 1)
+        bb = Instance(b.root)
+        bb.state["state"] = "IDLE"
+        bb.save()
+        g6 = arbiter.acquire(c, 1)
+        log = (shared / "arbiter.jsonl").read_text(encoding="utf-8")
+        d = _inst(td, "v188-d", {"state": "SEND", "turn": 2})
+        f = d.outbox / "turn-002.md"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+        d.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
+        d.save()
+        try:
+            anomaly.call = lambda op, args, timeout=None, env_extra=None: calls.append(op) or {"code": 0, "raw": "", "data": {}}
+            r = driver.h_send(driver.Ctx(d, {"shared_max_inflight": 1}, time.time() + 60))
+        finally:
+            anomaly.call = orig
+    ok = (g1["granted"] and not g2["granted"] and g2["position"] == 1 and not g3["granted"] and g3["position"] == 2
+          and not g4["granted"] and g5["granted"] and g6["granted"]
+          and all(f'"event": "{e}"' in log for e in ("wait", "grant", "release", "reclaim"))
+          and r[0] == "wait" and "send" not in calls)
+    _ok("1.8.8 共享仲裁（S4）：同一账号的发送槽先到先得；释放后队首先拿到，后来的不能插队；持有方已不在发送或等回复时被回收；"
+        "wait、grant、release、reclaim 都留痕；槽被占用时 h_send 不调用适配器",
+        ok, json.dumps([g1, g2, g3, g4, g5, g6, r, calls], ensure_ascii=False)[:800])
+
+
+def _t_review_gate(_ok):
+    from . import anomaly, release
+    from .core import WfError
+    orig = anomaly.transport_cfg
+    res = []
+    try:
+        for cfg, verdict in (({"review_required": True}, "unavailable"), ({"review_required": True}, "none"),
+                             ({"review_required": True}, "pass"), ({}, "unavailable")):
+            anomaly.transport_cfg = lambda c=cfg: c
+            try:
+                release._review_gate(verdict, "测试")
+                res.append("ok")
+            except WfError:
+                res.append("refused")
+    finally:
+        anomaly.transport_cfg = orig
+    _ok("1.8.8 安装前审查必需（开关）：开启后，没有审查结论（不在场、超时、没配）就不安装；有结论照常；不开启时行为不变",
+        res == ["refused", "refused", "ok", "ok"], str(res))
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
@@ -705,7 +763,8 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
          ("计划过时", _t_plan_stale), ("手工执行防重", _t_exec_guard), ("安装互斥", _t_update_mutex),
          ("回复发现延迟", _t_reply_latency), ("待发消息核对", _t_outgoing_missing), ("驱动器单实例", _t_single_driver),
          ("经验闭环", _t_ledger), ("回复与交付同源", _t_reply_source),
-         ("回执核对", _t_receipt), ("交付核对", _t_delivery_check)]
+         ("回执核对", _t_receipt), ("交付核对", _t_delivery_check),
+         ("共享仲裁", _t_arbiter), ("安装前审查必需", _t_review_gate)]
 
 
 def run_v18(_ok) -> None:

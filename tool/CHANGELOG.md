@@ -1,5 +1,12 @@
 # CHANGELOG（collab-wf）
 
+## 1.8.8 — 2026-10-13
+
+共享发送槽仲裁（S4）、安装前审查必需（collab-wf-dev 第 117 轮；P0-G 的 M2-G1、P1-L）。
+- policy 的 shared_max_inflight 大于 0 时，同一账号的发送先到先得、可回收、全程留痕（wf/arbiter）；默认 0，行为不变。
+- transport.json 的 review_required 为 true 时，审查没有结论就不安装；默认不开启。
+- DRIVER.md 第 39 节、TRANSPORT.md 附录 1.8.8。自检新增 2 项；原有检查没有删改。本版不改 floor.py。
+
 ## 1.8.7 — 2026-10-13
 
 经验闭环检查、回复与交付同源（collab-wf-dev 第 113–116 轮；P0-D 的 M2-D1、W83）。

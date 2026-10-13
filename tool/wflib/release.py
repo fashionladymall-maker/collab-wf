@@ -345,6 +345,16 @@ def _review_tool(src: Path, zip_path) -> tuple:
     return data["verdict"], "；".join(data.get("notes", [])[:5])
 
 
+def _review_gate(verdict, notes) -> None:
+    # 1.8.8（P1-L）：transport.json 写了 "review_required": true 时，审查没有结论（没配审查或审查不在场、超时）就不安装，
+    # 而不是按“未审查”继续；结论为 pass 或 concerns 照常，block 照旧拒绝。默认不开启，行为与 1.8.7 相同。
+    if verdict in ("none", "unavailable"):
+        from . import anomaly as _an
+        if (_an.transport_cfg() or {}).get("review_required"):
+            raise WfError(f"transport.json 要求安装前审查（review_required），本次没有审查结论（{verdict}：{notes}），不安装；"
+                          "审查到场后重跑 wf self-update --auto")
+
+
 _UPDATE_LOCK = []
 
 
@@ -391,6 +401,7 @@ def self_update(zip_path, skip_test=False, allow_same=False, auto=False) -> dict
             if probs:
                 raise WfError("候选版本没有通过底线行为检查，自动安装已拒绝：" + "；".join(probs[:5]))
             verdict, notes = _review_tool(src, zip_path)
+            _review_gate(verdict, notes)   # 1.8.8（P1-L）
             if verdict == "block":
                 raise WfError(f"另一个模型系列审查认为应阻止，自动安装已拒绝：{notes}")
         if not skip_test:

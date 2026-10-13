@@ -642,6 +642,14 @@ def h_send(ctx):
             inst.save()
             decide(inst, "rate", f"推迟发送到 {st['retry_at']}", f"{win} 秒内已发送 {len(recent)} 条（上限 {rate['max_sends']}）")
             return "wait", f"全局限速：{win} 秒内已发送 {len(recent)} 条，推迟到 {st['retry_at']}"
+    mx = int(ctx.pol.get("shared_max_inflight", 0) or 0)
+    if mx > 0:   # 1.8.8（P0-G，ISOLATION.md S4）：同一账号的发送槽，先到先得；拿不到不算失败，30 秒后再看
+        from . import arbiter
+        g = arbiter.acquire(inst, mx, int(ctx.pol.get("shared_lease_s", 3600) or 3600))
+        if not g["granted"]:
+            st["retry_at"] = (now() + timedelta(seconds=30)).isoformat(timespec="seconds")
+            inst.save()
+            return "wait", f"共享发送槽被占用（{g['holder']}），本项目排第 {g['position']} 位，30 秒后再看"
     st["send_intent"] = {"turn": turn, "status": "pending", "ts": now_iso(), "file": out.get("file")}
     inst.save()
     _quota(inst)
@@ -666,6 +674,8 @@ def h_send(ctx):
         return _finalize_send(ctx, out, "通道已接受")
     if code != 4:  # 4 = 暂时性错误或超时：结果可能不明，保留意图留待下次轮询确认
         st["send_intent"] = None
+        from . import arbiter
+        arbiter.release(inst, "send_failed")   # 1.8.8（P0-G）
     inst.save()
     facts = {"source": "transport", "op": "send", "code": code, "resets_at": r["data"].get("resets_at"),
              "kind": r.get("kind"), "text": r["raw"]}
@@ -823,6 +833,8 @@ def h_wait_reply(ctx):
         inst.save()
         _quota(inst)
         ops.mark_replied(inst, rf, r["data"].get("tools"), by="driver")
+        from . import arbiter
+        arbiter.release(inst, "reply_landed")   # 1.8.8（P0-G）：回复落地，释放共享发送槽
         return "progress", f"收到回复（交付文件 {len(st['delivered'])} 个）"
     if status == "refused":
         # 叶子被通道的安全防护拒绝，无法从它继续：回退到上一条健康消息，重新组织并重发本轮消息（§10）

@@ -163,3 +163,7 @@ poll 返回 status=done 时，可以同时给出：
 ## 附：1.8.7 poll 的交付来源（可选，强烈建议提供）
 
 poll 返回 status=done 时，除 message_uuid 外再给出 files_message_uuid：本次下载的交付文件所属那条回复的标识。两者不同时，wf 不收下这次回复、安全停下（第 113 轮：同一轮发了 3 次、对话分叉，比对用了另一条回复的正文）。下载的文件要落到本轮的 --out 目录（第 111 轮的 W80）。
+
+## 附：1.8.8 review_required（可选）
+
+transport.json 写 `"review_required": true`：自动安装工具版本时，审查没有结论（没配审查程序、执行端不在场、超时）就不安装（DRIVER.md 第 39 节）。适合执行端能保证审查在 review_timeout_s 内到场时开启。
