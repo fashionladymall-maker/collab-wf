@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 114 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 115 轮 · 落地版本（APPLY）
 
 ## 版本
 - 工具：collab-wf 1.8.5
@@ -9,8 +9,8 @@
 
 ## 最近一轮
 - 第 114 轮验收通过（2026-10-13T02:28:17+00:00）
-- 本方最新消息：`turns/turn-114.md`
-- Claude 最新回复：`replies/reply-114.md`
+- 本方最新消息：`turns/turn-115.md`
+- Claude 最新回复：`replies/reply-115.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -29,9 +29,8 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T114-1：只读核对 W83，不改状态。
-- [executor] 执行端待办 T114-3：1.8.5 装好、驱动器跑完目标检查后，做三件事：
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.8.5.zip`
-- `artifacts/collab-wf-dev-v3.6.zip`
+- `artifacts/collab-wf-dev-v3.7.zip`
