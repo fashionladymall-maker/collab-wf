@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 112 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 113 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.8.4
@@ -9,7 +9,7 @@
 
 ## 最近一轮
 - 第 112 轮验收通过（2026-10-13T01:35:05+00:00）
-- 本方最新消息：`turns/turn-112.md`
+- 本方最新消息：`turns/turn-113.md`
 - Claude 最新回复：`replies/reply-112.md`
 
 ## 目标
@@ -29,8 +29,8 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T112-3：只读核对第 111 轮的交付丢失（W80）。列出 workflow/evidence/turn-111/delivered/ 里的文件名、字节数与 sha256；写出适配器那一轮取回回复和下载附件的结果原文（只写中立的结果字段，不写接口细节），以及当时回复里列了几个交付文件；再写明第 112 轮收到了几条内容相同的回报、分别对应哪两次发送。结果写进 wf task done
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.8.4.zip`
-- `artifacts/collab-wf-dev-v3.5.zip`
+- `artifacts/collab-wf-dev-v3.6.zip`
