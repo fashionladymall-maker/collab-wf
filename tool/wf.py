@@ -412,8 +412,9 @@ def main(argv=None):
                                                                                  choices=["executor", "user"])
     x.add_argument("--action-text", dest="action_text", default=""); x.add_argument("--ttl", type=int, default=0)
     x = sub.add_parser("watchdog"); x.add_argument("--write", action="store_true")
-    x = sub.add_parser("task"); x.add_argument("action", nargs="?", default="list", choices=["list", "done"])
+    x = sub.add_parser("task"); x.add_argument("action", nargs="?", default="list", choices=["list", "done", "cancel", "supersede"])
     x.add_argument("tid", nargs="?"); x.add_argument("--note", default="")
+    x.add_argument("--reason", default=""); x.add_argument("--by-task", dest="by_task", default="")   # 1.8.2
     x = sub.add_parser("transport"); x.add_argument("action", nargs="?", default="check", choices=["check", "test"])
     sub.add_parser("effort")
     x = sub.add_parser("decisions"); x.add_argument("--n", type=int, default=40); x.add_argument("--turn", type=int)
@@ -423,7 +424,7 @@ def main(argv=None):
     x = sub.add_parser("schedule"); x.add_argument("action", choices=["plist", "status", "release"])
     x.add_argument("--interval", type=int, default=300); x.add_argument("--max-seconds", type=int, default=540)
     sub.add_parser("self-init")
-    sub.add_parser("self-check")
+    x = sub.add_parser("self-check"); x.add_argument("--probes", action="store_true")   # 1.8.2：本机行为探针
     sub.add_parser("self-manifest")
     x = sub.add_parser("self-update"); x.add_argument("zip"); x.add_argument("--skip-test", action="store_true")
     x.add_argument("--auto", action="store_true")   # 1.5.8：驱动器自动安装；改动护栏文件的版本会被拒绝（DRIVER.md 第 18 节）
@@ -693,6 +694,10 @@ def main(argv=None):
         r = bootstrap(_p(args), args.reason)
         print(f"说明消息：{r['message']}（{r['chars']} 字符）\n项目 zip：{r['zip']}\n工具 zip：{r['tool_zip']}\n"
               "在新对话中上传这两个 zip 并发送说明消息（档位 max）；桥接工具指向新对话后运行 wf conv new --note …")
+        if r.get("short"):   # 1.8.2：写明用了哪条交接路线（WORKFLOW.md 第 10 节）
+            print(f"短消息（路线 G，链接钉在同步提交上）：{r['short']}——开新对话时只发这一条")
+        elif r.get("short_why"):
+            print(f"没有生成短消息（路线 G 不可用：{r['short_why']}）：按路线 Z 发长消息")
     elif c == "doctor":
         from wflib.admin import doctor
         try:
@@ -839,7 +844,16 @@ def main(argv=None):
     elif c == "task":
         from wflib import tasks
         inst = _p(args)
-        if args.action == "done":
+        if args.action in ("cancel", "supersede"):   # 1.8.2（P0-B）：不再需要的待办如实关闭，不用 done 冒充
+            if not args.tid:
+                raise WfError(f"用法：wf task {args.action} <编号> --reason \"原因\""
+                              + ("（可加 --by-task <取代它的待办编号>）" if args.action == "supersede" else ""))
+            t = tasks.close(inst, args.tid, "cancelled" if args.action == "cancel" else "superseded", args.reason,
+                            by_task=args.by_task)
+            left = tasks.open_items(inst)
+            print(f"已{tasks.STATUS_CN[t['status']]} {t['id']}（{t['reason']}）；"
+                  + (f"还有 {len(left)} 项未完成" if left else "没有未完成的待办"))
+        elif args.action == "done":
             if not args.tid:
                 raise WfError("用法：wf task done <编号> --note \"结果\"（wf task 列出未完成的待办）")
             t = tasks.done(inst, args.tid, args.note)
@@ -854,7 +868,9 @@ def main(argv=None):
                 out({"tasks": rows})
             else:
                 for t in rows:
-                    print(f"{'✓' if t.get('done') else '○'} {t['id']}  {t['text']}" + (f"  —— {t['note']}" if t.get("note") else ""))
+                    sym = {"done": "✓", "open": "○", "cancelled": "✗", "superseded": "↷"}[tasks.status_of(t)]   # 1.8.2
+                    print(f"{sym} {t['id']}  {t['text']}" + (f"  —— {t['note']}" if t.get("note") else "")
+                          + (f"  —— 已{tasks.STATUS_CN[tasks.status_of(t)]}：{t.get('reason')}" if t.get("reason") else ""))
                 if not rows:
                     print("没有执行端待办")
     elif c == "watchdog":
@@ -905,6 +921,9 @@ def main(argv=None):
         st = inst.state
         if st["state"] != "AWAITING_USER":
             raise WfError(f"当前是 {st['state']}，没有等待用户决定的事项。")
+        if st.get("await_rule") == "NO_REF" and not st.get("send_ref"):   # 1.8.2（P0-E）：此前批准后回到等待、又停在 NO_REF，反复循环
+            raise WfError("本轮没有登记 ref，批准解决不了（批准后只会再次停在 NO_REF）。二选一：补登记 wf mark sent --ref <适配器返回的 ref>"
+                          "（回到等待回复，由驱动器接管轮询）；或整轮手动收尾 wf mark replied --reply-file <回复全文>。见 DRIVER.md 第 34 节")
         it = asks.verify(inst, "approve", args.code)
         note, by = _decide_as(inst, "approve", it, args)
         if st.get("return_to") == "REVIEW":
@@ -934,7 +953,7 @@ def main(argv=None):
               + (f"；{r['detail']}" if r.get("detail") else ""))
         for s in r.get("secrets", []):
             print("  疑似密钥：" + s)
-        sys.exit(1 if r["status"] in ("blocked", "failed") else 0)
+        sys.exit(1 if r["status"] in ("blocked", "failed", "unconfirmed") else 0)   # 1.8.2：没有提交号不算成功
     elif c == "said":
         from wflib import page
         page.record_user(_p(args), args.text, kind=args.kind)
@@ -1032,12 +1051,15 @@ def main(argv=None):
             elif not prog["defined"]:
                 print("没有定义目标（workflow/goals.json）")
             else:
+                print(goals.phase_title(prog))   # 1.8.2：先说当前是哪个阶段的目标
                 print(f"目标进度 {prog['done']} / {prog['total']}" + ("" if prog["approved"] else
                       ("（目标在批准后被改动，需重新批准）" if prog.get("changed_since_approval") else "（目标尚未批准，不生效）")))
                 for i in prog["items"]:
                     print(f"  {'✓' if i['ok'] else '○'} {i['id']} [{'可执行' if i['kind'] == 'exec' else '人工'}] {i['title']}：{i['detail']}")
                 for x in prog.get("issues", []):
                     print(f"  ! {x}")
+                for h in goals.history_lines(prog):
+                    print(f"  {h}")
     elif c == "policy":
         from wflib import policy
         inst = _p(args)
@@ -1154,6 +1176,9 @@ def main(argv=None):
         print(f"环境变量：{', '.join((cfg.get('env') or {}).keys()) or '无'}；模型：{cfg.get('model') or '未设置'}")
         sys.exit(1 if bad else 0)
     elif c == "self-check":
+        if getattr(args, "probes", False):   # 1.8.2：在临时 local/ 里对已安装的代码跑行为探针，不碰本机状态
+            from wflib.selftest_v18 import probes_main
+            sys.exit(probes_main())
         r = release.self_check()
         if args.json:
             out(r)

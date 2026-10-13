@@ -86,6 +86,8 @@ def run() -> int:
     print(f"collab-wf 自检（{(WF_HOME / 'VERSION').read_text().strip()}，Python {sys.version.split()[0]}）")
     from .selftest_v15 import run_v15   # 1.5.0 新增检查：纯函数与解析回归，计入总数
     run_v15(_ok)
+    from .selftest_v18 import run_v18   # 1.8.2 新增检查，计入总数
+    run_v18(_ok)
     tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-"))
     env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local")}
     env.pop("VIRTUAL_ENV", None)

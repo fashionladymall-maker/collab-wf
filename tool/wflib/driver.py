@@ -238,6 +238,7 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
         machine.go(inst, target, by="driver", reason=text[:300], block_reason=text[:800],
                    blocked_from=inst.state["state"], force=inst.state["state"] in ("BLOCKED", "DONE"))
     inst.state["needs_text"] = text
+    inst.state["await_rule"] = r["id"]   # 1.8.2（P0-E）：记下停在哪条规则上，wf approve 据此拒绝解决不了问题的批准
     inst.save()
     return "user", text
 
@@ -380,7 +381,7 @@ def _compose_text(ctx):
         # 1.7.6：续接消息带上块规格与上一轮没识别到的块（amy-local 第 7–11 轮：块名写成【结论】，续接消息又不说规格，反复续接）
         body = (f"【续接 · 第 {st['turn']} 轮 · {ver}】档位：{last_eff}\n\n上一轮回复在中途中断或缺少固定块"
                 f"（这条消息由驱动器自动发出）。请从断点继续，并给出完整的六个固定块。\n\n"
-                f"上一轮没有识别到：{miss}。\n"
+                + _limit_line(inst, st["turn"] - 1) + f"上一轮没有识别到：{miss}。\n"
                 "固定块的标题必须逐字如下，各自独占一行的开头：\n"
                 "【本轮结论】【本机执行】【本轮回报清单】【需要用户决定】【下一轮建议档位】【驱动指令】\n"
                 "【本机执行】里的命令放在代码块中、每条一行；没有内容的块写“无”。\n\n"
@@ -496,6 +497,7 @@ def h_compose(ctx):
             st.pop("compose_reason", None)
         inst.save()
     _append_tell(inst, out)   # 1.7.6：执行端用 wf tell 留给 Claude 的说明，附在这条待发消息末尾
+    _append_limit_carry(inst, out)   # 1.8.2（P0-F）：上一条回复因上限结束时，请 Claude 先从断点补齐
     chk = ops.check_outgoing(Path(out["file"]), out["kind"])
     if chk["secrets"]:
         return _anomaly(ctx, {"source": "compose", "kind": "secret"}, "；".join(chk["secrets"]))
@@ -692,8 +694,9 @@ def h_wait_reply(ctx):
     if not st.get("send_ref"):
         # 本轮是在驱动器之外手动发出的，没有登记 ref，无法自动接续（缺口 7）
         return _anomaly(ctx, {"source": "driver", "kind": "no_ref"},
-                        "本轮消息是手动发出的、没有登记 ref，驱动器无法轮询接续。请手动 wf mark replied，"
-                        "或下次用 wf mark sent --ref（适配器返回的 ref）发送")
+                        "本轮消息是手动发出的、没有登记 ref，驱动器无法轮询接续。批准解决不了这个问题（1.8.2 起 wf approve 会拒绝）："
+                        "补登记 wf mark sent --ref <适配器返回的 ref>，或整轮手动收尾 wf mark replied --reply-file <回复全文>；"
+                        "同一轮再次出现 NO_REF 会转为阻塞")
     pa = st.get("poll_after")
     if pa and (secs_since(pa) or 0) < 0:
         return "wait", "Claude 正在处理（稍后检查）"
@@ -762,6 +765,7 @@ def h_wait_reply(ctx):
                    "已记录")
             inst.event("auto", rule="MULTI_DELIVERY", action="report", detail=f"其他交付 {n} 套", by="driver")
             ops.add_note(inst, "deviation", f"[MULTI_DELIVERY] 本轮存在 {n} 套其他交付，只采用了最后一条完整回复的文件", by="driver")
+        _reply_meta(inst, r["data"])   # 1.8.2（P0-F）：记下适配器给出的结束原因，intake 据此判定回复是否完整
         st.pop("poll_after", None)
         st["replied_at"] = now_iso()   # 1.6.5（W42）：发下一条之前据此留出间隔
         inst.save()
@@ -795,12 +799,105 @@ def h_wait_reply(ctx):
     return _anomaly(ctx, facts, f"轮询结果：{status or r['raw'][:160]}")
 
 
+# 1.8.2（P0-F）：回复的结束原因。适配器在 poll 完成时可给出 stop_reason、completion_state（TRANSPORT.md 附录 1.8.2）
+COMPLETION_STATES = ("normal", "continuation_required", "refused", "unknown")
+LIMIT_STOPS = ("tool_use_limit", "max_tokens", "pause_turn", "max_tool_calls", "model_context_window_exceeded")
+LIMIT_STREAK_MAX = 3
+
+
+def _reply_meta(inst, data: dict) -> None:
+    sr, cs = data.get("stop_reason"), data.get("completion_state")
+    if sr is None and cs is None:
+        inst.state.pop("reply_completion", None)   # 适配器没给：行为与 1.7.x 相同
+        return
+    if cs not in COMPLETION_STATES:
+        cs = ("continuation_required" if sr in LIMIT_STOPS else "normal" if sr in ("end_turn", "stop_sequence")
+              else "refused" if sr == "refusal" else "unknown")
+    meta = {"turn": inst.state.get("turn"), "stop_reason": sr, "completion_state": cs,
+            "message_uuid": data.get("message_uuid"), "parent": data.get("parent"),
+            "conv": (inst.state.get("conv") or {}).get("conv"), "ts": now_iso()}
+    inst.state["reply_completion"] = meta
+    d = inst.turn_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    write_json(d / "reply_meta.json", meta)
+
+
+def _limit_reply(ctx, missing: bool) -> None:
+    """因工具调用或长度上限结束的回复：固定块齐全时照常推进，并请 Claude 在下一条消息里先从断点补齐（同一对话内，
+    连续 LIMIT_STREAK_MAX 次后不再自动附）；固定块不全时走原来的续接。"""
+    inst = ctx.inst
+    comp = inst.state.get("reply_completion") or {}
+    if comp.get("turn") != inst.state.get("turn"):
+        return
+    cs = comp.get("completion_state")
+    if cs == "normal":
+        if inst.state.pop("limit_streak", None) is not None:
+            inst.save()
+        return
+    if cs != "continuation_required":
+        if cs in ("unknown", "refused"):
+            ops.add_note(inst, "deviation", f"[REPLY_END] 回复的结束状态为 {cs}（stop_reason={comp.get('stop_reason')}），"
+                                            "按原样处理，请留意内容是否完整", by="driver")
+        return
+    n = int(inst.state.get("limit_streak", 0)) + 1
+    inst.state["limit_streak"] = n
+    sr = comp.get("stop_reason") or "未知原因"
+    if missing:
+        note = f"[REPLY_LIMIT] 回复因 {sr} 结束（连续第 {n} 次），固定块不全：按续接处理，续接消息写明结束原因"
+    elif n >= LIMIT_STREAK_MAX:
+        inst.state.pop("limit_carry", None)
+        note = (f"[REPLY_LIMIT] 连续 {n} 轮回复因工具或长度上限结束：不再自动附“从断点补齐”，"
+                "请 Claude 缩小每轮范围、分批交付")
+    else:
+        inst.state["limit_carry"] = {"turn": inst.state.get("turn"), "stop_reason": sr, "conv": comp.get("conv"),
+                                     "delivered": [Path(f).name for f in (inst.state.get("delivered") or [])]}
+        note = f"[REPLY_LIMIT] 回复因 {sr} 结束，不是正常结束；固定块齐全，照常解析与执行；下一条消息会请 Claude 先从断点补齐"
+    inst.save()
+    ops.add_note(inst, "deviation", note, by="driver")
+    inst.event("reply_limit", stop_reason=sr, streak=n, blocks_missing=True if missing else None, by="driver")
+
+
+def _limit_line(inst, turn) -> str:
+    m = read_json(inst.turn_dir(turn) / "reply_meta.json", {}) or {}
+    if m.get("completion_state") == "continuation_required":
+        return f"上一轮回复因 {m.get('stop_reason') or '未知原因'} 结束（工具调用或长度上限），不是正常结束。\n"
+    return ""
+
+
+def _append_limit_carry(inst, out) -> None:
+    """把“请先从断点补齐”附在下一条待发消息末尾；对话已更换时作废（续接只在同一个已核验的对话里进行）。"""
+    c = inst.state.get("limit_carry")
+    if not c or not out:
+        return
+    inst.state.pop("limit_carry", None)
+    cur = (inst.state.get("conv") or {}).get("conv")
+    if c.get("conv") and cur and c.get("conv") != cur:
+        inst.save()
+        inst.event("limit_carry_dropped", turn=c.get("turn"), why="对话已更换，不在新对话里续接", by="driver")
+        return
+    p = Path(out["file"])
+    try:
+        txt = p.read_text(encoding="utf-8")
+    except OSError:
+        inst.save()
+        return
+    files = "、".join(c.get("delivered") or []) or "无"
+    add = ("\n\n===== 上一条回复的结束状态（1.8.2）=====\n"
+           f"上一条回复（第 {c.get('turn')} 轮）因 {c.get('stop_reason')} 结束，不是正常结束；固定块齐全，已照常解析与执行。"
+           f"交付文件：{files}。\n"
+           "请先从断点补齐上一条回复里声明没做完的部分（只补缺的，不重复已完成的），并在本轮结论的开头写明补齐了什么、还剩什么。\n")
+    p.write_text(txt.rstrip("\n") + add, encoding="utf-8")
+    inst.save()
+    inst.event("limit_carry_attached", turn=c.get("turn"), msg_turn=out.get("turn"), by="driver")
+
+
 def h_intake(ctx):
     inst, st = ctx.inst, ctx.st
     reply = inst.turn_dir() / "reply.md"
     if not reply.exists():
         return _anomaly(ctx, {"source": "intake", "kind": "no_reply_file"}, "本轮没有保存的回复全文")
     res = ops.intake(inst, reply, by="driver")
+    _limit_reply(ctx, bool(res["blocks_missing"]))   # 1.8.2（P0-F）
     if res["blocks_missing"]:
         return _anomaly(ctx, {"source": "intake", "kind": "missing_blocks"}, "缺少：" + "、".join(res["blocks_missing"]))
     d = res.get("directives") or {}
@@ -1102,6 +1199,10 @@ def h_execute(ctx):
     while i < len(cmds):
         if ctx.time_left() <= 0:
             return "progress", f"已执行到第 {i} 条，本次时间用完，下次继续"
+        inst.save()   # 1.8.2：每条命令之前与磁盘合并，看到其他进程的 wf pause（第 106 轮：暂停后下一条 self-update 仍被执行）
+        if inst.state.get("paused"):
+            return "user", (f"已暂停：第 {i + 1} 条命令之前停下，恢复后从这里继续（{inst.state['paused'].get('note') or ''}）")
+        st = inst.state
         if policy.classify(cmds[i], ctx.pol).get("manual"):
             ops.add_note(inst, "info", f"第 {i + 1} 条「{cmds[i]}」是手动步骤，驱动器未执行（F21）", by="driver")
             decide(inst, "exec", f"跳过第 {i + 1} 条：{cmds[i]}", "会改变工作流状态的 wf 命令只能在驱动器之外手动执行", "", "已跳过")
@@ -1112,6 +1213,10 @@ def h_execute(ctx):
             continue
         st["exec_inflight"] = {"i": i, "cmd": cmds[i], "ts": now_iso()}
         inst.save()
+        if inst.state.get("paused"):   # 1.8.2：启动前、在状态锁内最后一次合并之后再查一次（停线边界见 DRIVER.md 第 34 节）
+            inst.state.pop("exec_inflight", None)
+            inst.save()
+            return "user", f"已暂停：第 {i + 1} 条命令启动前停下，恢复后从这里继续（{inst.state['paused'].get('note') or ''}）"
         rc = ops.run_exec(inst, cmds[i], label=f"#{i + 1}", timeout=timeout, by="driver")
         st = inst.state
         st.pop("exec_inflight", None)

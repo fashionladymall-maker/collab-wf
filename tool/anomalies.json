@@ -317,6 +317,8 @@
     },
     {
       "id": "NO_REF",
+      "max": 1,
+      "then": "block",
       "match": {
         "source": "driver",
         "kind": "no_ref"

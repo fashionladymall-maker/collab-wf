@@ -1,38 +1,39 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 108 轮 · 发送（SEND）
+第 108 轮 · 等待计划节点（WAIT_SCHEDULE）
 
 ## 版本
-- 工具：collab-wf 1.7.6
+- 工具：collab-wf 1.8.2
 - 项目：v3.3；55c1e75 (HEAD -> main, tag: v3.3) release v3.3
 - 仓库指纹：cbad75d7e6df496b（10 个文件）
 
 ## 最近一轮
-- 第 107 轮验收未通过（0 项）（2026-10-12T23:41:25+00:00）
-- 本方最新消息：`turns/turn-107.md`
-- Claude 最新回复：`replies/reply-107.md`
+- 第 108 轮验收通过（2026-10-13T00:24:10+00:00）
+- 本方最新消息：`turns/turn-108.md`
+- Claude 最新回复：`replies/reply-108.md`
 
 ## 目标
-- 进度 0 / 11
-- ○ M2-B1 阶段目标：看板与 STATUS 先显示当前阶段，旧阶段只作历史：输出不含“探针 阶段目标：通过”
-- ○ M2-B2 待办可取消、可被取代，完成必须写结果：输出不含“探针 待办取消：通过”
-- ○ M2-E1 NO_REF 不再循环：输出不含“探针 NO_REF：通过”
-- ○ M2-F1 回复完整性：识别工具上限并有界续接：输出不含“探针 回复完整性：通过”
-- ○ M2-H1 同步凭证：没有提交号不算推送：输出不含“探针 同步凭证：通过”
-- ○ M2-A1 交接短消息钉在提交上、只链已推送的文件：输出不含“探针 交接短消息：通过”
+- 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
+- 进度 6 / 11
+- ✓ M2-B1 阶段目标：看板与 STATUS 先显示当前阶段，旧阶段只作历史：通过
+- ✓ M2-B2 待办可取消、可被取代，完成必须写结果：通过
+- ✓ M2-E1 NO_REF 不再循环：通过
+- ✓ M2-F1 回复完整性：识别工具上限并有界续接：通过
+- ✓ M2-H1 同步凭证：没有提交号不算推送：通过
+- ✓ M2-A1 交接短消息钉在提交上、只链已推送的文件：通过
 - ○ M2-F2 回复发现延迟有界：输出不含“探针 回复发现延迟：通过”
 - ○ M2-C1 默认工程门禁基线与角色准入退出：输出不含“探针 门禁基线：通过”
 - ○ M2-D1 经验闭环：台账缺项不得标已解决：输出不含“探针 经验闭环：通过”
 - ○ M2-G1 共享资源仲裁 S4：输出不含“探针 共享仲裁：通过”
 - ○ M2-U1 用户验收 M2：等待用户确认
+- 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
 - [executor] 确认目标 M2-U1：用户验收 M2
-- [executor] 执行端待办 T106-1：本轮验收通过后，迁移旧待办：wf task supersede T100-2 --reason "用户边界：Amy 在 collab-wf 完备前不恢复（第 104 轮）"；wf task supersede T100-1 --reason "由第 106 轮执行端 2 取代" --by-task T106-2。把两条命令的输出原文写进 wf task done
 - [executor] 执行端待办 T106-2：同步程序（P0-H 执行端侧）：接受 --repo；拿不到锁或跳过时返回非 0，且不输出提交号；缓存、锁、日志按项目、目标仓库、分支分开。改好后先做一次 wf sync --dry-run，再做一次真实推送，确认 local/sync/collab-wf-dev.json 里出现 pushed_commit。结果写进 wf task done
 - [executor] 执行端待办 T106-3：先运行 wf goals，核对 M2 目标是否已被自动批准。如果没有，按决策顺位审阅 goals.json 后，用 wf goals approve --by executor --reason 代批。再运行 wf self-check --probes，把它和 wf goals 的原文都写进 wf task done
-- [executor] 执行端待办 T107-1：1.8.1 装好后，写下独立审查结论的原文（写明是安装前给出、超时未审查，还是迟到）；如果没在安装前审查，就安排事后补审，如实记为“未审查”。再运行 wf self-check --probes，写下原文。两份原文都写进 wf task done
+- [executor] 执行端待办 T108-1：1.8.2 装好后，写下独立审查结论的原文，并注明是安装前给出、超时未审查，还是迟到给出；运行 wf self-check --probes 并写下原文；用 wf task supersede T107-1 --reason "由 1.8.2 取代" --by-task T108-1 关闭上一轮那项待办。三份原文都写进 wf task done
 
 ## 最新产物
-- `artifacts/collab-wf-1.8.1.zip`
-- `artifacts/collab-wf-1.8.1.zip`
+- `artifacts/collab-wf-1.8.2.zip`
+- `artifacts/collab-wf-1.8.2.zip`

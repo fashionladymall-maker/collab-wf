@@ -929,7 +929,9 @@ def _t_v163_bootstrap_short(_ok):
         inst.save()
         calls = []
         try:
-            sync.run = lambda i, **k: calls.append(i.name) or {"status": "pushed"}
+            sync.run = lambda i, **k: calls.append(i.name) or {"status": "pushed", "commit": "c0ffee1234567", "digest": "d1",
+                                                               "files": 3, "names": ["STATUS.md", "turns/turn-007.md",
+                                                                                     "replies/reply-007.md"]}   # 1.8.2
             sync.cfg = lambda: {"sync": "/x/gh_sync.py", "sync_projects": [inst.name], "sync_repo": "me/repo"}
             b1 = admin.bootstrap(inst, "测试")
             short = b1["short"].read_text(encoding="utf-8") if b1.get("short") else ""
@@ -939,7 +941,7 @@ def _t_v163_bootstrap_short(_ok):
         finally:
             sync.cfg, sync.run = orig
     _ok("1.6.3 开新对话的短消息：开启同步并写了 sync_repo 时先同步、再生成带 raw 链接的短消息；没开启时照旧只有长消息",
-        bool(b1.get("short")) and calls == [inst.name] and "https://raw.githubusercontent.com/me/repo/main/STATUS.md" in short
+        bool(b1.get("short")) and calls == [inst.name] and "https://raw.githubusercontent.com/me/repo/c0ffee1234567/STATUS.md" in short and "/main/" not in short
         and "turns/turn-007.md" in short and "replies/reply-007.md" in short and len(short) < 4000
         and b2.get("short") is None and long_ok, short[:300])
 

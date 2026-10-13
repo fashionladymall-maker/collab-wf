@@ -200,54 +200,64 @@ def bootstrap(inst: Instance, reason: str, by: str = "executor") -> dict:
             .replace("{tool_manifest}", fidelity.tool_manifest_text(WF_HOME, inst.root)))
     mpath = inst.outbox / f"bootstrap-{stamp}.md"
     mpath.write_text(text, encoding="utf-8")
-    short = _bootstrap_short(inst, reason, ver, head, s, fp, last, stamp)   # 1.6.3：短消息 + 公开仓库链接
+    short, short_why = _bootstrap_short(inst, reason, ver, head, s, fp, last, stamp)   # 1.6.3；1.8.2：返回 (路径或 None, 原因)
     inst.event("bootstrap", file=mpath.name, zip=zpath.name, tool_zip=tool_zip.name, reason=reason,
-               short=short.name if short else None, by=by)   # 1.6.4：驱动器生成时记 by=driver
-    return {"message": mpath, "zip": zpath, "tool_zip": tool_zip, "chars": len(text), "short": short}
+               short=short.name if short else None, short_skipped=short_why or None, by=by)   # 1.6.4：驱动器生成时记 by=driver
+    return {"message": mpath, "zip": zpath, "tool_zip": tool_zip, "chars": len(text), "short": short, "short_why": short_why}
 
 
 def _bootstrap_short(inst: Instance, reason: str, ver: str, head: str, s: dict, fp: dict, last: str, stamp: str):
-    """1.6.3：项目开启了同步、并在 transport.json 写了 sync_repo（owner/仓库）时，另外生成一条短的续接消息：
-    项目上下文在公开仓库里（用户第 31 轮：“以后都用这个仓库做这个项目的上下文”），新对话按链接读取，不需要附件。
-    生成前先同步一次，保证链接里是最新内容。没有开启同步时返回 None，长消息照旧。"""
-    from . import sync
-    c = sync.cfg()
+    """1.6.3：项目开启了同步、并在 transport.json 写了仓库时，另外生成一条短的续接消息（WORKFLOW.md 第 10 节路线 G）。
+    1.8.2（P0-A、P0-H）：只有这次同步确有提交号（推送成功，或内容与上一次带提交号的推送相同）才生成；链接钉在那个
+    提交上、不用分支，读的过程中内容不会变；只链接已推送清单里的文件（第 103 轮的短消息引用了没推上去的 turn-103）。
+    同步失败、被拦、没有提交号时不生成，由长消息兜底（路线 Z）。返回 (路径或 None, 没生成的原因或 "")。"""
+    import re as _re
+    from . import goals as _goals, sync, tasks as _tasks
     repo = sync.repo_for(inst)   # 1.7.6：按项目分仓库时用本项目的仓库
     if not repo or not sync.enabled(inst):
-        return None
+        return None, ""
     try:
-        sync.run(inst)
-    except Exception:   # noqa: BLE001  同步失败不妨碍生成消息；仓库里是上一次同步的内容
-        pass
-    raw = f"https://raw.githubusercontent.com/{repo}/{c.get('sync_branch') or 'main'}"
-    sent = []
-    if inst.turns_path.exists():
-        for line in inst.turns_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if '"sent"' in line:
-                try:
-                    r = __import__("json").loads(line)
-                except ValueError:
-                    continue
-                if r.get("status") == "sent" and isinstance(r.get("turn"), int):
-                    sent.append(r["turn"])
-    replies = sorted(d.name.split("-", 1)[1] for d in inst.evidence.glob("turn-*") if (d / "reply.md").is_file()) \
-        if inst.evidence.exists() else []
-    lines = [f"【项目续接 · 新对话】档位：high", "",
-             f"上一个对话因 {reason} 结束。项目上下文在公开仓库 {repo}，请直接按链接读取，不需要附件：", "",
-             f"1. 进度总览：{raw}/STATUS.md",
-             f"2. 项目状态与计划：{raw}/project/PROJECT.md 、{raw}/project/VISION.md",
-             f"3. 协作规则：{raw}/tool/docs/WORKFLOW.md ；【驱动指令】格式：{raw}/tool/docs/DRIVER.md 第 5 节",
-             (f"4. 最近一轮：我方消息 {raw}/turns/turn-{max(sent):03d}.md" if sent else "4. 最近一轮：我方消息（无）")
-             + (f" ；你的回复 {raw}/replies/reply-{replies[-1]}.md" if replies else ""),
+        res = sync.run(inst)
+        if res.get("status") == "unchanged" and not res.get("commit"):
+            res = sync.run(inst, force=True)   # 1.8.2 之前的推送记录没有提交号：补推一次，拿到提交号
+    except Exception as e:   # noqa: BLE001
+        res = {"status": "error", "detail": str(e)[:200]}
+    commit = str(res.get("commit") or "")
+    if res.get("status") not in ("pushed", "unchanged") or not _re.fullmatch(r"[0-9a-f]{7,40}", commit):
+        return None, (f"同步结果 {res.get('status')}" + ("" if commit else "，没有提交号")
+                      + (f"：{str(res.get('detail'))[:160]}" if res.get("detail") else ""))
+    names = set(res.get("names") or [])
+    raw = f"https://raw.githubusercontent.com/{repo}/{commit}"
+    turns = sorted(n for n in names if _re.fullmatch(r"turns/turn-\d{3}\.md", n))
+    replies = sorted(n for n in names if _re.fullmatch(r"replies/reply-\d{3}\.md", n))
+    prog = _goals.progress(inst)
+    left = _tasks.open_items(inst)
+    conv = (inst.state.get("conv") or {}).get("conv") or "（未登记）"
+
+    def ln(rel):
+        return f"{raw}/{rel}" if rel in names else f"（{rel} 不在这次推送里）"
+    lines = ["【项目续接 · 新对话】档位：max", "",
+             f"上一个对话因 {reason} 结束。项目上下文在公开仓库 {repo}，固定在同步提交 {commit}"
+             f"（同步摘要 {res.get('digest')}，{res.get('files')} 个文件）。下面的链接都钉在这个提交上，不读分支：", "",
+             f"1. 进度总览：{ln('STATUS.md')}",
+             f"2. 项目状态与计划：{ln('project/PROJECT.md')} 、{ln('project/VISION.md')}",
+             f"3. 协作规则：{ln('tool/docs/WORKFLOW.md')}（第 10 节：交接路线与新对话首轮的要求）；"
+             f"【驱动指令】格式：{ln('tool/docs/DRIVER.md')} 第 5 节",
+             "4. 最近一轮：" + (f"我方消息 {raw}/{turns[-1]}" if turns else "我方消息（这次推送里没有）")
+             + (f" ；你的回复 {raw}/{replies[-1]}" if replies else ""),
              f"5. 工具源码：{raw}/tool/ 下按路径读取（例如 tool/wflib/driver.py）；版本包在 artifacts/", "",
              f"当前：工具 collab-wf {tool_version()}，项目 {ver}（提交 {head}），仓库指纹 {fp['digest']}（{fp['count']} 个文件）；"
-             f"工作流 {s['state']}（{s['name']}），第 {s['turn']} 轮。", "",
+             f"工作流 {s['state']}（{s['name']}），第 {s['turn']} 轮；本项目登记的对话 {conv}。",
+             _goals.phase_title(prog) + (f"，进度 {prog['done']} / {prog['total']}" if prog.get("defined") else "（没有定义目标）")
+             + "；未完成的执行端待办：" + ("；".join(f"{t['id']} {t['text'][:40]}" for t in left[:5]) or "无") + "。",
+             "失败台账：PROJECT.md 的“失败模式台账”；用户边界：VISION.md 第〇、一节与 PROJECT.md 的“协作约定”。", "",
              "最近一轮的回报清单与验收结论：", last, "",
-             "本轮请只做三件事：复述当前版本、阶段、待用户决策与工具边界；按仓库内容核对仓库指纹；给出下一轮指令。"
-             "本轮不要交付新版本。raw 链接偶尔有几分钟的缓存，内容对不上时稍后重读。"]
+             "本轮请只做三件事：复述当前版本、阶段、待用户决策与工具边界；按上面的提交复算仓库指纹（ops.fingerprint 的规则）"
+             "与同步摘要（sync.digest 的规则），列出读到与缺失的文件；给出下一轮指令。本轮不要交付新版本，也不要进入业务开发"
+             "（WORKFLOW.md 第 10 节）。"]
     p = inst.outbox / f"bootstrap-{stamp}-short.md"
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return p
+    return p, ""
 
 
 def _tool_zip(outdir: Path) -> Path:

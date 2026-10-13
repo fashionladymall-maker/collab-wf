@@ -114,8 +114,10 @@ def status_md(inst, turns, replies, artifacts) -> str:
     p = goals.progress(inst)
     lines += ["", "## 目标"]
     if p.get("defined"):
+        lines.append(f"- {goals.phase_title(p)}")   # 1.8.2（P0-B）：先写当前阶段；旧阶段单列为历史、不计入当前进度
         lines.append(f"- 进度 {p['done']} / {p['total']}" + ("" if p.get("approved") else "（目标尚未批准，不生效）"))
         lines += [f"- {'✓' if i['ok'] else '○'} {i['id']} {i['title']}：{i['detail']}" for i in p["items"]]
+        lines += [f"- {h}" for h in goals.history_lines(p)]
     else:
         lines.append("- 没有定义目标")
     items = [x for x in notify.collect_inbox([inst]) if "|sync_" not in x["key"]]   # 同步自身的提示不进 STATUS，免得自己引起变化
@@ -215,6 +217,76 @@ def digest(files: dict) -> str:
     return h.hexdigest()
 
 
+def _stage_tree(stage: Path, files: dict) -> dict:
+    """1.8.2（P0-H）：把暂存目录原地更新成与 files 一致：内容相同的不重写，多出的文件逐个删除，不整目录删除
+    （整目录删除会触发宿主的批量删除确认）。安全边界（1.8.0 独立审查 block）：清单里的路径必须是相对路径、
+    不含 . 与 ..；暂存目录及它到 local/sync 的上级都不能是符号链接；暂存目录里的符号链接一律只删链接本身、
+    从不跟随写入；写文件一律“新 inode 临时文件 + 原子替换”，不截断旧 inode（硬链接）。任何一条不满足就拒绝，
+    不写穿到暂存目录之外。残余风险：前提是单写者——检查与替换之间若有另一个有写权限的进程同时改暂存目录，
+    这里不承诺防住（不宣称能防住拥有同等权限的攻击者）。"""
+    import os
+    import stat as _stat
+    import tempfile
+    from .core import WfError
+    stage = Path(stage)
+    for name in files:
+        parts = str(name).split("/")
+        if not name or "\\" in name or str(name).startswith("/") or any(x in ("", ".", "..") for x in parts):
+            raise WfError(f"同步清单里有不安全的路径，拒绝写入：{name!r}")
+    for q in [stage] + [q for q in stage.parents if q == SYNC_DIR or SYNC_DIR in q.parents]:
+        if q.is_symlink():
+            raise WfError(f"暂存目录或它的上级是符号链接，拒绝写入：{q}")
+    stage.mkdir(parents=True, exist_ok=True)
+    removed = written = 0
+    for dirpath, dirnames, filenames in os.walk(stage, topdown=True, followlinks=False):
+        d = Path(dirpath)
+        for n in list(dirnames):
+            if (d / n).is_symlink():
+                os.unlink(d / n)   # 只删链接本身
+                dirnames.remove(n)
+                removed += 1
+        for n in filenames:
+            f = d / n
+            if f.is_symlink() or f.relative_to(stage).as_posix() not in files:
+                os.unlink(f)
+                removed += 1
+    for name, data in files.items():
+        parts = name.split("/")
+        cur = stage
+        for part in parts[:-1]:
+            cur = cur / part
+            if cur.is_symlink() or (os.path.lexists(cur) and not cur.is_dir()):
+                os.unlink(cur)
+            if not os.path.lexists(cur):
+                cur.mkdir()
+        t = cur / parts[-1]
+        if os.path.lexists(t) and not t.is_symlink():
+            ls = os.lstat(t)
+            if _stat.S_ISDIR(ls.st_mode):
+                raise WfError(f"暂存目录里的 {name} 是目录，拒绝覆盖")
+            if _stat.S_ISREG(ls.st_mode) and ls.st_nlink == 1 and t.read_bytes() == data:
+                continue   # 内容相同、没有别的硬链接：不重写
+        # 1.8.2（第 107 轮审查 block）：不在旧 inode 上截断重写（旧文件可能是指向暂存目录之外的硬链接）。
+        # 先在同目录建私有的新文件（O_EXCL，新 inode）写完、落盘，再原子替换目录项：旧 inode 与它的其他链接不受影响；
+        # 写失败时旧文件原样保留、临时文件删除。
+        fd, tmp = tempfile.mkstemp(dir=str(cur), prefix=".wf-stage-", suffix=".tmp")
+        try:
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, t)   # rename 不跟随链接：目标是链接时替换的是链接本身
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        written += 1
+    return {"written": written, "removed": removed}
+
+
 def run(inst, dry_run=False, force=False) -> dict:
     """收集、扫描，内容有变化时调用执行端的同步程序。结果写入 local/sync/<项目>.json 并返回。"""
     from . import anomaly
@@ -229,23 +301,24 @@ def run(inst, dry_run=False, force=False) -> dict:
     elif dry_run:
         res.update(status="dry_run")
     elif d == rec.get("pushed_digest") and not force:
-        res.update(status="unchanged")
+        res.update(status="unchanged", commit=rec.get("pushed_commit") or "")   # 1.8.2：带上那次推送的提交号
     else:
         stage = SYNC_DIR / inst.name / "tree"
-        if stage.exists():
-            shutil.rmtree(stage)
-        for name, data in files.items():
-            p = stage / name
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(data)
+        _stage_tree(stage, files)   # 1.8.2：原地更新，不整目录删除（整目录删除会触发宿主的批量删除确认）
         rargs = ["--project", inst.name, "--turn", inst.state.get("turn", 0), "--dir", stage]
         if isinstance(cfg().get("sync_repos"), dict):   # 1.7.6：按项目分仓库时告诉同步程序推到哪个仓库
             rargs += ["--repo", repo_for(inst)]
         r = anomaly.call("sync", rargs,
                          timeout=cfg().get("sync_timeout_s", 300))
-        if r.get("code") == 0:
-            res.update(status="pushed", detail=(r.get("data") or {}).get("commit") or "")
-            rec["pushed_digest"], rec["pushed_ts"], rec["failures"] = d, res["ts"], 0
+        commit = str((r.get("data") or {}).get("commit") or "").strip()
+        if r.get("code") == 0 and commit:
+            res.update(status="pushed", detail=commit, commit=commit)
+            rec["pushed_digest"], rec["pushed_ts"], rec["failures"], rec["pushed_commit"] = d, res["ts"], 0, commit
+        elif r.get("code") == 0:
+            # 1.8.2（P0-H）：退出码 0 却没有提交号（例如同步程序拿不到锁就跳过）：不算推送成功、不更新已推送摘要，
+            # 下一次照常再推；计入连续失败（3 次进 inbox）
+            rec["failures"] = int(rec.get("failures", 0)) + 1
+            res.update(status="unconfirmed", detail="同步程序退出码 0，但没有返回提交号（可能是忙、跳过或没有推送），不记为已推送")
         else:
             rec["failures"] = int(rec.get("failures", 0)) + 1
             res.update(status="failed", detail=(r.get("raw") or "")[-300:])
@@ -256,6 +329,7 @@ def run(inst, dry_run=False, force=False) -> dict:
         else:
             rec["blocked"] = {"ts": res["ts"], "secrets": res["secrets"], "reasons": res.get("reasons") or []}
         write_json(record_path(inst), rec)
+    res["names"] = sorted(files)   # 1.8.2：这次（或与上次推送相同的）文件清单，只返回、不写进记录；短消息只链接其中的文件
     return res
 
 

@@ -40,7 +40,14 @@ def pending(inst: Instance) -> list:
                          s.get("block_reason") or "某一步失败次数超过上限",
                          ["已处理 {code}"], f"wf unblock --to {s.get('blocked_from') or 'COMPOSE'} --code {{code}} --said …",
                          "流程保持停住，不会自动继续", "wf status 显示该步的异常处置表"))
-    if s["state"] == "AWAITING_USER":
+    if s["state"] == "AWAITING_USER" and st.get("await_rule") == "NO_REF" and not st.get("send_ref"):
+        # 1.8.2（P0-E）：没有 ref 时批准解决不了问题（wf approve 会拒绝），只给真正能解开的两条路
+        out.append(_item("no_ref", f"no_ref:{s['turn']}:{s['since']}", "本轮没有 ref：补登记或整轮手动收尾",
+                         st.get("needs_text") or "本轮消息在驱动器之外发出，没有登记 ref",
+                         ["补登记 ref", "整轮手动收尾", "暂停"],
+                         "wf mark sent --ref <适配器返回的 ref>  或  wf mark replied --reply-file <回复全文>",
+                         "驱动器保持停住；同一轮再次出现 NO_REF 会转为阻塞", "DRIVER.md 第 7a、34 节"))
+    elif s["state"] == "AWAITING_USER":
         out.append(_item("approve", f"approve:{s['turn']}:{s['since']}", "需要你批准才能继续",
                          st.get("needs_text") or "驱动器停下来等你决定",
                          ["批准 {code}", "暂停"], "wf approve --code {code} --said …",
@@ -85,7 +92,8 @@ def notices(inst: Instance) -> list:
         why = "全部目标判据已通过，自动化停在这里"
         # 1.6.7：目标达成那一轮登记的执行端待办做完后，结果写进这条提示。key 不变（done:<轮次>），交给用户、
         # 没有 action 与 code，看门狗仍按正常完成提示识别；DONE 不自动回报
-        fin = [t for t in (inst.state.get("executor_tasks") or []) if t.get("turn") == s["turn"] and t.get("done")]
+        from .tasks import status_of as _task_status   # 1.8.2：被取代的不算完成
+        fin = [t for t in (inst.state.get("executor_tasks") or []) if t.get("turn") == s["turn"] and _task_status(t) == "done"]
         if fin:
             why += "；本轮执行端待办已完成：" + "；".join(f"{t['id']}：{(t.get('note') or '没有写说明')[:80]}" for t in fin[:5])
         out.append({"key": f"done:{s['turn']}", "title": "目标已达成", "why": why})
@@ -96,10 +104,11 @@ def notices(inst: Instance) -> list:
         # 1.6.9（N9）：与看门狗一致，暂停期间不报停滞；auto=false 的项目驱动器不推进，停留本来就不变
         out.append({"key": f"stuck:{s['state']}:{s['since']}", "title": f"“{s['name']}”停留超过上限",
                     "why": "驱动器会按异常处置表处理；若一直这样，看板会显示原因"})
+    from .tasks import status_of as _task_status
     for t in (inst.state.get("executor_tasks") or []):   # 1.6.6：写给执行端的待办，做完前一直在 inbox 里
-        if not t.get("done"):
+        if _task_status(t) == "open":   # 1.8.2：取消、被取代的不再出现
             out.append({"key": f"task:{t['id']}", "title": f"执行端待办 {t['id']}", "why": t.get("text") or "",
-                        "action": f"做完后：wf task done {t['id']} --note \"结果\""})
+                        "action": f"做完后：wf task done {t['id']} --note \"结果\"；不再需要时：wf task cancel {t['id']} --reason \"原因\""})
     from .heartbeat import driver_health   # 1.5.6：驱动器停了要让用户知道（手写循环会静默退出）
     hb = driver_health(inst)
     if hb["status"] == "stale":

@@ -86,7 +86,7 @@ def classify(cmd: str, pol: dict) -> dict:
     auto_su = (pol or {}).get("auto_self_update") is True and bool(AUTO_SELF_UPDATE.match(first))
     if auto_su:   # 1.5.8：只此一种 wf 写操作可由驱动器执行；仍须在白名单内（下面照常检查）
         cats.append("自动安装工具版本")
-    elif re.match(r"^\s*wf(\s|$)", first) and not WF_READONLY.match(first) and not re.match(r"^\s*wf\s+self-check\s*$", first):
+    elif re.match(r"^\s*wf(\s|$)", first) and not WF_READONLY.match(first) and not re.match(r"^\s*wf\s+self-check(\s+--probes)?\s*$", first):
         manual = True
         cats.append("手动步骤")
         reasons.append("会改变工作流状态的 wf 命令，驱动器不执行，须在驱动器之外手动执行")

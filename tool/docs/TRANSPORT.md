@@ -149,3 +149,13 @@ policy.json 的 auto_new_conversation 为 true 时，wf 在对话达到上限时
 - 选对话的顺序：`--conv` > 适配器配置里该项目的绑定（projects[--project]）> `--prev-ref` 所属的对话 > 默认对话。`--prev-ref` 仍然提供定位的下界（上一轮的坐标），但不决定用哪个对话（执行端第 90 轮的意见：否则换对话后仍会按旧 ref 查旧对话，N10 重演）。
 - 退到默认对话时，输出加 `"warning": "conv_from_default"`；`--prev-ref` 所属对话与选定的对话不同时加 `"warning": "conv_mismatch"`。warning 是可选字段：wf 只把它写进回报的“需要注意”，不改变任何处置。
 - 一致性检查：声明了 per_project_conv 时，wf transport test 用空 ref 加一个不存在的 `--conv` 做一次 poll，要求退出码 0、status 为 none 或 no_ref。
+
+## 附：1.8.2 poll 的结束原因（可选，强烈建议提供）
+
+poll 返回 status=done 时，可以同时给出：
+
+- stop_reason：通道给出的原值（例如 end_turn、tool_use_limit、max_tokens、refusal）。wf 只记录，不解析它在通道里的含义。
+- completion_state：normal（正常结束）、continuation_required（因工具调用或长度上限结束，需要从断点继续）、refused（被拒）、unknown（无法判断）。不给时 wf 按 stop_reason 推断：tool_use_limit、max_tokens、pause_turn 视为 continuation_required，end_turn、stop_sequence 视为 normal，refusal 视为 refused，其余为 unknown。
+- message_uuid、parent：这条回复与它所回应的消息的标识，原样记录。
+
+两项都不给时，行为与 1.7.x 相同。wf 的处置见 DRIVER.md 第 34 节。

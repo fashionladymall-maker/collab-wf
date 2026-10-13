@@ -49,6 +49,16 @@ def validate(g: dict) -> list:
         for k in ("title", "means", "on_fail"):
             if not x.get(k):
                 issues.append(f"{gid}：缺少 {k}")
+    ph = g.get("phase")   # 1.8.2（P0-B）：当前阶段与历史阶段
+    if ph is not None and (not isinstance(ph, dict) or not str(ph.get("id") or "").strip()
+                           or not str(ph.get("title") or "").strip()):
+        issues.append("phase（当前阶段）需要 id 与 title")
+    hist = g.get("history")
+    if hist is not None:
+        if not isinstance(hist, list) or not all(isinstance(h, dict) and h.get("id") and h.get("title") for h in hist):
+            issues.append("history 是历史阶段的列表，每项需要 id 与 title")
+        elif isinstance(ph, dict) and any(h.get("id") == ph.get("id") for h in hist):
+            issues.append("当前阶段的编号不能与历史阶段重复")
     return issues
 
 
@@ -149,4 +159,35 @@ def progress(inst: Instance) -> dict:
     done = sum(1 for i in items if i["ok"])
     return {"defined": True, "approved": st["approved"], "changed_since_approval": st["changed_since_approval"],
             "items": items, "done": done, "total": len(items), "reached": st["approved"] and done == len(items),
-            "issues": validate(g)}
+            "issues": validate(g), "phase": _phase(g), "history": _history(g)}
+
+
+def _phase(g: dict):
+    ph = g.get("phase") if isinstance(g, dict) else None
+    if not isinstance(ph, dict) or not ph.get("id"):
+        return None
+    return {k: ph.get(k) for k in ("id", "title", "since", "supersedes", "requirements", "scope") if ph.get(k) is not None}
+
+
+def _history(g: dict) -> list:
+    out = []
+    for h in ((g.get("history") or []) if isinstance(g, dict) else []):
+        if isinstance(h, dict) and h.get("id"):
+            out.append({k: h.get(k) for k in ("id", "title", "status", "closed", "summary") if h.get(k) is not None})
+    return out
+
+
+def phase_title(prog: dict) -> str:
+    """1.8.2（P0-B）：当前阶段的标题行。旧格式（没有 phase）照实说明，不把这份目标当成之后新范围的进度。"""
+    ph = prog.get("phase")
+    if ph:
+        return (f"当前阶段 {ph['id']} {ph.get('title') or ''}".rstrip()
+                + (f"（取代 {ph['supersedes']}）" if ph.get("supersedes") else ""))
+    return "当前阶段：未声明（旧格式的目标文件；进度只代表这份文件里的目标，不代表之后的新范围）"
+
+
+def history_lines(prog: dict) -> list:
+    cn = {"done": "已完成", "superseded": "已被取代", "cancelled": "已取消", "closed": "已结束"}
+    return [f"历史阶段 {h['id']} {h.get('title') or ''}：{cn.get(h.get('status'), h.get('status') or '已结束')}"
+            + (f"（{h['closed']}）" if h.get("closed") else "") + (f"；{h['summary']}" if h.get("summary") else "")
+            for h in prog.get("history") or []]

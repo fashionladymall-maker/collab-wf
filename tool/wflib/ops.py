@@ -27,6 +27,14 @@ def _conv_add(inst: Instance, chars: int):
 def mark_sent(inst: Instance, message_file=None, kind=None, effort=None, model=None,
               usage_session=None, usage_weekly=None, by="executor", role=None, reasons=None, ref=None) -> dict:
     st = inst.state
+    if st.get("state") == "AWAITING_USER" and st.get("await_rule") == "NO_REF":
+        # 1.8.2（P0-E）：补登记 ref——消息早已发出，只记上 ref、回到等待回复，由驱动器接管轮询；不重复记一次发送
+        if not ref:
+            raise WfError("本轮停在 NO_REF：补登记要带 --ref <适配器返回的 ref>；或整轮手动收尾：wf mark replied --reply-file <回复全文>")
+        st["send_ref"] = ref
+        machine.resume(inst, "补登记 ref，驱动器接管轮询（1.8.2）", by=by)
+        inst.event("ref_registered", ref=str(ref)[:120], by=by)
+        return inst.state
     if st["state"] == "COMPOSE":
         if message_file:
             res = check_outgoing(Path(message_file), kind or "task")
@@ -63,6 +71,9 @@ def mark_sent(inst: Instance, message_file=None, kind=None, effort=None, model=N
 def mark_replied(inst: Instance, reply_file=None, tools=None, usage_session=None, usage_weekly=None,
                  status="done", by="executor") -> dict:
     st = inst.state
+    if st.get("state") == "AWAITING_USER" and st.get("await_rule") == "NO_REF":
+        machine.resume(inst, "整轮手动收尾（NO_REF，1.8.2）", by=by)   # 回到等待回复，再照常记为已收到
+        st = inst.state
     if st["state"] != "WAIT_REPLY":
         raise WfError(f"当前是 {st['state']}，只有 WAIT_REPLY 状态可以记为已收到回复。")
     usage = {}

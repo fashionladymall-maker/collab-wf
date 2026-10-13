@@ -29,7 +29,7 @@ def add(inst: Instance, turn: int, items: dict) -> list:
         t = {"id": tid, "turn": turn, "text": str(items[n])[:500], "since": now_iso(), "done": None, "note": ""}
         cur.append(t)
         added.append(t)
-    done = [t for t in cur if t.get("done")]
+    done = [t for t in cur if status_of(t) != "open"]   # 1.8.2：已完成、已取消、已取代都算已关闭
     if len(done) > KEEP_DONE:
         drop = {t["id"] for t in done[:len(done) - KEEP_DONE]}
         cur[:] = [t for t in cur if t["id"] not in drop]
@@ -39,8 +39,19 @@ def add(inst: Instance, turn: int, items: dict) -> list:
     return added
 
 
+STATUS_CN = {"open": "未完成", "done": "完成", "cancelled": "取消", "superseded": "被取代"}
+
+
+def status_of(t: dict) -> str:
+    """1.8.2：待办的状态 open / done / cancelled / superseded；1.8.2 之前的记录只有 done 字段。"""
+    s = t.get("status")
+    if s in ("cancelled", "superseded"):
+        return s
+    return "done" if t.get("done") else "open"
+
+
 def open_items(inst: Instance) -> list:
-    return [t for t in (inst.state.get("executor_tasks") or []) if not t.get("done")]
+    return [t for t in (inst.state.get("executor_tasks") or []) if status_of(t) == "open"]
 
 
 def done(inst: Instance, tid: str, note: str = "") -> dict:
@@ -49,13 +60,54 @@ def done(inst: Instance, tid: str, note: str = "") -> dict:
     for t in inst.state.get("executor_tasks") or []:
         if str(t.get("id", "")).upper() != want:
             continue
+        if status_of(t) in ("cancelled", "superseded"):
+            raise WfError(f"{t['id']} 已{STATUS_CN[status_of(t)]}（{t.get('reason') or '没有写原因'}），不能再记为完成")
         if t.get("done"):
             raise WfError(f"{t['id']} 已在 {t['done']} 完成")
-        t["done"], t["note"] = now_iso(), (note or "").strip()[:1000]
+        if not (note or "").strip():   # 1.8.2（P0-B）：完成必须写结果，不再出现“没有写说明”的完成
+            raise WfError("记为完成必须写结果：wf task done <编号> --note \"结果\"；不再需要的待办用 wf task cancel 或 wf task supersede")
+        t["done"], t["note"], t["status"] = now_iso(), (note or "").strip()[:1000], "done"
         append_jsonl(inst.turn_dir() / "notes.jsonl",
                      {"ts": now_iso(), "kind": "info",
                       "text": f"执行端待办 {t['id']} 已完成（{t['text'][:80]}）：{t['note'] or '没有写说明'}"})
         inst.event("task_done", id=t["id"], note=t["note"][:300], by="executor")
+        inst.save()
+        return t
+    ids = "、".join(t["id"] for t in open_items(inst)) or "无"
+    raise WfError(f"没有这个待办：{tid}。未完成的待办：{ids}")
+
+
+def close(inst: Instance, tid: str, kind: str, reason: str, by: str = "executor", by_task: str = "") -> dict:
+    """1.8.2（P0-B、P1-N）：不再需要的待办如实关闭——cancelled（取消）或 superseded（被取代），必须写原因，
+    不再用 done 冒充。已经记为 done 的待办只能改记为 superseded（做过、但已被新的边界或新的待办取代）：
+    原来的完成时刻与说明保留在 was_done 里，不抹掉历史。"""
+    if kind not in ("cancelled", "superseded"):
+        raise WfError("只能记为 cancelled 或 superseded")
+    reason = (reason or "").strip()
+    if len(reason) < 2:
+        raise WfError(f"{'取消' if kind == 'cancelled' else '记为被取代'}必须写原因：--reason \"原因\"")
+    want = (tid or "").strip().upper()
+    for t in inst.state.get("executor_tasks") or []:
+        if str(t.get("id", "")).upper() != want:
+            continue
+        cur = status_of(t)
+        if cur in ("cancelled", "superseded"):
+            raise WfError(f"{t['id']} 已{STATUS_CN[cur]}（{t.get('reason') or ''}）")
+        if cur == "done" and kind == "cancelled":
+            raise WfError(f"{t['id']} 已在 {t['done']} 记为完成，不能取消；它若已被新的边界或待办取代，用 wf task supersede {t['id']} --reason …")
+        if cur == "done":
+            t["was_done"] = {"done": t.get("done"), "note": t.get("note", "")}
+            t["done"] = None
+        t.update(status=kind, closed=now_iso(), reason=reason[:500], closed_by=by)
+        if by_task:
+            t["superseded_by"] = str(by_task).strip().upper()[:40]
+        append_jsonl(inst.turn_dir() / "notes.jsonl",
+                     {"ts": now_iso(), "kind": "info",
+                      "text": f"执行端待办 {t['id']} 已{STATUS_CN[kind]}（{t['text'][:80]}）：{reason[:300]}"
+                              + (f"；原先在 {t['was_done']['done']} 记为完成" if cur == "done" else "")
+                              + (f"；取代它的是 {t['superseded_by']}" if t.get("superseded_by") else "")})
+        inst.event("task_" + kind, id=t["id"], reason=reason[:300], was_done=True if cur == "done" else None,
+                   superseded_by=t.get("superseded_by"), by=by)
         inst.save()
         return t
     ids = "、".join(t["id"] for t in open_items(inst)) or "无"

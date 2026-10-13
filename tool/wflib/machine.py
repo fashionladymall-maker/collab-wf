@@ -58,7 +58,7 @@ def go(inst: Instance, to: str, by="executor", reason=None, force=False, **extra
     if to in ("BLOCKED", "AWAITING_USER", "QUOTA_WAIT"):
         st["return_to"] = cur
     st.update(prev=cur, state=to, since=now_iso(), attempts=0)
-    for k in ("until", "wait_reason", "block_reason", "blocked_from"):
+    for k in ("until", "wait_reason", "block_reason", "blocked_from", "await_rule"):   # 1.8.2：await_rule 只属于那一次停下
         st.pop(k, None)
     for k, v in extra.items():
         if v is not None:
@@ -90,7 +90,7 @@ def resume(inst: Instance, note: str, to=None, by="user") -> dict:
     # 回到进入前的步骤：不增加轮次、不重置该步以外的标记
     cur = st["state"]
     st.update(prev=cur, state=target, since=now_iso(), attempts=0)
-    for k in ("return_to", "block_reason", "blocked_from", "until", "wait_reason"):
+    for k in ("return_to", "block_reason", "blocked_from", "until", "wait_reason", "await_rule"):
         st.pop(k, None)
     inst.event("transition", frm=cur, to=target, by=by, reason=note)
     return st
