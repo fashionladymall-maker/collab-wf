@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 110 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 111 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.8.3
@@ -29,7 +29,7 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T110-3：只读整理第 108–110 轮的时间线并附原文，不改状态：turns.jsonl 里这几轮的 turn、status、ref；暂停、解除暂停、人工安装 1.8.2、批准、恢复这些事件（用 wf audit）；SEND_REJECTED「消息文件不存在：None」是哪一轮的哪次发送；turn-109 的交付目录里有没有 build_wf_183.py。结果写进 wf task done
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.8.3.zip`
