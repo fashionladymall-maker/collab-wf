@@ -167,3 +167,7 @@ poll 返回 status=done 时，除 message_uuid 外再给出 files_message_uuid�
 ## 附：1.8.8 review_required（可选）
 
 transport.json 写 `"review_required": true`：自动安装工具版本时，审查没有结论（没配审查程序、执行端不在场、超时）就不安装（DRIVER.md 第 39 节）。适合执行端能保证审查在 review_timeout_s 内到场时开启。
+
+## 附：1.8.9 只有心跳不再按“通道忙”重发
+
+send 只收到心跳、没看到生成开始（`{"status": "heartbeat_only"}`，退出码 0 或 2，或 `{"accepted": false}`）时，1.8.9 起 wf 保留发送意图，按“结果不明”轮询确认（poll_since 按内容与时刻找这条消息），确认没送达之前绝不重发。此前按“通道忙”退避后再发，消息其实已经落地时就会重复发送、对话分叉（第 112、113、117 轮，W84）。真正的“通道忙、消息没被接受”请返回退出码 2 且不带 heartbeat_only。适配器自己也不要在一次 send 调用里重试发送。

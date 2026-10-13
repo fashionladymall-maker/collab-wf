@@ -642,8 +642,10 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     (fake / "send_mode").write_text("heartbeat")
     _wf(env, h, "kick", "--message", str(task))
     rc, o = _wf(env, h, "run")
-    _ok("send 只有心跳：不当作已接受，按通道忙退避（缺口 11-3、F22）", _state(h)["state"] == "SEND"
-        and ("退避" in o or "SEND_BUSY" in o or "忙" in o), o)
+    # 1.8.9（W84）改了这条旧断言：只有心跳不再按“通道忙”退避重发，而是保留意图、按结果不明等待确认（仍不当作已接受）
+    _ok("send 只有心跳：不当作已接受；1.8.9 起保留发送意图、按结果不明等待确认，不重发（缺口 11-3、F22、W84）",
+        _state(h)["state"] in ("SEND", "BLOCKED") and (_state(h).get("send_intent") or {}).get("status") == "pending"
+        and "不重发" in o, o)
     (fake / "send_mode").unlink()
     r = setup("refuse", base_pol)
     _wf(env, r, "kick", "--message", str(task))

@@ -665,13 +665,18 @@ def h_send(ctx):
     if code == 0:
         # 不只信退出码：适配器必须给出“生成已开始”的正面证据，否则按“通道忙”处理（缺口 11-3、F22）
         if r["data"].get("accepted") is False or r["data"].get("status") == "heartbeat_only":
-            st["send_intent"] = None
+            # 1.8.9（W84）：只有心跳、没看到生成开始，不等于没送达（第 112、113、117 轮：消息其实落地了，退避后再发一次，
+            # 对话就分叉）。保留发送意图，按“结果不明”轮询确认（poll_since 按内容与时刻找这条消息），确认没送达之前绝不重发。
             inst.save()
-            return _anomaly(ctx, {"source": "transport", "op": "send", "code": 2, "text": r["raw"]},
-                            "适配器返回 0 但未确认生成开始（只有心跳）")
+            return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
+                            "适配器只收到心跳、没确认生成开始：保留发送意图、轮询确认，不重发（W84）")
         st["send_intent"].update(status="accepted", ref=r["data"].get("ref"))
         st.pop("resend_parent", None)
         return _finalize_send(ctx, out, "通道已接受")
+    if code == 2 and r["data"].get("status") == "heartbeat_only":   # 1.8.9（W84）：同上，退出码 2 加只有心跳也按结果不明处理
+        inst.save()
+        return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
+                        "适配器只收到心跳、没确认生成开始：保留发送意图、轮询确认，不重发（W84）")
     if code != 4:  # 4 = 暂时性错误或超时：结果可能不明，保留意图留待下次轮询确认
         st["send_intent"] = None
         from . import arbiter

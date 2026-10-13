@@ -756,6 +756,43 @@ def _t_review_gate(_ok):
         res == ["refused", "refused", "ok", "ok"], str(res))
 
 
+def _t_heartbeat_no_resend(_ok):
+    from . import anomaly, driver
+    orig, calls = anomaly.call, []
+
+    def fake(op, args, timeout=None, env_extra=None):
+        calls.append(op)
+        if op == "send":
+            return {"code": fake.send_code, "raw": "心跳", "data": {"status": "heartbeat_only"}}
+        if op == "poll":
+            return {"code": 0, "raw": "", "data": {"status": "done", "ref": "R1"}}
+        return {"code": 0, "raw": "", "data": {}}
+    res = []
+    try:
+        anomaly.call = fake
+        with tempfile.TemporaryDirectory() as td:
+            for code in (0, 2):
+                fake.send_code = code
+                a = _inst(td, f"v189-h{code}", {"state": "SEND", "turn": 2})
+                f = a.outbox / "turn-002.md"
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+                a.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
+                a.save()
+                pol = {"send_unknown_wait": True}
+                n0 = len(calls)
+                r1 = driver.h_send(driver.Ctx(a, pol, time.time() + 60))
+                kept = (a.state.get("send_intent") or {}).get("status") == "pending"
+                a.state.pop("retry_at", None)
+                a.save()
+                r2 = driver.h_send(driver.Ctx(a, pol, time.time() + 60))
+                res.append([code, r1[0], kept, r2[0], a.state.get("state"), calls[n0:].count("send")])
+    finally:
+        anomaly.call = orig
+    _ok("1.8.9 心跳不重发：发送只收到心跳（退出码 0 或 2）时保留发送意图、按结果不明轮询确认，确认已送达就接上，整个过程只发一次",
+        all(x[2] and x[3] == "progress" and x[4] == "WAIT_REPLY" and x[5] == 1 for x in res), json.dumps(res, ensure_ascii=False))
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
@@ -764,7 +801,8 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
          ("回复发现延迟", _t_reply_latency), ("待发消息核对", _t_outgoing_missing), ("驱动器单实例", _t_single_driver),
          ("经验闭环", _t_ledger), ("回复与交付同源", _t_reply_source),
          ("回执核对", _t_receipt), ("交付核对", _t_delivery_check),
-         ("共享仲裁", _t_arbiter), ("安装前审查必需", _t_review_gate)]
+         ("共享仲裁", _t_arbiter), ("安装前审查必需", _t_review_gate),
+         ("心跳不重发", _t_heartbeat_no_resend)]
 
 
 def run_v18(_ok) -> None:

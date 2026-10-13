@@ -1,11 +1,11 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 118 轮 · 落地版本（APPLY）
+第 118 轮 · 执行与取证（EXECUTE）
 
 ## 版本
-- 工具：collab-wf 1.8.8
-- 项目：v3.7；a41ae6c (HEAD -> main, tag: v3.7) release v3.7
-- 仓库指纹：47b9f533d91ecbff（10 个文件）
+- 工具：collab-wf 1.8.9
+- 项目：v3.8；599a6ed (HEAD -> main, tag: v3.8) release v3.8
+- 仓库指纹：df0cd87fae6046a8（11 个文件）
 
 ## 最近一轮
 - 第 117 轮验收通过（2026-10-13T03:34:34+00:00）
@@ -32,5 +32,5 @@
 - 无
 
 ## 最新产物
-- `artifacts/collab-wf-1.8.8.zip`
+- `artifacts/collab-wf-1.8.9.zip`
 - `artifacts/collab-wf-dev-v3.8.zip`
