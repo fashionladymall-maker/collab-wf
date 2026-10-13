@@ -30,7 +30,6 @@
 
 ## 待办
 - [executor] 执行端待办 T114-1：只读核对 W83，不改状态。
-- [executor] 执行端待办 T114-2：只读核对第 112 轮的 3 次发送，不改状态。用 wf audit 和 turns.jsonl，列出每次发送的时刻、发起方（driver 或 executor）、原因，以及对应的 send_intent 和 ref。特别说明：驱动器为什么会重发。结果写进 wf task done。
 - [executor] 执行端待办 T114-3：1.8.5 装好、驱动器跑完目标检查后，做三件事：
 
 ## 最新产物
