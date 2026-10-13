@@ -32,6 +32,7 @@
 ## 待办
 - [executor] 执行端待办 T124-1：回核交接，结果写进 wf task done。一是本条回复的核对结果：同步仓库 5337436 下 12 个项目文件、仓库指纹 29a0181934f5d903、1.9.1 工具 67 个文件与清单一致。二是发送身份：本条回复所在对话、send_ref 与 reply_parent 是否逐字对应第 124 轮这条消息。两项都一致才算交接闭合；任何一项不一致，写明原文，不要改状态。
 - [executor] 执行端待办 T124-2：先核对 inbox 里的 signal|review:collab-wf.tool.collab-wf-1.9.3 是否已被 T123-1 提交的 concerns 结论满足。如果已满足，就用 wf signal clear 清掉，并在 wf task done 里写明键与结论文件名；如果没满足，写明还缺什么。
+- [executor] 驱动器停了：最近一次运行在 18 分钟前，系统定时器可能没有运行。执行端用 wf schedule status 检查，按 docs/PROCESS.md 第 1 节第 3 步安装定时器
 
 ## 最新产物
 - `artifacts/collab-wf-1.9.1-0f9305c.zip`
