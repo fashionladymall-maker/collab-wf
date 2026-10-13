@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 121 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 122 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -30,8 +30,7 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T121-2：1.9.1 装好、驱动器跑完目标检查后：先运行 wf goals，若目标仍待批准，确认改动只是新增 M2-R1，然后用 wf goals approve --by executor --reason 代批；再运行 wf self-check --probes（预期 29/29）和 wf live-check --rounds 3（预期未通过，记作基线）；附上独立审查结论原文。原文都写进 wf ta
-- [executor] 执行端待办 T121-3：按决策顺位决定两件事，写明理由：①是否开启 review_required，并让审查程序对同一个版本包复用已有的结论；②唤醒程序是否改为按 depends_on 字段判断先后，适配器是否补上 ended_at。结果写进 wf task done
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.9.1.zip`
