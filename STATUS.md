@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 127 轮 · 阻塞（BLOCKED）
+第 128 轮 · 组织消息（COMPOSE）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -30,7 +30,7 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 流程阻塞，需要人处理：[SEND_REJECTED] 通道明确拒绝了消息（非暂时性）。需要人工查看。 {"reason": "HTTP 429: {\"error\":{\"details\":{\"error_visibility\":\"user_facing\"},\"message\":\"当前车队模型【claude-opus-5-5-high-thinking】提问次数已达上限，请 2026-10-15 05
+- 无
 
 ## 最新产物
 - `artifacts/collab-wf-1.9.1-0f9305c.zip`
