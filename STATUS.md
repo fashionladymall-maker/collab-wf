@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 133 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 134 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -30,7 +30,6 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T133-1：让 1.9.3 候选包进入公开仓库——先核对 /Users/admin/.workbuddy-ai/projects/collab-wf-dev/workflow/outbox/collab-wf-1.9.3.zip 的 sha256 仍为 ad541aea5686da4b4c479b643e01d6db248a4dfa2227c10aae61bbdf79fa48d3；一致的话只更新它的修改时间（
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
