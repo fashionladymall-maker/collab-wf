@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 143 轮 · 接收与解析（INTAKE）
+第 143 轮 · 落地版本（APPLY）
 
 ## 版本
 - 工具：collab-wf 1.9.7
