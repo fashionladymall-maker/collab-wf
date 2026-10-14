@@ -35,7 +35,6 @@
 - [executor] 执行端待办 T142-2：为巡查主体补三项原文，只读或只在一次性测试会话上做：① hook 配置的确切 JSON 结构（含事件名、matcher、command 字段、timeout），以及项目级配置被实际读取的完整路径（附源码行号）；② hook 的输入方式（是否经 stdin 传 JSON）、退出码含义、超时与失败时的宿主行为；③ 新建一个一次性测试会话（不用 main、repair、live），让一个 codebud
 - [executor] 执行端待办 T144-1：按 patrol-0.1.zip 里 README 的“安装”在演练模式下落地并验收（resume_enabled 保持 false，不 resume 任何会话、不运行 wf tick、不改已有 launchd 任务）：① 解压到 /Users/admin/.workbuddy-ai/adapter/patrol/，核对包的 sha256 后运行 patrol.py selftest，应为 16/
 - [executor] 执行端待办 T144-2：适配器接上实景测量需要的字段：发送日志按项目与轮次记录、发送时给出用户消息的 uuid、poll 完成时给出回复的 parent 与可信的 ended_at；改完用一轮真实收发核对 reply_meta.json 与 send_meta.json 的原文，写进 wf task done。
-- [executor] 执行端待办 T147-1：审读并离线核验 patrol-0.4.zip，只在临时目录里做，不启用 resume、hook、launchd，不碰 main、repair、live 会话，也不装到 adapter 目录：① 核对包的 sha256 与 patrol.py（da4e2719…）、patrol_hook.py（9d247f71…）的 sha256；② 运行 patrol.py selftest，应为 38/38；③
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
