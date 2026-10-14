@@ -30,7 +30,6 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 执行端待办 T134-2：查明第 134 轮回报里 wf tell 附带的第三份原文为什么在“sha256：54f5”处中断，是 wf tell 排队、回报预算还是发送环节截断的，截断时有没有任何提示；只报告，不重发那份原文。
 - [executor] 独立审查 collab-wf-1.9.4.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/collab-wf.tool.collab-wf-1.9.4.request.json
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
