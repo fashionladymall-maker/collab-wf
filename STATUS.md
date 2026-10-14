@@ -31,6 +31,7 @@
 
 ## 待办
 - [executor] 执行端待办 T136-1：等执行端重启的独立审查对 workflow/outbox/collab-wf-1.9.4.zip（sha256 3386fb1fa31c794ecfd20ec56dd26c5e2ede460923b689f25288cdf3f70b6b65）与 local/reviews/collab-wf-1.9.4.diff 正式提交结论；先核对结论绑定的是这个包的 sha256 与这份 diff（写明 di
+- [executor] 独立审查 collab-wf-1.9.4.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/collab-wf.tool.collab-wf-1.9.4.request.json
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
