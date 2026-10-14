@@ -187,3 +187,7 @@ send 只收到心跳、没看到生成开始（`{"status": "heartbeat_only"}`，
 
 - 发送结果不明、驱动器之后用 poll 确认送达时（status 为 generating 或 done），请同样给出 message_uuid：被确认的那条消息在通道里的标识。wf 记进本轮的 send_meta.json，注明 confirmed_by=poll；没有给出时不记，实景测量如实判“父子关系无法核对”。
 
+## 附：1.9.6 读不了通道
+
+- poll 读不了通道（例如接口返回 HTML、非 JSON、网络错误）时，请返回 status=read_error，并在 error 里写明原因；不要返回 none。none 的意思是“读到了，没有这条消息或回复”，会计入“没落地”；read_error 会被单独处置：保留发送意图与 ref，不重发、不换对话。
+

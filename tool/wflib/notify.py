@@ -4,6 +4,8 @@
 关闭：环境变量 WF_NOTIFY=0，或 local/notify.json 写 {"enabled": false}。通知出任何问题都不影响 wf tick。"""
 from __future__ import annotations
 
+import json
+
 import os
 import shutil
 import subprocess
@@ -137,12 +139,13 @@ def collect_inbox(projects) -> list:
     return out
 
 
-def write_inbox(projects, path=None, items=None) -> list:
+def write_inbox(projects, path=None, items=None, keep_projects=None) -> list:
     """覆盖写 inbox：当前全部待办；同一件事保留第一次出现的时间（since），处理掉的事随之消失。
-    1.7.2：每个项目自己的定时任务会并发写它，读改写放在文件锁里。"""
+    1.7.2：每个项目自己的定时任务会并发写它，读改写放在文件锁里。
+    1.9.6：keep_projects 里的项目（这次读不出状态的）在 inbox 里原有的事项原样保留，不因读不出就被抹掉。"""
     path = path or INBOX
     with _inbox_lock(path):
-        res = _write_inbox_locked(projects, path, items)
+        res = _write_inbox_locked(projects, path, items, keep_projects)
         _write_views(projects, path, res)
         return res
 
@@ -185,9 +188,12 @@ def _inbox_lock(path):
     return _cm()
 
 
-def _write_inbox_locked(projects, path, items) -> list:
+def _write_inbox_locked(projects, path, items, keep_projects=None) -> list:
     old = {x.get("key"): x for x in ((read_json(path, {}) or {}).get("items") or []) if isinstance(x, dict)}
     items = collect_inbox(projects) if items is None else [dict(x) for x in items]
+    keep = set(keep_projects or ()) - {getattr(i, "name", "") for i in projects or []}
+    have = {x.get("key") for x in items}
+    kept = [json.loads(json.dumps(x)) for k, x in old.items() if k not in have and x.get("project") in keep]
     for x in items:
         x["since"] = (old.get(x["key"]) or {}).get("since") or now_iso()
         x.setdefault("decision_owner", x.get("for") or "executor")   # 1.8.3：升级之前的决定归属
@@ -198,6 +204,7 @@ def _write_inbox_locked(projects, path, items) -> list:
             # 1.8.3（W70）：升级只是让用户看见（notify_user）；for 为兼容旧读者仍改为 user，但决定归属不变、投递对象仍是执行端
             x["for"], x["escalated"], x["notify_user"] = "user", True, True
             x["title"] = f"{x.get('title') or ''}（交给执行端超过 {ESCALATE_S // 3600} 小时仍未处理，已转给用户）"
+    items += kept   # 1.9.7：读不出状态的项目，原有事项放在升级循环之后，逐字段原样保留
     write_json(path, {"updated": now_iso(), "items": items})
     return items
 

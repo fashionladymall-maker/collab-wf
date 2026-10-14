@@ -249,7 +249,13 @@ def _t_reply_limit(_ok):
             mp = inst.turn_dir(5) / "reply_meta.json"
             meta = json.loads(mp.read_text(encoding="utf-8")) if mp.exists() else {}
             r2 = driver.h_intake(driver.Ctx(inst, {}, time.time() + 60))
-            carry = dict(inst.state.get("limit_carry") or {})
+            # 1.9.5：固定块齐全但因上限结束的回复不再照常执行，改为续接；不再挂“下一条补齐”
+            no_exec = (inst.state.get("state") == "COMPOSE" and inst.state.get("compose_reason") == "continue"
+                       and "limit_carry" not in inst.state)
+            ctext = driver._compose_text(driver.Ctx(inst, {}, time.time() + 60))[0] if no_exec else ""
+            # 旧的“下一条补齐”附加逻辑保留给升级前留下的状态，照旧检查它
+            carry = {"turn": 5, "stop_reason": "tool_use_limit", "conv": "C1", "delivered": []}
+            inst.state["limit_carry"] = dict(carry)
             out = Path(td) / "next.md"
             out.write_text("【回报 · 第 6 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
             driver._append_limit_carry(inst, {"file": str(out), "turn": 6})
@@ -261,19 +267,21 @@ def _t_reply_limit(_ok):
             driver._append_limit_carry(inst, {"file": str(out2), "turn": 6})
             body2 = out2.read_text(encoding="utf-8")
             inst.state["limit_streak"] = 2
-            inst.state["reply_completion"] = dict(meta)
+            inst.state["reply_completion"] = dict(meta, turn=inst.state.get("turn"))   # 1.9.5：续接已让轮次加一
             driver._limit_reply(driver.Ctx(inst, {}, time.time() + 60), False)
             capped = "limit_carry" not in inst.state and inst.state.get("limit_streak") == 3
             line = driver._limit_line(inst, 5)
         finally:
             anomaly.call = orig
-    _ok("1.8.2 回复完整性：适配器给出的结束原因写入 reply_meta.json；因工具上限结束、固定块齐全时照常解析，并在下一条消息末尾"
-        "请 Claude 先从断点补齐（只在同一对话内，连续 3 次后不再自动附）；续接消息写明上一轮的结束原因",
+    _ok("1.9.5 回复完整性：适配器给出的结束原因写入 reply_meta.json；因工具上限结束的回复即使固定块齐全也不落地、不执行，"
+        "转为续接，续接消息写明结束原因、要求把命令与驱动指令完整重写；升级前留下的“下一条补齐”只在同一对话内附、用过即清、"
+        "连续 3 次后不再附",
         r1[0] == "progress" and meta.get("completion_state") == "continuation_required"
-        and meta.get("stop_reason") == "tool_use_limit" and r2[0] == "progress" and carry.get("stop_reason") == "tool_use_limit"
+        and meta.get("stop_reason") == "tool_use_limit" and r2[0] == "progress" and "REPLY_TRUNCATED" in r2[1] and no_exec
+        and "tool_use_limit" in ctext and "完整写出" in ctext
         and "tool_use_limit" in body and "从断点补齐" in body and cleared and "从断点补齐" not in body2 and capped
         and "tool_use_limit" in line,
-        json.dumps([r1, r2, meta, carry, body[-300:], body2, line], ensure_ascii=False)[:900])
+        json.dumps([r1, r2, meta, no_exec, ctext[-300:], body[-200:], body2, line], ensure_ascii=False)[:900])
 
 
 def _t_stage_symlink(_ok):
@@ -1142,6 +1150,253 @@ def _t_selftest_failure_report(_ok):
         msg[:600])
 
 
+def _t_explain_executor_wait(_ok):
+    # 1.9.5（W101）：驱动器在等执行端的待办时，explain 写明“需要：执行端”与待办编号，不再是“脚本、无需操作”
+    from . import driver, tasks
+    orig = driver.policy.status
+    driver.policy.status = lambda inst, kind: {"approved": True, "exists": True, "changed_since_approval": False}
+    try:
+        e1, e2 = _explain_wait_case(driver, tasks)
+    finally:
+        driver.policy.status = orig
+    _ok("1.9.5 等执行端时的说明：有未完成的阻塞待办时写“执行端”与待办编号、说明定时器不会替执行端完成；"
+        "只剩不阻塞的待办时照旧",
+        e1.get("who") == "执行端" and "T4-1" in e1.get("why", "") and "T4-2" not in e1.get("why", "")
+        and "wf task done" in e1.get("what", "") and e2.get("who") != "执行端",
+        json.dumps([e1, e2], ensure_ascii=False)[:600])
+
+
+def _explain_wait_case(driver, tasks):
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v195-x", {"state": "WAIT_SCHEDULE", "turn": 4, "wait_until": "2026-10-14T10:00:00+00:00",
+                                 "wait_reason": "等执行端"})
+        tasks.add(a, 4, {"1": "核对日志", "2": "（不阻塞）顺带整理"})
+        e1 = driver.explain(a)
+        for t in a.state["executor_tasks"]:
+            if t["id"] == "T4-1":
+                t["done"] = "2026-10-14T09:00:00+00:00"
+        a.save()
+        e2 = driver.explain(a)
+    return e1, e2
+
+
+def _t_tell_lossless(_ok):
+    # 1.9.5（W98）：wf tell 不再按 4000 字符静默截断：超长分段并写明全文长度与 sha256；超过上限拒绝排队
+    import hashlib
+    from . import driver, ops
+    from .core import WfError
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v195-t", {"state": "IDLE", "turn": 2})
+        long = "  \n" + "".join(f"第{i:05d}行原文；" for i in range(1200)) + "\n\n  "   # 约 1.2 万字，首尾带空白
+        r = ops.queue_tell(a, long)
+        q = list(a.state.get("pending_tell") or [])
+        k = len(q)
+        rebuilt = ""
+        for i, x in enumerate(q, 1):   # 1.9.6：按段头、段尾精确拆回，必须逐字等于原文（含首尾空白）
+            head = f"（第 {i}/{k} 段；全文 {len(long)} 字，sha256 {r['sha256']}）"
+            body_i = x["text"][len(head):] if x["text"].startswith(head) else None
+            if body_i is None:
+                rebuilt = None
+                break
+            if i == k:
+                body_i = body_i[:-len("（全文结束）")] if body_i.endswith("（全文结束）") else None
+            if body_i is None:
+                rebuilt = None
+                break
+            rebuilt += body_i
+        f = a.outbox / "turn-003.md"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("【回报 · 第 3 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+        driver._append_tell(a, {"file": str(f), "turn": 3})
+        body = f.read_text(encoding="utf-8")
+        try:
+            ops.queue_tell(a, "x" * (ops.TELL_MAX + 1))
+            refused = False
+        except WfError as e:
+            refused = "没有排队" in str(e)
+        left = a.state.get("pending_tell")
+    joined = "".join(x["text"] for x in q)
+    _ok("1.9.6 wf tell 无损：超过 4000 字分段排队，每段写明第几段、全文长度与完整 sha256；按段头段尾拆回后逐字等于原文"
+        "（含首尾空白）；超过单次上限拒绝、不截断",
+        rebuilt == long and r["parts"] == len(q) >= 3 and r["chars"] == len(long)
+        and r["sha256"] == hashlib.sha256(long.encode()).hexdigest()
+        and all(long[i * ops.TELL_PART:(i + 1) * ops.TELL_PART] in q[i]["text"] for i in range(len(q)))
+        and f"第 1/{len(q)} 段" in joined and "全文结束" in joined and all(x["text"] in body for x in q) and refused and not left,
+        json.dumps([r, len(q), refused], ensure_ascii=False))
+
+
+def _t_watchdog_scope(_ok):
+    # 1.9.5：wf watchdog --project 只检查这个项目；重写 inbox 时带上全部项目，不抹掉别的项目的事项
+    from . import notify, watchdog
+    calls = {}
+    orig = (watchdog.check, notify.write_inbox)
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v195-wa", {"state": "IDLE", "turn": 1})
+        b = _inst(td, "v195-wb", {"state": "IDLE", "turn": 1})
+        try:
+            watchdog.check = lambda inst: calls.setdefault("checked", []).append(inst.name) or []
+            notify.write_inbox = lambda projects, path=None, items=None, **k: calls.setdefault("inbox", []).extend(i.name for i in projects)
+            watchdog.run([a], write=True, inbox_insts=[a, b])
+        finally:
+            watchdog.check, notify.write_inbox = orig
+        ib = Path(td) / "inbox.json"
+        ghost = {"key": "ghost|x", "project": "ghost-proj", "for": "executor", "title": "读不出的项目原有的事项",
+                 "since": "2026-10-14T00:00:00+00:00"}
+        ib.write_text(json.dumps({"items": [ghost]}), encoding="utf-8")
+        notify.write_inbox([a], path=ib, keep_projects={"ghost-proj"})
+        # 1.9.7：原样保留——逐字段相等（此前会经过 2 小时升级循环被改写字段）
+        kept = [x for x in json.loads(ib.read_text(encoding="utf-8"))["items"] if x.get("key") == "ghost|x"] == [ghost]
+        notify.write_inbox([a], path=ib)
+        dropped = not any(x.get("key") == "ghost|x" for x in json.loads(ib.read_text(encoding="utf-8"))["items"])
+    _ok("1.9.7 看门狗按项目：只检查指定的项目；重写 inbox 时带上全部项目；这次读不出状态的项目，inbox 里原有的事项逐字段原样保留（不经升级循环）",
+        calls.get("checked") == [a.name] and sorted(calls.get("inbox") or []) == sorted([a.name, b.name]) and kept and dropped,
+        json.dumps([calls, kept, dropped], ensure_ascii=False))
+
+
+def _t_truncated_atomic(_ok):
+    # 1.9.6（1.9.5 安装前审查 block）：完整性判据必须在转入 REVIEW 之前；评审、落地、执行共用守卫；命令行 intake 同样拦下
+    from . import driver, ops
+    from .core import WfError
+    res = {}
+    with tempfile.TemporaryDirectory() as td:
+        rf = Path(td) / "reply.md"
+        rf.write_text(REPLY6, encoding="utf-8")
+        cut = {"turn": 5, "stop_reason": "max_tokens", "completion_state": "continuation_required"}
+        a = _inst(td, "v196-i", {"state": "INTAKE", "turn": 5, "reply_completion": dict(cut)})
+        r = ops.intake(a, rf, by="executor")   # 命令行 wf intake 走的就是这里
+        res["cli_state"], res["cli_trunc"] = a.state["state"], r.get("truncated")
+        a.state["state"] = "REVIEW"   # 模拟升级前遗留、或在转入 REVIEW 之后崩溃重启
+        a.save()
+        try:
+            ops.review(a, accept=True)
+            res["cli_review"] = "放行了"
+        except WfError as e:
+            res["cli_review"] = "拦下" if "没有完成" in str(e) else str(e)
+        for stname, h in (("REVIEW", driver.h_review), ("APPLY", driver.h_apply), ("EXECUTE", driver.h_execute)):
+            b = _inst(td, f"v196-{stname.lower()}", {"state": stname, "turn": 5, "reply_completion": dict(cut),
+                                                     "release_path": None})
+            b.turn_dir().mkdir(parents=True, exist_ok=True)
+            write = ops.parse_reply(REPLY6)
+            (b.turn_dir() / "intake.json").write_text(json.dumps(write, ensure_ascii=False), encoding="utf-8")
+            out = h(driver.Ctx(b, {}, time.time() + 60))
+            evs = [json.loads(x) for x in b.events_path.read_text(encoding="utf-8").splitlines()] if b.events_path.exists() else []
+            res[stname] = (out[1][:40], b.state["state"], sum(1 for e in evs if e.get("type") in ("exec", "apply")))
+    _ok("1.9.6 没完成的回复进不了评审：命令行 intake 不转入 REVIEW；在 REVIEW、APPLY、EXECUTE 里重启时，"
+        "评审、落地、执行都拦下并转为续接，一条命令都不执行",
+        res.get("cli_state") == "INTAKE" and res.get("cli_trunc") == "max_tokens" and res.get("cli_review") == "拦下"
+        and all(res.get(k) and "REPLY_TRUNCATED" in res[k][0] and res[k][1] == "COMPOSE" and res[k][2] == 0
+                for k in ("REVIEW", "APPLY", "EXECUTE")),
+        json.dumps(res, ensure_ascii=False)[:700])
+
+
+def _t_poll_read_error(_ok):
+    # 1.9.6：适配器读不了通道（read_error）不等于“没有回复”：不计入未落地、不清 ref、不重发，单独处置
+    from . import anomaly, driver
+    orig = anomaly.call
+    calls = []
+
+    def fake(op, args, timeout=None, env_extra=None):
+        calls.append(op)
+        if op == "poll":
+            return {"code": 0, "raw": "<html>", "data": {"status": "read_error", "error": "text/html 482 字节"}}
+        return {"code": 0, "raw": "", "data": {"ref": "NEW"}}
+    res = {}
+    try:
+        anomaly.call = fake
+        with tempfile.TemporaryDirectory() as td:
+            a = _inst(td, "v196-r1", {"state": "SEND", "turn": 2})
+            f = a.outbox / "turn-002.md"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+            a.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
+            a.state["send_intent"] = {"turn": 2, "status": "pending", "ts": "2026-10-14T08:19:56+00:00", "ref": "R2", "file": str(f)}
+            a.save()
+            o1 = driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+            res["send"] = (o1[1][:60], a.state["state"], (a.state.get("send_intent") or {}).get("status"), "send" in calls)
+            b = _inst(td, "v196-r2", {"state": "WAIT_REPLY", "turn": 3, "send_ref": "R3", "sent_at": "2026-10-14T08:00:00+00:00"})
+            o2 = driver.h_wait_reply(driver.Ctx(b, {}, time.time() + 60))
+            res["wait"] = (o2[1][:60], b.state["state"], b.state.get("send_ref"), b.state.get("send_unconfirmed"))
+    finally:
+        anomaly.call = orig
+    _ok("1.9.6 读不了通道：发送待确认与等待回复时，轮询返回 read_error 都按 POLL_READ_ERROR 处置；"
+        "发送意图仍待确认、不重发，ref 保留，不计入“没落地”",
+        "POLL_READ_ERROR" in res["send"][0] and res["send"][1] == "SEND" and res["send"][2] == "pending" and not res["send"][3]
+        and "POLL_READ_ERROR" in res["wait"][0] and res["wait"][1] == "WAIT_REPLY" and res["wait"][2] == "R3"
+        and not res["wait"][3],
+        json.dumps(res, ensure_ascii=False))
+
+
+def _t_read_error_window(_ok):
+    # 1.9.7（1.9.6 安装前审查 block）：读不了通道的时段不计入“结果不明”窗口与“没落地”的墙钟；
+    # 故障恢复后第一次读到 none，不立刻判超时、不清 ref。对照组（没有读取故障）照旧按墙钟判定
+    from datetime import timedelta
+    from . import anomaly, driver
+    from .core import now
+    orig = anomaly.call
+    iso = lambda dt: dt.isoformat(timespec="seconds")
+    anomaly.call = lambda op, args, timeout=None, env_extra=None: {"code": 0, "raw": "", "data": {"status": "none"}}
+    res = {}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            for case, rec in (("comp", True), ("ctrl", False)):
+                a = _inst(td, f"v197-s-{case}", {"state": "SEND", "turn": 2})
+                f = a.outbox / "turn-002.md"
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+                a.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
+                a.state["send_intent"] = {"turn": 2, "status": "pending", "ts": iso(now() - timedelta(hours=2)), "ref": "R2",
+                                          "file": str(f)}
+                if rec:
+                    a.state["read_error"] = {"turn": 2, "total_s": 0.0, "since": iso(now() - timedelta(minutes=114))}
+                a.save()
+                driver.h_send(driver.Ctx(a, {"send_unknown_wait": True, "send_unknown_window_s": 3600}, time.time() + 60))
+                res[f"send-{case}"] = (a.state["state"], (a.state.get("send_intent") or {}).get("status"))
+                b = _inst(td, f"v197-w-{case}", {"state": "WAIT_REPLY", "turn": 3, "send_ref": "R3",
+                                                 "sent_at": iso(now() - timedelta(hours=2))})
+                if rec:
+                    b.state["read_error"] = {"turn": 3, "total_s": 0.0, "since": iso(now() - timedelta(minutes=117))}
+                    b.save()
+                driver.h_wait_reply(driver.Ctx(b, {"landed_timeout_s": 600, "landed_min_polls": 1}, time.time() + 60))
+                res[f"wait-{case}"] = (b.state["state"], b.state.get("send_ref"), round(driver._read_error_secs(b.state)))
+    finally:
+        anomaly.call = orig
+    _ok("1.9.7 读取故障的时段从墙钟里扣掉：长时间 read_error 恢复后第一次读到 none，发送待确认仍在窗口内重试、"
+        "等待回复不判没落地、ref 保留；对照组（同样的墙钟、没有读取故障）照旧超时",
+        res["send-comp"] == ("SEND", "pending") and res["send-ctrl"][0] != "SEND"
+        and res["wait-comp"][0] == "WAIT_REPLY" and res["wait-comp"][1] == "R3" and res["wait-comp"][2] >= 6900
+        and res["wait-ctrl"][1] is None,
+        json.dumps(res, ensure_ascii=False))
+
+
+def _t_completion_boundaries(_ok):
+    # 1.9.7（审查 concerns）：完整性判据的边界——适配器没给结束信息、结束信息属于旧轮次、结束状态“未知”时照常进入评审；
+    # 结束原因是上限却标成 normal（自相矛盾）时从严，按没有完成处理
+    from . import driver, ops
+    out = {}
+    with tempfile.TemporaryDirectory() as td:
+        rf = Path(td) / "reply.md"
+        rf.write_text(REPLY6, encoding="utf-8")
+        cases = {"none": None, "old_turn": {"turn": 4, "stop_reason": "max_tokens", "completion_state": "continuation_required"},
+                 "contradict": {"stop_reason": "max_tokens", "completion_state": "normal"},
+                 "unknown": {"stop_reason": None, "completion_state": "unknown", "ended_at": "2026-10-14T00:00:00+00:00"}}
+        for name, meta in cases.items():
+            a = _inst(td, f"v197-b-{name}", {"state": "INTAKE", "turn": 5})
+            a.turn_dir().mkdir(parents=True, exist_ok=True)
+            if name == "old_turn":
+                a.state["reply_completion"] = dict(meta)
+                a.save()
+            elif meta is not None:
+                driver._reply_meta(a, meta)
+                a.save()
+            r = ops.intake(a, rf, by="executor")
+            out[name] = (a.state["state"], r.get("truncated"), (a.state.get("reply_completion") or {}).get("contradiction"))
+    _ok("1.9.7 完整性判据的边界：没有结束信息、结束信息属于旧轮次、结束状态未知，都照常进入评审；"
+        "结束原因是上限却标成 normal，从严按没有完成处理、不进入评审",
+        out["none"][0] == "REVIEW" and out["old_turn"][0] == "REVIEW" and out["unknown"][0] == "REVIEW"
+        and out["contradict"][0] == "INTAKE" and out["contradict"][1] == "max_tokens" and out["contradict"][2] is True,
+        json.dumps(out, ensure_ascii=False))
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
@@ -1156,7 +1411,10 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
          ("待办标记", _t_task_markers),
          ("自检不发通知", _t_no_desktop_notify), ("自检环境隔离", _t_selftest_env), ("事件身份恢复", _t_actor_restore),
          ("不明发送的消息标识", _t_send_meta_poll), ("同步历史HEAD", _t_sync_history_head),
-         ("目标检查只读", _t_goal_check_readonly), ("自检失败报告", _t_selftest_failure_report)]
+         ("目标检查只读", _t_goal_check_readonly), ("自检失败报告", _t_selftest_failure_report),
+         ("等执行端的说明", _t_explain_executor_wait), ("补充说明无损", _t_tell_lossless), ("看门狗按项目", _t_watchdog_scope),
+         ("完整性前门原子", _t_truncated_atomic), ("读不了通道", _t_poll_read_error),
+         ("读取故障时段", _t_read_error_window), ("完整性判据边界", _t_completion_boundaries)]
 
 
 def run_v18(_ok) -> None:

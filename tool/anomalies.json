@@ -138,6 +138,34 @@
       "ledger": "WR-2"
     },
     {
+      "id": "REPLY_TRUNCATED",
+      "match": {
+        "source": "intake",
+        "kind": "reply_truncated"
+      },
+      "action": "continue",
+      "max": 2,
+      "then": "block",
+      "why": "回复因工具调用或长度上限结束，没有完成。固定块齐全也不解析执行，先请 Claude 从断点补齐成一条完整的回复（1.9.5）。"
+    },
+    {
+      "id": "POLL_READ_ERROR",
+      "match": {
+        "source": "driver",
+        "kind": "poll_read_error"
+      },
+      "action": "retry",
+      "backoff_s": [
+        60,
+        120,
+        300,
+        600
+      ],
+      "max": 12,
+      "then": "await_user",
+      "why": "适配器读不了通道（read_error），这不是“没有回复”：保留发送意图、ref 与原对话，不重发、不换对话；请执行端修复通道读取，恢复后按原链路取回回复（1.9.6）。"
+    },
+    {
       "id": "VERSION_JUMP",
       "match": {
         "source": "review",

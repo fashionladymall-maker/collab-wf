@@ -567,6 +567,8 @@ def main(argv=None):
             out({k: v for k, v in r.items() if k != "blocks"})
         else:
             print(f"固定块：齐全" if not r["blocks_missing"] else f"缺少固定块：{'、'.join(r['blocks_missing'])}（IN-1）")
+            if r.get("truncated"):   # 1.9.6
+                print(f"回复因 {r['truncated']} 结束，没有完成：不进入评审，等续接后的完整回复")
             print(f"命令 {len(r['commands'])} 条；回报清单 {len(r['checklist'])} 项；需要用户决定 {len(r['user_decisions'])} 项；"
                   f"建议档位 {r['effort'] or '未写明'}；交付文件 {', '.join(r['zips']) or '无'}")
             for i, cmd in enumerate(r["commands"], 1):
@@ -896,7 +898,13 @@ def main(argv=None):
                 insts.append(Instance(Path(p["root"])))
             except WfError as e:
                 print(f"跳过 {p['name']}：{e}")
-        rows = watchdog.run(insts, write=args.write)
+        mine = insts
+        if getattr(args, "project", None):   # 1.9.5：--project 只检查这个项目；重写 inbox 时仍带上全部项目，不抹掉别的项目的事项
+            mine = [i for i in insts if i.name == args.project]
+            if not mine:
+                raise WfError(f"注册表里没有项目 {args.project}")
+        failed = {p["name"] for p in load_registry()["projects"]} - {i.name for i in insts}
+        rows = watchdog.run(mine, write=args.write, inbox_insts=insts, keep_projects=failed)   # 1.9.6：读不出的项目，inbox 里原有事项保留
         if args.json:
             out({"findings": rows, "thresholds": watchdog.THRESHOLDS, "written": bool(args.write)})
         else:
@@ -981,15 +989,11 @@ def main(argv=None):
     elif c == "tell":
         # 1.7.6：执行端给 Claude 的补充说明，附在下一条发出的消息末尾（回报、续接、计划节点都带）
         inst = _p(args)
-        t = (args.text or "").strip()
-        if not t:
-            raise WfError('用法：wf tell --text "…"')
-        q = list(inst.state.get("pending_tell") or [])
-        q.append({"ts": tool_now(), "text": t[:4000]})
-        inst.state["pending_tell"] = q
-        inst.event("tell", text=t[:500], by="executor")
+        from wflib import ops as _ops   # 1.9.5（W98）：不再静默截断，超长分段并写明长度与 sha256
+        r = _ops.queue_tell(inst, args.text or "")
         busy = inst.state.get("state") in ("SEND", "WAIT_REPLY")
-        print(f"已排队（共 {len(q)} 条）：附在下一条发给 Claude 的消息末尾" +
+        print(f"已排队：原文 {r['chars']} 字" + (f"，分 {r['parts']} 段" if r["parts"] > 1 else "")
+              + f"，sha256 {r['sha256'][:16]}（队列共 {r['queued']} 条），附在下一条发给 Claude 的消息末尾" +
               ("；本轮消息已在发送或等待回复，会附在下一条" if busy else ""))
     elif c == "pause":
         inst = _p(args)

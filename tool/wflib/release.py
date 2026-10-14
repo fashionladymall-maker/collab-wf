@@ -289,7 +289,10 @@ def _with_heartbeat(fn, limit_s: int, every_s: int):
             box["r"] = fn()
         except Exception as e:   # noqa: BLE001
             box["e"] = e
-    print(f"开始等独立审查（上限 {limit_s} 秒；到时没有结论按“未审查”继续安装）", file=sys.stderr, flush=True)
+    from . import anomaly as _an   # 1.9.5：开启 review_required 时，到时没有结论是不安装，不能写“继续安装”
+    print(f"开始等独立审查（上限 {limit_s} 秒；到时没有结论"
+          + ("按 review_required 不安装）" if _an.transport_cfg().get("review_required") else "按“未审查”继续安装）"),
+          file=sys.stderr, flush=True)
     t0 = time.monotonic()
     th = threading.Thread(target=target, daemon=True)
     th.start()

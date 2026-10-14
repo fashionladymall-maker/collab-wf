@@ -320,12 +320,24 @@ def intake(inst: Instance, reply_file: Path, by="executor") -> dict:
     if st["state"] != "INTAKE":
         raise WfError(f"当前是 {st['state']}，intake 需要在 INTAKE 状态运行（先 wf mark replied）。")
     res = parse_reply(Path(reply_file).read_text(encoding="utf-8"))
+    tr = truncated_reason(inst)   # 1.9.6：完整性判据在转入 REVIEW 之前判定，与转入是同一步，中途退出也不会跳过
+    if tr:
+        res["truncated"] = tr
     write_json(inst.turn_dir() / "intake.json", res)
     inst.event("intake", missing=res["blocks_missing"] or None, commands=len(res["commands"]),
-               checklist=len(res["checklist"]), effort=res["effort"], by=by)
-    if not res["blocks_missing"]:
-        machine.go(inst, "REVIEW", by="wf", reason="固定块齐全")
+               checklist=len(res["checklist"]), effort=res["effort"], truncated=tr or None, by=by)
+    if not res["blocks_missing"] and not tr:
+        machine.go(inst, "REVIEW", by="wf", reason="固定块齐全，回复正常结束")
     return res
+
+
+def truncated_reason(inst) -> str:
+    """1.9.6：本轮回复因工具调用或长度上限结束（适配器给出 completion_state=continuation_required）时返回结束原因，否则返回空。
+    intake、评审、落地、执行共用这一个判据：没完成的回复不进入评审，也不会在评审之后被落地或执行。"""
+    c = inst.state.get("reply_completion") or {}
+    if c.get("turn") == inst.state.get("turn") and c.get("completion_state") == "continuation_required":
+        return str(c.get("stop_reason") or "未知原因")
+    return ""
 
 
 # ---------------- 执行前评审 ----------------
@@ -357,6 +369,9 @@ def review(inst: Instance, accept=False, user_approved=None, by="executor") -> d
     st = inst.state
     if st["state"] != "REVIEW":
         raise WfError(f"当前是 {st['state']}，评审需要在 REVIEW 状态进行。")
+    tr = truncated_reason(inst)
+    if tr:
+        raise WfError(f"本轮回复因 {tr} 结束，没有完成，不能评审（1.9.6）：请 Claude 续接，按补齐后的完整回复处理")
     it = read_json(inst.turn_dir() / "intake.json", {}) or {}
     rows = []
     for c in it.get("commands", []):
@@ -739,3 +754,34 @@ def bridge_check(log: Path, hours=None, grace_s=None, at=None) -> list:
                 hits.append(f"第 {i} 行：{why}")
     ok("R5 无凭据", not hits, "未发现疑似凭据" if not hits else "；".join(hits[:5]))
     return res
+
+
+TELL_PART = 4000     # 1.9.5（W98）：每段的长度；超过就分段，不再截断
+TELL_MAX = 40000     # 单次 wf tell 的上限；超过就拒绝排队（不截断），请拆开或放进项目文件
+
+
+def queue_tell(inst, text: str) -> dict:
+    """1.9.5（W98）：执行端给 Claude 的补充说明排队。此前按 4000 字符静默截断（第 134 轮第三份原文丢尾）；
+    现在超长时分段、每段写明第几段与全文长度和 sha256，全文超过 TELL_MAX 时拒绝排队并说明。"""
+    import hashlib
+    from .core import WfError, now_iso
+    t = text or ""   # 1.9.6：原样保留，不去掉首尾空白（审查意见：strip 改变了原文边缘）
+    if not t.strip():
+        raise WfError('用法：wf tell --text "…"')
+    n = len(t)
+    if n > TELL_MAX:
+        raise WfError(f"补充说明有 {n} 字，超过单次上限 {TELL_MAX} 字，没有排队（不截断）。请拆成几次 wf tell，"
+                      "或把原文放进项目里的文件、在说明里写路径与 sha256，由 Claude 用命令读取")
+    digest = hashlib.sha256(t.encode("utf-8")).hexdigest()
+    parts = [t[i:i + TELL_PART] for i in range(0, n, TELL_PART)]
+    q = list(inst.state.get("pending_tell") or [])
+    ts = now_iso()
+    for i, part in enumerate(parts, 1):
+        head = f"（第 {i}/{len(parts)} 段；全文 {n} 字，sha256 {digest}）" if len(parts) > 1 else ""
+        tail = "（全文结束）" if len(parts) > 1 and i == len(parts) else ""
+        q.append({"ts": ts, "text": head + part + tail})
+    inst.state["pending_tell"] = q
+    inst.save()
+    inst.event("tell", text=t[:500], chars=n, parts=len(parts), sha256=digest, by="executor")
+    return {"chars": n, "parts": len(parts), "sha256": digest, "queued": len(q)}
+

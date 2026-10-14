@@ -71,8 +71,9 @@ def check(inst: Instance) -> list:
     return out
 
 
-def run(insts, write=False) -> list:
-    """检查全部项目。write 为真时写成信号、清除已恢复的、并重写 inbox。"""
+def run(insts, write=False, inbox_insts=None, keep_projects=None) -> list:
+    """检查给定的项目。write 为真时写成信号、清除这些项目里已恢复的、并重写 inbox。
+    1.9.5：inbox 按 inbox_insts（默认同 insts）重写——只检查一个项目时，也不抹掉其他项目在 inbox 里的事项。"""
     findings = []
     for inst in insts:
         try:
@@ -94,7 +95,7 @@ def run(insts, write=False) -> list:
             if k.startswith("watchdog:") and len(parts) >= 3 and parts[1] in names and k not in live:
                 signals.clear(k)
         try:
-            notify.write_inbox(insts)
+            notify.write_inbox(inbox_insts if inbox_insts is not None else insts, keep_projects=keep_projects)
         except Exception:   # noqa: BLE001  inbox 写不出来不影响判定结果
             pass
     return findings

@@ -196,6 +196,15 @@ def explain(inst: Instance) -> dict:
         return {"where": where, "why": "全部目标判据已通过", "who": "用户", "what": "验收结果；需要交给 Claude 时 wf kick --kind report（由证据生成带原文的回报；说明先用 wf note --kind info 写）"}
     if s["state"] == "WAIT_REPLY":
         return {"where": where, "why": "Claude 正在处理消息", "who": "Claude", "what": "无需操作，驱动器会定时检查"}
+    if s["state"] == "WAIT_SCHEDULE":
+        from . import tasks as _tasks   # 1.9.5（W101）：在等执行端的待办时，要说清是执行端要做事，不是“无需操作”
+        waiting = _tasks.blocking_items(inst)
+        if waiting:
+            return {"where": where, "why": f"等执行端完成 {len(waiting)} 项待办："
+                    + "；".join(f"{t['id']} {t['text'][:30]}" for t in waiting[:3]) + f"（最迟到 {s['until']}）",
+                    "who": "执行端",
+                    "what": "执行端现在就做：做完一项 wf task done <编号> --note \"结果\"，做到一半用 wf task progress 留检查点；"
+                            "定时器只会在超时后按“未完成”回报，不会替执行端完成"}
     if s["state"] in ("WAIT_SCHEDULE", "QUOTA_WAIT"):
         return {"where": where, "why": f"等待到 {s['until']}：{s['wait_reason'] or ''}", "who": "脚本",
                 "what": "无需操作，到点后驱动器自动继续"}
@@ -231,6 +240,8 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
     if r["id"] == "SEND_UNKNOWN_WAIT":   # 1.8.5（W66）：按墙钟等满 send_unknown_window_s（默认 1 小时），不按次数
         it = st.get("send_intent") or {}
         since = secs_since(it.get("ts")) if it.get("ts") else None
+        if since is not None:
+            since -= _read_error_secs(st)   # 1.9.7：读不了通道的时段不计入“结果不明”的等待窗口
         act = "retry" if since is None or since < int(ctx.pol.get("send_unknown_window_s", 3600) or 3600) else r.get("then", "block")
     streak_block = act == "continue" and int(st.get("continue_streak", 0)) >= 3
     if streak_block:   # 1.7.6：续接连续 3 轮仍缺固定块就停下等人看，不再空耗额度（amy-local 第 7–11 轮）
@@ -412,7 +423,8 @@ def _compose_text(ctx):
     if reason == "continue":
         prev = read_json(inst.turn_dir(st["turn"] - 1) / "intake.json", {}) or {}
         last_eff = prev.get("effort") or "high"
-        miss = "、".join(f"【{b}】" for b in (prev.get("blocks_missing") or [])) or "（见上一轮回复）"
+        miss = "、".join(f"【{b}】" for b in (prev.get("blocks_missing") or [])) or \
+            "（固定块都在，但回复没有正常结束；本轮只按补齐后的完整回复执行，请把全部命令与驱动指令重新完整写出）"
         # 1.7.6：续接消息带上块规格与上一轮没识别到的块（amy-local 第 7–11 轮：块名写成【结论】，续接消息又不说规格，反复续接）
         body = (f"【续接 · 第 {st['turn']} 轮 · {ver}】档位：{last_eff}\n\n上一轮回复在中途中断或缺少固定块"
                 f"（这条消息由驱动器自动发出）。请从断点继续，并给出完整的六个固定块。\n\n"
@@ -648,10 +660,14 @@ def h_send(ctx):
         _adapter_warning(inst, "poll", r)
         page.after_poll(inst, "poll", r["data"].get("status"))
         status = r["data"].get("status")
+        _read_error_track(st, status == "read_error")   # 1.9.7
         if r["code"] == 0 and status in ("generating", "done"):
             intent.update(status="accepted", ref=r["data"].get("ref") or intent.get("ref"))
             _send_meta(inst, r["data"], confirmed_by="poll")   # 1.9.4：结果不明后经轮询确认的发送，也记下消息 uuid
             return _finalize_send(ctx, out, "发送曾被中断，经轮询确认消息已被接受", immediate=(status == "done"))
+        if status == "read_error":   # 1.9.6：适配器读不了通道，不等于“没有回复”：单独处置，不消耗“结果不明”的等待窗口
+            return _anomaly(ctx, {"source": "driver", "kind": "poll_read_error"},
+                            f"发送意图 {intent.get('ts')} 待确认，但轮询读不了通道（read_error）：{(r['data'].get('error') or r['raw'])[:160]}")
         # 1.5.1：policy 的 send_unknown_wait 为真时先自动等待并反复确认（长回复可达半小时以上），绝不自动重发
         return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
                         f"发送意图 {intent.get('ts')} 结果不明；轮询返回 {status or r['raw'][:120]}")
@@ -768,6 +784,29 @@ def _landed_since(st):
     return _pi(st.get("sent_at")) or _pi(st.setdefault("send_unconfirmed_since", now_iso()))
 
 
+def _read_error_track(st, on: bool) -> None:
+    """1.9.7（1.9.6 安装前审查 block）：记下本轮读不了通道（read_error）的时段。这段时间从“结果不明”的等待窗口与
+    “没落地”的墙钟里扣掉：读取故障恢复后第一次读到 none，不会因为故障期间墙钟走过了就立刻判超时、清 ref。"""
+    rec = st.get("read_error") or {}
+    if rec.get("turn") != st.get("turn"):
+        rec = {"turn": st.get("turn"), "total_s": 0.0}
+    if on:
+        rec.setdefault("since", now_iso())
+    elif rec.get("since"):
+        rec["total_s"] = float(rec.get("total_s", 0) or 0) + max(0.0, float(secs_since(rec.pop("since")) or 0))
+    st["read_error"] = rec
+
+
+def _read_error_secs(st) -> float:
+    rec = st.get("read_error") or {}
+    if rec.get("turn") != st.get("turn"):
+        return 0.0
+    t = float(rec.get("total_s", 0) or 0)
+    if rec.get("since"):
+        t += max(0.0, float(secs_since(rec["since"]) or 0))
+    return t
+
+
 def _landed_gave_up(ctx, n: int) -> bool:
     """1.6.8（P2-E）：落地核对何时放弃（进入 SEND_NOT_LANDED；仍不自动重发，恢复只用 wf resend）。
     policy 有 landed_timeout_s（秒，> 0）时按墙钟：距发送已满 landed_timeout_s，且至少核对了 landed_min_polls 次
@@ -776,7 +815,9 @@ def _landed_gave_up(ctx, n: int) -> bool:
     pol, st = ctx.pol, ctx.st
     lt = int(pol.get("landed_timeout_s", 0) or 0)
     if lt > 0:
-        return (now() - _landed_since(st)).total_seconds() >= lt and n >= max(1, int(pol.get("landed_min_polls", 3) or 1))
+        # 1.9.7：扣掉本轮读不了通道的时段
+        return ((now() - _landed_since(st)).total_seconds() - _read_error_secs(st) >= lt
+                and n >= max(1, int(pol.get("landed_min_polls", 3) or 1)))
     return n >= int(pol.get("landed_confirm_polls", 5))
 
 
@@ -801,9 +842,14 @@ def h_wait_reply(ctx):
     _adapter_warning(inst, "poll", r)
     page.after_poll(inst, "poll", r["data"].get("status"))
     status = r["data"].get("status")
+    _read_error_track(st, status == "read_error")   # 1.9.7
     interval = int(ctx.pol.get("poll_interval_s", 120))
     # 独立落地核对（缺口 11/§3）：send 返回 0 只是适配器的说法。这里由 wf 查会话确认消息真的出现了。
     # landed 字段（适配器可给出）或 generating/done 都算“确实落地”；若连续 none，说明消息没落地，按 POLL_NONE 退避/阻塞。
+    if status == "read_error":   # 1.9.6：读不了通道不计入“没落地”，不清 ref、不重发、不换对话
+        inst.save()
+        return _anomaly(ctx, {"source": "driver", "kind": "poll_read_error"},
+                        f"等待回复时轮询读不了通道（read_error）：{(r['data'].get('error') or r['raw'])[:160]}")
     if status in ("generating", "done") or r["data"].get("landed"):
         st.pop("send_unconfirmed", None)
         st.pop("send_unconfirmed_since", None)
@@ -913,7 +959,10 @@ def _reply_meta(inst, data: dict) -> None:
     if cs not in COMPLETION_STATES:
         cs = ("continuation_required" if sr in LIMIT_STOPS else "normal" if sr in ("end_turn", "stop_sequence")
               else "refused" if sr == "refusal" else "unknown")
-    meta = {"turn": inst.state.get("turn"), "stop_reason": sr, "completion_state": cs,
+    contradiction = sr in LIMIT_STOPS and cs != "continuation_required"
+    if contradiction:   # 1.9.7：结束原因是上限、却标成别的状态时，从严按“没有完成”处理
+        cs = "continuation_required"
+    meta = {"turn": inst.state.get("turn"), "stop_reason": sr, "completion_state": cs, "contradiction": contradiction or None,
             "message_uuid": data.get("message_uuid"), "parent": data.get("parent"), "ended_at": data.get("ended_at"),
             "conv": (inst.state.get("conv") or {}).get("conv"), "ts": now_iso()}
     inst.state["reply_completion"] = meta
@@ -942,16 +991,11 @@ def _limit_reply(ctx, missing: bool) -> None:
     n = int(inst.state.get("limit_streak", 0)) + 1
     inst.state["limit_streak"] = n
     sr = comp.get("stop_reason") or "未知原因"
-    if missing:
-        note = f"[REPLY_LIMIT] 回复因 {sr} 结束（连续第 {n} 次），固定块不全：按续接处理，续接消息写明结束原因"
-    elif n >= LIMIT_STREAK_MAX:
-        inst.state.pop("limit_carry", None)
-        note = (f"[REPLY_LIMIT] 连续 {n} 轮回复因工具或长度上限结束：不再自动附“从断点补齐”，"
-                "请 Claude 缩小每轮范围、分批交付")
-    else:
-        inst.state["limit_carry"] = {"turn": inst.state.get("turn"), "stop_reason": sr, "conv": comp.get("conv"),
-                                     "delivered": [Path(f).name for f in (inst.state.get("delivered") or [])]}
-        note = f"[REPLY_LIMIT] 回复因 {sr} 结束，不是正常结束；固定块齐全，照常解析与执行；下一条消息会请 Claude 先从断点补齐"
+    # 1.9.5：不论固定块是否齐全，都不解析执行，按续接处理（此前固定块齐全时照常执行、下一条再补齐）；
+    # 续接计数与 1.7.6 共用：连续续接 3 轮仍不完整就停下等人看
+    inst.state.pop("limit_carry", None)
+    note = (f"[REPLY_LIMIT] 回复因 {sr} 结束（连续第 {n} 次），没有完成："
+            + ("固定块不全；" if missing else "固定块齐全，但") + "不落地、不执行，按续接处理，续接消息写明结束原因")
     inst.save()
     ops.add_note(inst, "deviation", note, by="driver")
     inst.event("reply_limit", stop_reason=sr, streak=n, blocks_missing=True if missing else None, by="driver")
@@ -1049,6 +1093,10 @@ def h_intake(ctx):
     _limit_reply(ctx, bool(res["blocks_missing"]))   # 1.8.2（P0-F）
     if res["blocks_missing"]:
         return _anomaly(ctx, {"source": "intake", "kind": "missing_blocks"}, "缺少：" + "、".join(res["blocks_missing"]))
+    if res.get("truncated"):
+        # 1.9.5（用户第 133 轮：没完成的回复不能算完成）；1.9.6：判据在 ops.intake 转入 REVIEW 之前，这里只负责续接
+        return _anomaly(ctx, {"source": "intake", "kind": "reply_truncated"},
+                        f"回复因 {res['truncated']} 结束，没有完成；固定块齐全，但不落地、不执行，先请 Claude 补齐")
     d = res.get("directives") or {}
     bad = _receipt_and_deliveries(inst, d)   # 1.8.7（W83）：评审之前核对回执与交付
     inst.event("reply_binding", by="driver", **_binding_status(inst, d))   # 1.9.0：留给实景验收（LIVE.md 判据 2、3）
@@ -1071,8 +1119,20 @@ def _blocking_decisions(items) -> list:
     return [x for x in (items or []) if re.search(r"[（(]前置[)）]", str(x))]
 
 
+def _truncated_guard(ctx):
+    """1.9.6：评审、落地、执行的共用守卫。本轮回复没有正常结束（升级前遗留，或从中途重启）时不往下走，转为续接。"""
+    tr = ops.truncated_reason(ctx.inst)
+    if not tr:
+        return None
+    return _anomaly(ctx, {"source": "intake", "kind": "reply_truncated"},
+                    f"本轮回复因 {tr} 结束，没有完成，却处在 {ctx.inst.state.get('state')}：不评审、不落地、不执行，转为续接")
+
+
 def h_review(ctx):
     inst, st = ctx.inst, ctx.st
+    g = _truncated_guard(ctx)
+    if g:
+        return g
     it = read_json(inst.turn_dir() / "intake.json", {}) or {}
     d = it.get("directives") or {}
     flags = st.setdefault("turn_flags", {})
@@ -1269,6 +1329,9 @@ def _plan_stale(inst) -> str:
 
 def h_apply(ctx):
     inst, st = ctx.inst, ctx.st
+    g = _truncated_guard(ctx)   # 1.9.6
+    if g:
+        return g
     st["exec_binding"] = _plan_binding(inst, with_fp=False)   # 1.8.4（W77）：计划批准时的工具版本（项目指纹随落地会变，先不记）
     path = st.get("release_path")
     if not path:
@@ -1348,6 +1411,9 @@ def _run_gates(ctx, gates, label) -> dict:
 def h_execute(ctx):
     inst = ctx.inst
     st = inst.state
+    g = _truncated_guard(ctx)   # 1.9.6
+    if g:
+        return g
     it = read_json(inst.turn_dir() / "intake.json", {}) or {}
     d = it.get("directives") or {}
     cmds = it.get("commands", [])
