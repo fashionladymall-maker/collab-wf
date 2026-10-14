@@ -31,10 +31,8 @@
 
 ## 待办
 - [executor] 执行端待办 T133-1：让 1.9.3 候选包进入公开仓库——先核对 /Users/admin/.workbuddy-ai/projects/collab-wf-dev/workflow/outbox/collab-wf-1.9.3.zip 的 sha256 仍为 ad541aea5686da4b4c479b643e01d6db248a4dfa2227c10aae61bbdf79fa48d3；一致的话只更新它的修改时间（
-- [executor] 执行端待办 T133-2：用 wf tell 把三份文本原样附在下一份回报里：ad54 审查结论（local/reviews/collab-wf.tool.collab-wf-1.9.3.bed19e2bd798416ab9869e5915c2f940.verdict.json，1802 字节）、collab-wf-193-corrected-reproduction.json（3192 字节）、A 组 failure-c
-- [executor] 执行端待办 T133-3：执行端转述里“不通过轮换账号规避额度限制”如果是用户原话，用 wf said 逐字记下；如果是执行端的归纳，写明这一点。
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
-- `artifacts/collab-wf-1.9.1-0f9305c.zip`
+- `artifacts/collab-wf-1.9.3.zip`
 - `artifacts/collab-wf-dev-v3.10.zip`
