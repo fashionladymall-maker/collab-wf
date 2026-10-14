@@ -1,14 +1,14 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 138 轮 · 落地版本（APPLY）
+第 138 轮 · 验收（VERIFY）
 
 ## 版本
 - 工具：collab-wf 1.9.4
-- 项目：v3.10；278ec98 (HEAD -> main, tag: v3.10) release v3.10
-- 仓库指纹：29a0181934f5d903（12 个文件）
+- 项目：v3.11；a912b0f (HEAD -> main, tag: v3.11) release v3.11
+- 仓库指纹：e1d316e281551ca5（12 个文件）
 
 ## 最近一轮
-- 第 137 轮验收通过（2026-10-14T07:49:16+00:00）
+- 第 138 轮验收通过（2026-10-14T08:17:28+00:00）
 - 本方最新消息：`turns/turn-138.md`
 - Claude 最新回复：`replies/reply-138.md`
 

@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## v3.11 — 2026-10-14
+- 补记第 121–138 轮：已确认结论 75–77（新对话交接与回核、1.9.3 安装失败与 1.9.4、两步安装第一次实跑）
+- 台账新增 W91–W101，W86、W89、W90 状态更新；当前版本、工具版本、下一步、已知限制、协作约定更新
+- workflow/goals.json、policy.json 不变
+
 ## v3.10 — 2026-10-13
 - workflow/goals.json：新增实景目标 M2-R1（wf live-check --rounds 3），M2-U1 的前置随之包含实景
 - workflow/policy.json：默认门禁（工具自检、行为探针），白名单不变
