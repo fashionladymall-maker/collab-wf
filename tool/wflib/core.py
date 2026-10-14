@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+ACTOR = {"actor": "cli"}   # 1.9.3（W93）：事件是谁写的——驱动器进程里为 driver，命令行为 cli
+
 try:
     import fcntl
 except ImportError:   # 非 POSIX 平台：状态锁退化为进程内计数
@@ -247,7 +249,8 @@ class Instance:
             disk_seq = int((read_json(self.state_path) or {}).get("seq") or 0)
             st["seq"] = max(disk_seq, int(st.get("seq") or 0)) + 1
             self.save()
-            ev = {"seq": st["seq"], "ts": now_iso(), "type": type_, "turn": st.get("turn", 0), "state": st.get("state")}
+            ev = {"seq": st["seq"], "ts": now_iso(), "type": type_, "turn": st.get("turn", 0), "state": st.get("state"),
+                  "actor": ACTOR.get("actor", "cli"), "pid": os.getpid()}   # 1.9.3（W93）：事件身份
             ev.update({k: v for k, v in fields.items() if v is not None})
             append_jsonl(self.events_path, ev)
         return ev

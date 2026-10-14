@@ -82,14 +82,47 @@ rm -rf build
 """
 
 
+# 1.9.4（W95）：自检的外部副作用隔离改在进程边界上做。1.9.3 在 run_v15、run_v18 之后才设 WF_NOTIFY=0，
+# 而 run_v18 里的检查要求它已经是 0：构建器预先设了 0，掩盖了这个顺序问题，真实安装时（没有预设）自检 278/279。
+# 现在 wf selftest 先在一个子进程里跑全部检查：子进程从第一条检查起就是 WF_NOTIFY=0、WF_LOCAL_DIR 指向临时目录；
+# 父进程自己的环境一项都不改，所以不需要恢复，也不会漏恢复。
+CHILD_FLAG = "WF_SELFTEST_CHILD"
+ISOLATED = {"WF_NOTIFY": "0"}   # 有外部副作用的开关：自检里一律关闭（WF_NOTIFY：macOS 通知）
+
+
+def child_env(base: dict, local_dir: str) -> dict:
+    """由父进程的环境生成自检子进程的环境；不改动 base 本身。"""
+    env = dict(base)
+    env.update(ISOLATED)
+    env["WF_LOCAL_DIR"] = str(local_dir)
+    env[CHILD_FLAG] = "1"
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
+
 def run() -> int:
+    if os.environ.get(CHILD_FLAG) != "1":
+        tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-env-"))
+        try:
+            r = subprocess.run([sys.executable, str(WF_HOME / "wf.py"), "selftest"], env=child_env(os.environ, tmp / "local"),
+                               timeout=1500)
+            return r.returncode
+        except subprocess.TimeoutExpired:
+            print("自检子进程超过 1500 秒没有结束，按未通过处理", flush=True)
+            return 1
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return _run_checks()
+
+
+def _run_checks() -> int:
     print(f"collab-wf 自检（{(WF_HOME / 'VERSION').read_text().strip()}，Python {sys.version.split()[0]}）")
     from .selftest_v15 import run_v15   # 1.5.0 新增检查：纯函数与解析回归，计入总数
     run_v15(_ok)
     from .selftest_v18 import run_v18   # 1.8.2 新增检查，计入总数
     run_v18(_ok)
     tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-"))
-    env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local")}
+    env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local"), "WF_NOTIFY": "0"}   # 子进程里本来就是 0，这里照旧写明
     env.pop("VIRTUAL_ENV", None)
     try:
         proj = tmp / "demo"

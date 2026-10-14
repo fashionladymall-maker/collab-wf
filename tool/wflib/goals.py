@@ -49,6 +49,12 @@ def validate(g: dict) -> list:
         for k in ("title", "means", "on_fail"):
             if not x.get(k):
                 issues.append(f"{gid}：缺少 {k}")
+    from . import policy as _pol   # 1.9.3：目标的检查命令也必须是只读命令
+    for x in g["goals"]:
+        # 1.9.4（审查 concerns）：只拒“要人批准的 wf 命令”证明不了只读，改为按 policy.readonly_check 的允许清单判定
+        if isinstance(x, dict) and x.get("kind") == "exec" and x.get("check") and not _pol.readonly_check(str(x["check"])):
+            issues.append(f"{x.get('id')}：检查命令 {x['check']} 不能证明是只读的（只允许 wf 的只读命令、只读程序、"
+                          "项目里的 python 脚本，不许命令链与重定向），不能做目标判据")
     ph = g.get("phase")   # 1.8.2（P0-B）：当前阶段与历史阶段
     if ph is not None and (not isinstance(ph, dict) or not str(ph.get("id") or "").strip()
                            or not str(ph.get("title") or "").strip()):

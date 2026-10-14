@@ -176,3 +176,14 @@ send 只收到心跳、没看到生成开始（`{"status": "heartbeat_only"}`，
 
 - poll 返回 status=done 时请给出 ended_at：通道记录的这条回复的结束时刻（服务端时间），不要用拉取时刻代替。wf 记进 reply_meta.json，实景测量据此核对发现延迟。
 - 审查程序收到同一个版本包（sha256 相同）的审查请求，而之前已经给出过结论（包括迟到的结论）时，立即返回那次的结论。配合 review_required，就实现了“这一轮构建并请求审查、下一轮在结论到场后安装”。
+
+## 附：1.9.3 父子关系与日志归属
+
+- send 成功时请在结果里给出 message_uuid：本条消息在通道里的标识。wf 记进本轮的 send_meta.json。
+- poll 返回 status=done 时请给出 parent：这条回复的父消息标识（应等于本轮发出消息的 message_uuid），以及 ended_at（附录 1.9.1）。
+- 动作日志的每一条都写 project 字段；没有项目字段的日志无法归属，实景测量判为无法核对。
+
+## 附：1.9.4 结果不明后的确认
+
+- 发送结果不明、驱动器之后用 poll 确认送达时（status 为 generating 或 done），请同样给出 message_uuid：被确认的那条消息在通道里的标识。wf 记进本轮的 send_meta.json，注明 confirmed_by=poll；没有给出时不记，实景测量如实判“父子关系无法核对”。
+

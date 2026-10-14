@@ -1219,6 +1219,8 @@ def main(argv=None):
                 print(f"第 {rd['turn']} 轮：{'全部达标' if rd['ok'] else '不达标'}")
                 for cr in rd["criteria"]:
                     print(f"  {'✓' if cr['ok'] else '✗'} {cr['n']}. {cr['why']}")
+            for ms in r.get("missing") or []:
+                print(f"  还缺：{ms}")
             print(f"实景验收：连续达标 {r['streak']} 轮（需要 {r['need']} 轮）——" + ("通过" if r["passed"] else "未通过"))
         sys.exit(0 if r["passed"] else 1)
     elif c == "ledger":

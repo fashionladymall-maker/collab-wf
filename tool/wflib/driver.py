@@ -45,6 +45,18 @@ class Ctx:
 # ---------------- 入口 ----------------
 
 def run(inst: Instance, max_seconds=600, max_steps=40, linger=False) -> tuple:
+    # 1.9.3（W93）：本次推进期间写的事件都记作驱动器（by 字段照旧）。
+    # 1.9.4（审查 concerns）：结束后、包括中途出错，都把 ACTOR 恢复成进入前的值，不留在进程里
+    from . import core as _core
+    prev = _core.ACTOR.get("actor")
+    _core.ACTOR["actor"] = "driver"
+    try:
+        return _run_body(inst, max_seconds, max_steps, linger)
+    finally:
+        _core.ACTOR["actor"] = prev or "cli"
+
+
+def _run_body(inst: Instance, max_seconds=600, max_steps=40, linger=False) -> tuple:
     LOCAL.mkdir(parents=True, exist_ok=True)
     (LOCAL / "locks").mkdir(exist_ok=True)
     lock = open(LOCAL / "locks" / f"{inst.name}.lock", "w")
@@ -517,6 +529,17 @@ def _append_receipt(inst, out) -> None:
     inst.save()
 
 
+def _send_meta(inst, data: dict, confirmed_by: str = "send") -> None:
+    # 1.9.3：记下发出消息的 uuid。1.9.4（审查 concerns）：发送结果不明、之后经轮询确认送达时也记（confirmed_by=poll）；
+    # 适配器没给 uuid 就不写，实景测量如实判“无法核对”，不拿别的字段（例如回复的 parent）冒充
+    uid = (data or {}).get("message_uuid")
+    if uid:
+        d = inst.turn_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        write_json(d / "send_meta.json", {"turn": inst.state.get("turn"), "message_uuid": uid, "ts": now_iso(),
+                                          "confirmed_by": confirmed_by})
+
+
 def h_compose(ctx):
     inst, st = ctx.inst, ctx.st
     out = st.get("outgoing")
@@ -627,6 +650,7 @@ def h_send(ctx):
         status = r["data"].get("status")
         if r["code"] == 0 and status in ("generating", "done"):
             intent.update(status="accepted", ref=r["data"].get("ref") or intent.get("ref"))
+            _send_meta(inst, r["data"], confirmed_by="poll")   # 1.9.4：结果不明后经轮询确认的发送，也记下消息 uuid
             return _finalize_send(ctx, out, "发送曾被中断，经轮询确认消息已被接受", immediate=(status == "done"))
         # 1.5.1：policy 的 send_unknown_wait 为真时先自动等待并反复确认（长回复可达半小时以上），绝不自动重发
         return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
@@ -674,6 +698,7 @@ def h_send(ctx):
                             "适配器只收到心跳、没确认生成开始：保留发送意图、轮询确认，不重发（W84）")
         st["send_intent"].update(status="accepted", ref=r["data"].get("ref"))
         st.pop("resend_parent", None)
+        _send_meta(inst, r["data"])   # 1.9.3：记下发出消息的 uuid，供核对回复的父子关系
         return _finalize_send(ctx, out, "通道已接受")
     if code == 4:   # 1.9.0（W89）：暂时性错误或超时，发送结果不明，按“结果不明”轮询确认（此前标成 NET，读起来像要重发）
         inst.save()

@@ -29,6 +29,26 @@ DEFAULT_PIPE_FILTERS = ["head", "tail", "grep", "wc", "sort", "uniq", "cut"]
 # 改动护栏文件的版本由 release.self_update(auto=True) 拒绝，另一个模型系列审查阻止时也拒绝
 AUTO_SELF_UPDATE = re.compile(r"^\s*wf\s+self-update\s+--auto\s+workflow/outbox/collab-wf-\d+\.\d+\.\d+\.zip\s*$")
 
+# 1.9.4（审查 concerns）：目标的检查命令要能证明是只读的。允许三类：wf 的只读命令（含 self-check、live-check）、
+# 只读程序（sed 只许 -n、git 只许查看类子命令）、项目里受版本管理的 python 脚本（相对路径、不含 ..，随项目版本经过评审）；
+# 不许命令链与重定向；管道只能接过滤命令
+READONLY_PROGRAMS = re.compile(r"^\s*(cat|head|tail|wc|grep|sort|uniq|cut|ls|true|false|test|echo|"
+                               r"sed\s+-n|git\s+(-C\s+\S+\s+)?(log|status|diff|show|ls-tree|rev-parse))(\s|$)")
+PROJECT_SCRIPT = re.compile(r"^\s*(\S*/)?python3(\.\d+)?\s+(?![/~])(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9_./-]*\.py(\s|$)")
+
+
+def readonly_check(cmd: str) -> bool:
+    cmd = str(cmd or "")
+    if not cmd.strip() or META.search(cmd.replace("2>&1", "")):
+        return False
+    segs = [x.strip() for x in cmd.split("|")]
+    first = segs[0]
+    if re.match(r"^\s*wf(\s|$)", first):
+        ok = bool(WF_READONLY.match(first) or re.match(r"^\s*wf\s+self-check(\s+--probes)?\s*$", first))
+    else:
+        ok = bool(READONLY_PROGRAMS.match(first) or PROJECT_SCRIPT.match(first))
+    return ok and all(x and x.split()[0] in DEFAULT_PIPE_FILTERS for x in segs[1:])
+
 
 def sha256(p: Path):
     p = Path(p)

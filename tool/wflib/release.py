@@ -338,7 +338,8 @@ def _review_tool(src: Path, zip_path) -> tuple:
         # 1.6.9（P0-A）：未审查照常安装（不变），但写明原因并留档，事后可按 diff 补审
         write_json(rd / f"{Path(zip_path).stem}.unreviewed.json",
                    {"ts": now_iso(), "release": str(zip_path), "diff": str(diff), "reason": why})
-        print(f"本次未审查：{why}；照常安装，可事后按 {diff} 补审", file=sys.stderr, flush=True)
+        print(f"本次未审查：{why}；" + ("按 review_required 不安装" if anomaly.transport_cfg().get("review_required") else "照常安装")
+              + f"，可事后按 {diff} 补审", file=sys.stderr, flush=True)   # 1.9.3：开启 review_required 时不再写“照常安装”
         return "unavailable", why
     print(f"独立审查结论：{data['verdict']}", file=sys.stderr, flush=True)
     write_json(rd / f"{Path(zip_path).stem}.json", data)
@@ -357,6 +358,42 @@ def _record_review(zip_path, verdict, notes) -> None:
                     "zip_sha256": hashlib.sha256(Path(zip_path).read_bytes()).hexdigest()})
     except OSError:
         pass
+
+
+def _mark_install_start(zip_path) -> None:
+    # 1.9.4（审查 concerns）：实景测量要核“审查结论早于安装”，此前只能拿安装命令结束的时刻比，这里记下开始复制文件的时刻
+    from .core import LOCAL, now_iso
+    p = LOCAL / "reviews" / f"{Path(zip_path).stem}.result.json"
+    try:
+        rr = read_json(p, {}) or {}
+        if rr:
+            rr["install_started_at"] = now_iso()
+            write_json(p, rr)
+    except OSError:
+        pass
+
+
+def selftest_failure_report(new, stdout, stderr, log_dir) -> tuple:
+    """1.9.4（W95）：新版本自检未通过时，完整输出写进文件，提示里列出全部 ✗ 行与文件路径
+    （此前只回显最后 3000 个字符，第 125 轮失败的那一行就不在里面）。返回 (提示, 文件路径)。"""
+    from .core import now_iso
+    stdout, stderr = stdout or "", stderr or ""
+    path = None
+    try:
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / f"selftest-{new}-{now_iso().replace(':', '').replace('+', 'Z')}.log"
+        path.write_text(f"===== stdout =====\n{stdout}\n===== stderr =====\n{stderr}\n", encoding="utf-8")
+    except OSError:
+        path = None
+    fails = [ln for ln in stdout.splitlines() if ln.lstrip().startswith("✗")]
+    summary = next((ln for ln in reversed(stdout.splitlines()) if ln.startswith("自检结果")), "")
+    msg = (f"新版本 {new} 的自检未通过，未安装。{summary}\n未通过的项（共 {len(fails)} 条）：\n"
+           + ("\n".join(fails[:60]) or "（输出里没有 ✗ 行，见完整输出）")
+           + (f"\n……另有 {len(fails) - 60} 条，见完整输出" if len(fails) > 60 else "")
+           + (f"\n完整输出：{path}" if path else "\n完整输出没能写进文件；末尾原文：\n" + stdout[-3000:])
+           + (f"\nstderr 末尾：\n{stderr[-1500:]}" if stderr.strip() else ""))
+    return msg, path
 
 
 def _review_gate(verdict, notes) -> None:
@@ -426,7 +463,10 @@ def self_update(zip_path, skip_test=False, allow_same=False, auto=False) -> dict
             r = subprocess.run([sys.executable, str(src / "wf.py"), "selftest"], capture_output=True, text=True,
                                env=env, timeout=600)
             if r.returncode != 0:
-                raise WfError(f"新版本 {new} 的自检未通过，未安装：\n{r.stdout[-3000:]}\n{r.stderr[-2000:]}")
+                msg, _ = selftest_failure_report(new, r.stdout, r.stderr, WF_HOME / "local" / "selftest-logs")
+                raise WfError(msg)
+        if auto:
+            _mark_install_start(zip_path)   # 1.9.4：审查结论要早于真正开始安装（复制文件）的时刻
         manifest = read_json(src / "RELEASE.json", {}) or {}
         _copy_tree(src, WF_HOME, SELF_PROTECT)
         _delete(WF_HOME, manifest.get("delete"), SELF_PROTECT)

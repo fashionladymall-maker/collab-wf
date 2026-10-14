@@ -794,57 +794,105 @@ def _t_heartbeat_no_resend(_ok):
 
 
 def _t_live_check(_ok):
+    import hashlib
     from datetime import datetime, timedelta, timezone
-    from . import anomaly, live
+    from . import anomaly, core, live
     from .core import LOCAL
     orig = anomaly.transport_cfg
     with tempfile.TemporaryDirectory() as td:
-        a = _inst(td, f"v190-l{os.getpid()}", {"state": "IDLE", "turn": 8})
+        a = _inst(td, f"v192-l{os.getpid()}", {"state": "IDLE", "turn": 8})
         base = datetime(2026, 10, 13, 6, 0, tzinfo=timezone.utc)
         iso = lambda dt: dt.isoformat(timespec="seconds")
+        zname = f"collab-wf-9.9.{os.getpid()}"
+        zp = a.root / "workflow" / "outbox" / f"{zname}.zip"
+        zp.parent.mkdir(parents=True, exist_ok=True)
+        zp.write_bytes(b"pkg")
+        # 1.9.4：同步记的 HEAD 要等于项目当时的 HEAD——给临时项目建版本库，提交时刻早于这三轮
+        gd = {**os.environ, "GIT_AUTHOR_DATE": iso(base - timedelta(days=1)), "GIT_COMMITTER_DATE": iso(base - timedelta(days=1))}
+        subprocess.run(["git", "init", "-q"], cwd=a.root)
+        subprocess.run(["git", "add", "-A"], cwd=a.root)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], cwd=a.root, env=gd)
+        real_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=a.root, capture_output=True, text=True).stdout.strip()
         turns, events, alog, hist = [], [], [], []
         for i, t in enumerate((5, 6, 7)):
             t0 = base + timedelta(minutes=30 * i)
             turns += [{"turn": t, "status": "sent", "from": "driver", "ts_sent": iso(t0)},
                       {"turn": t, "status": "done", "ts_done": iso(t0 + timedelta(minutes=10))}]
-            events += [{"seq": i, "type": "reply_binding", "turn": t, "receipt": "ok", "deliveries": "ok", "by": "driver"},
-                       {"seq": 20 + i, "type": "reply_checked", "turn": t, "by": "driver"},
-                       {"seq": 40 + i, "type": "round_result", "turn": t, "ok": True, "by": "driver"}]   # 1.9.1
-            alog += [{"action": "send", "turn": t, "ts": iso(t0), "project": a.name},
-                     {"action": "done", "turn": t, "ts": iso(t0 + timedelta(minutes=9)), "project": a.name}]
-            hist.append({"turn": t, "status": "pushed", "commit": "abc1234def", "ts": iso(t0 + timedelta(minutes=12))})
-            (a.evidence / f"turn-{t:03d}").mkdir(parents=True, exist_ok=True)
-            cm = [f"wf self-update --auto workflow/outbox/collab-wf-9.9.{os.getpid()}.zip"] if t == 7 else []
-            (a.evidence / f"turn-{t:03d}" / "intake.json").write_text(json.dumps({"commands": cm}), encoding="utf-8")
-            (a.evidence / f"turn-{t:03d}" / "reply_meta.json").write_text(
-                json.dumps({"ended_at": iso(t0 + timedelta(minutes=9))}), encoding="utf-8")
-        zname = f"collab-wf-9.9.{os.getpid()}"
-        events.append({"seq": 9, "type": "exec", "turn": 7, "cmd": f"wf self-update --auto workflow/outbox/{zname}.zip", "by": "driver"})
+            events += [{"type": "reply_binding", "turn": t, "receipt": "ok", "deliveries": "ok", "by": "driver", "actor": "driver"},
+                       {"type": "reply_checked", "turn": t, "by": "driver", "actor": "driver"},
+                       {"type": "transition", "turn": t, "by": "wf", "actor": "driver"},
+                       {"type": "round_result", "turn": t, "ok": True, "by": "driver", "actor": "driver"}]
+            alog += [{"action": "send", "turn": t, "ts": iso(t0), "project": a.name}]
+            hist.append({"turn": t, "status": "pushed", "commit": "abc1234def", "head": real_head, "ts": iso(t0 + timedelta(minutes=12))})
+            d = a.evidence / f"turn-{t:03d}"
+            d.mkdir(parents=True, exist_ok=True)
+            cm = [f"wf self-update --auto workflow/outbox/{zname}.zip"] if t == 7 else []
+            (d / "intake.json").write_text(json.dumps({"commands": cm}), encoding="utf-8")
+            (d / "reply_meta.json").write_text(json.dumps({"ended_at": iso(t0 + timedelta(minutes=9)), "parent": f"H{t}"}), encoding="utf-8")
+            (d / "send_meta.json").write_text(json.dumps({"message_uuid": f"H{t}"}), encoding="utf-8")
+        events.append({"type": "apply", "turn": 6, "by": "driver", "actor": "driver"})
+        events.append({"type": "exec", "turn": 7, "cmd": f"wf self-update --auto workflow/outbox/{zname}.zip", "exit_code": 0,
+                       "by": "driver", "actor": "driver", "ts": iso(base + timedelta(minutes=75)), "duration_s": 600})
         (LOCAL / "reviews").mkdir(parents=True, exist_ok=True)
-        (LOCAL / "reviews" / f"{zname}.result.json").write_text(json.dumps({"verdict": "pass"}), encoding="utf-8")
+        rp = LOCAL / "reviews" / f"{zname}.result.json"
+        rgood = {"verdict": "pass", "ts": iso(base + timedelta(minutes=70)), "zip_sha256": hashlib.sha256(b"pkg").hexdigest()}
+        rp.write_text(json.dumps(rgood), encoding="utf-8")
         (LOCAL / "sync").mkdir(parents=True, exist_ok=True)
         hp = LOCAL / "sync" / f"{a.name}.history.jsonl"
         hp.write_text("".join(json.dumps(h) + "\n" for h in hist), encoding="utf-8")
         a.turns_path.write_text("".join(json.dumps(r) + "\n" for r in turns), encoding="utf-8")
         a.events_path.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8")
         lp = Path(td) / "bridge.jsonl"
-        lp.write_text("".join(json.dumps(x) + "\n" for x in alog), encoding="utf-8")
+        wl = lambda xs: lp.write_text("".join(json.dumps(x) + "\n" for x in xs), encoding="utf-8")
+        res = {}
+        old_actor = core.ACTOR.get("actor")
         try:
             anomaly.transport_cfg = lambda: {"log": str(lp)}
-            r1 = live.check(a, 3)
-            lp.write_text("".join(json.dumps(x) + "\n" for x in alog + [{"action": "send", "turn": 6, "ts": iso(base), "project": a.name}]),
-                          encoding="utf-8")
-            r2 = live.check(a, 3)
-            anomaly.transport_cfg = lambda: {}
-            r3 = live.check(a, 3)
+            wl(alog)
+            res["ok"] = live.check(a, 3)
+            wl(alog + [{"action": "send", "turn": 6, "ts": iso(base), "project": a.name}])
+            res["dup"] = live.check(a, 3)
+            wl([{k: v for k, v in x.items() if k != "project"} for x in alog])
+            res["noproj"] = live.check(a, 3)
+            wl(alog)
+            a.events_path.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events if e.get("type") != "apply"),
+                                     encoding="utf-8")
+            res["noapply"] = live.check(a, 3)
+            a.events_path.write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in events), encoding="utf-8")
+            # 1.9.4：审查结论早于这次安装命令（不是这次取得的）、没有时刻、晚于开始安装，都不通过
+            rp.write_text(json.dumps(dict(rgood, ts=iso(base + timedelta(minutes=10)))), encoding="utf-8")
+            res["oldreview"] = live.check(a, 3)
+            rp.write_text(json.dumps(dict(rgood, ts="")), encoding="utf-8")
+            res["notime"] = live.check(a, 3)
+            rp.write_text(json.dumps(dict(rgood, install_started_at=iso(base + timedelta(minutes=68)))), encoding="utf-8")
+            res["afterinstall"] = live.check(a, 3)
+            rp.write_text(json.dumps(dict(rgood, install_started_at=iso(base + timedelta(minutes=72)))), encoding="utf-8")
+            res["beforeinstall"] = live.check(a, 3)
+            rp.write_text(json.dumps(rgood), encoding="utf-8")
+            # 1.9.4：同步记的 HEAD 与项目当时的 HEAD 不一致，不通过
+            hp.write_text("".join(json.dumps(dict(h, head="f00d" * 10)) + "\n" for h in hist), encoding="utf-8")
+            res["badhead"] = live.check(a, 3)
+            hp.write_text("".join(json.dumps(h) + "\n" for h in hist), encoding="utf-8")
+            core.ACTOR["actor"] = "driver"
+            e1 = a.event("note", by="wf")
+            core.ACTOR["actor"] = "cli"
+            e2 = a.event("note", by="wf")
         finally:
             anomaly.transport_cfg = orig
+            core.ACTOR["actor"] = old_actor or "cli"
             hp.unlink()
-    _ok("1.9.0 实景测量：三轮证据齐全且达标时通过；有一轮发了两次，连续计数从那一轮之后重来、不通过；没有适配器日志时如实判为无法核对",
-        r1["passed"] and r1["streak"] == 3 and not r2["passed"] and r2["streak"] == 1
-        and not r3["passed"] and any("无法核对" in c["why"] for rd in r3["rounds"] for c in rd["criteria"]),
-        json.dumps([r1["streak"], r2["streak"], r3["streak"], [c for rd in r2["rounds"] for c in rd["criteria"] if not c["ok"]]],
-                   ensure_ascii=False)[:700])
+            rp.unlink()
+    ok = (res["ok"]["passed"] and res["ok"]["streak"] == 3 and not res["dup"]["passed"] and res["dup"]["streak"] == 1
+          and not res["noproj"]["passed"] and not res["noapply"]["passed"] and res["noapply"]["missing"]
+          and not res["oldreview"]["passed"] and not res["notime"]["passed"] and not res["afterinstall"]["passed"]
+          and res["beforeinstall"]["passed"] and not res["badhead"]["passed"]
+          and e1.get("actor") == "driver" and e2.get("actor") == "cli"
+          and not live._manual({"type": "transition", "by": "wf", "actor": "driver"})
+          and live._manual({"type": "transition", "by": "wf", "actor": "cli"}))
+    _ok("1.9.4 实景测量：证据齐全的三轮通过（驱动器进程里的 wf 转换不算人工）；一轮发两次、日志没有项目字段、"
+        "连续达标的轮次里没有项目落地、审查结论不是这次安装时取得的或没有时刻或晚于开始安装、同步记的 HEAD 与项目当时的不符，"
+        "都不通过；事件带上写入者身份",
+        ok, json.dumps({k: [v["streak"], v["passed"], v.get("missing")] for k, v in res.items()}, ensure_ascii=False)[:600])
 
 
 def _t_task_progress(_ok):
@@ -908,6 +956,192 @@ def _t_task_markers(_ok):
         json.dumps([ts, block, list(rows)], ensure_ascii=False)[:700])
 
 
+def _t_no_desktop_notify(_ok):
+    # 1.9.4（W95）：1.9.3 的这条检查吞掉异常、按 hasattr 调一个不存在的 run_once，证明不了真实的通知路径。
+    # 现在走真实路径 notify.after_tick：把平台与 osascript 换成测试替身（替身只记录、不执行），
+    # 先在 WF_NOTIFY=1 下确认这条路径确实会发通知（对照），再在自检的 WF_NOTIFY=0 下确认一条都不发。
+    from . import notify
+    sent = []
+    orig = (notify.subprocess.run, notify.sys.platform, notify.shutil.which)
+    old_env = os.environ.get("WF_NOTIFY")
+
+    class _Done:
+        returncode = 0
+        stdout = stderr = ""
+
+    def spy(args, *a, **k):
+        if args and args[0] == "osascript":
+            sent.append(list(args))
+            return _Done()
+        return orig[0](args, *a, **k)
+    res = {}
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v194-n", {"state": "BLOCKED", "turn": 1, "block_reason": "测试：自检里的阻塞"})
+        try:
+            notify.subprocess.run = spy
+            notify.sys.platform = "darwin"
+            notify.shutil.which = lambda name, *x, **k: "/usr/bin/osascript" if name == "osascript" else orig[2](name, *x, **k)
+            os.environ["WF_NOTIFY"] = "1"
+            res["control"] = len(notify.after_tick([a], store=Path(td) / "n1.json"))
+            res["control_calls"] = len(sent)
+            os.environ["WF_NOTIFY"] = "0"
+            res["off"] = len(notify.after_tick([a], store=Path(td) / "n2.json"))
+            res["off_calls"] = len(sent) - res["control_calls"]
+        finally:
+            notify.subprocess.run, notify.sys.platform, notify.shutil.which = orig
+            if old_env is None:
+                os.environ.pop("WF_NOTIFY", None)
+            else:
+                os.environ["WF_NOTIFY"] = old_env
+    _ok("1.9.4 自检不发真实系统通知：对照组（WF_NOTIFY=1、替身 osascript）确实会发；WF_NOTIFY=0 时一条不发；"
+        "自检进程本身从第一条检查起就是 WF_NOTIFY=0",
+        res.get("control_calls", 0) >= 1 and res.get("off_calls") == 0 and res.get("off") == 0 and old_env == "0"
+        and os.environ.get("WF_NOTIFY") == "0",
+        json.dumps([res, old_env], ensure_ascii=False))
+
+
+def _t_selftest_env(_ok):
+    # 1.9.4（W95）：自检子进程的环境由 child_env 生成，父进程的环境一项不改；当前进程里的检查不写工具目录自己的 local/
+    from . import core, selftest
+    base = {"WF_NOTIFY": "1", "VIRTUAL_ENV": "/v", "KEEP": "k"}
+    snap = dict(base)
+    env = selftest.child_env(base, "/tmp/x/local")
+    base2 = {"KEEP": "k"}
+    unset = selftest.child_env(base2, "/tmp/y/local")
+    local_ok = core.LOCAL.resolve() != (core.WF_HOME / "local").resolve()
+    _ok("1.9.4 自检环境隔离：子进程 WF_NOTIFY=0、WF_LOCAL_DIR 指向临时目录、去掉 VIRTUAL_ENV；父进程的环境字典原样不动"
+        "（原来是 1 的仍是 1，原来没有的仍没有）；本进程的检查不写工具目录自己的 local/",
+        env["WF_NOTIFY"] == "0" and env["WF_LOCAL_DIR"] == "/tmp/x/local" and "VIRTUAL_ENV" not in env
+        and env.get("KEEP") == "k" and base == snap and unset["WF_NOTIFY"] == "0" and "WF_NOTIFY" not in base2
+        and os.environ.get("WF_NOTIFY") == "0" and local_ok,
+        json.dumps([env, base, str(core.LOCAL), os.environ.get("WF_NOTIFY")], ensure_ascii=False))
+
+
+def _t_actor_restore(_ok):
+    # 1.9.4（审查 concerns）：driver.run 把事件身份记作 driver，结束后（含出错）要恢复原值，不能留在进程里
+    from . import core, driver
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "v194-a", {"state": "IDLE", "turn": 1})
+        before = core.ACTOR.get("actor")
+        driver.run(a, max_seconds=5)
+        after = core.ACTOR.get("actor")
+        orig = driver._run_body
+
+        def boom(*x, **k):
+            raise RuntimeError("测试：驱动器中途出错")
+        driver._run_body = boom
+        try:
+            try:
+                driver.run(a, max_seconds=5)
+            except RuntimeError:
+                pass
+        finally:
+            driver._run_body = orig
+        after_err = core.ACTOR.get("actor")
+    _ok("1.9.4 事件身份：driver.run 结束后、以及中途出错后，ACTOR 都恢复为进入前的值",
+        before == "cli" and after == "cli" and after_err == "cli", str([before, after, after_err]))
+
+
+def _t_send_meta_poll(_ok):
+    # 1.9.4（审查 concerns）：发送结果不明、之后经轮询确认送达时，也记下发出消息的 uuid（适配器在 poll 里给出 message_uuid）
+    from . import anomaly, driver
+    orig = anomaly.call
+    out = {}
+    for case, poll_uuid in (("with", "U-7"), ("without", None)):
+        def fake(op, args, timeout=None, env_extra=None, _u=poll_uuid):
+            if op == "send":
+                return {"code": 4, "raw": "超时", "data": {}}
+            d = {"status": "done", "ref": "R"}
+            if _u:
+                d["message_uuid"] = _u
+            return {"code": 0, "raw": "", "data": d}
+        try:
+            anomaly.call = fake
+            with tempfile.TemporaryDirectory() as td:
+                a = _inst(td, f"v194-sm-{case}", {"state": "SEND", "turn": 2})
+                f = a.outbox / "turn-002.md"
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
+                a.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
+                a.save()
+                driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+                a.state.pop("retry_at", None)
+                a.save()
+                driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+                mp = a.turn_dir(2) / "send_meta.json"
+                out[case] = json.loads(mp.read_text(encoding="utf-8")) if mp.exists() else None
+        finally:
+            anomaly.call = orig
+    w = out.get("with") or {}
+    _ok("1.9.4 发送结果不明后经轮询确认：poll 给了 message_uuid 就记进 send_meta.json（注明经轮询确认）；没给就不编造",
+        w.get("message_uuid") == "U-7" and w.get("confirmed_by") == "poll" and out.get("without") is None,
+        json.dumps(out, ensure_ascii=False))
+
+
+def _t_sync_history_head(_ok):
+    # 1.9.4：1.9.1 写同步历史时用错了 git 的参数顺序（TypeError，外层只接 OSError），只有带 .git 的项目才会走到；
+    # 1.8.2 的同步测试用的是没有 .git 的临时项目，所以没测到（执行端第 128 轮在本机手工改正，本版正式收进来）
+    from . import anomaly, sync
+    orig = (sync.cfg, sync.SYNC_DIR, anomaly.call, sync.collect)
+    res, head, err = {}, "", ""
+    with tempfile.TemporaryDirectory() as td:
+        inst = _inst(td, "v194-sh", {"state": "IDLE", "turn": 3})
+        g = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", "init", "-q"], cwd=inst.root)
+        subprocess.run(["git", "add", "-A"], cwd=inst.root)
+        subprocess.run(g + ["commit", "-qm", "init"], cwd=inst.root)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=inst.root, capture_output=True, text=True).stdout.strip()
+        try:
+            sync.cfg = lambda: {"sync": "测试同步程序", "sync_projects": [inst.name]}
+            sync.SYNC_DIR = Path(td) / "local-sync"
+            sync.collect = lambda i: {"STATUS.md": b"s\n"}
+            anomaly.call = lambda op, args, timeout=None, env_extra=None: {"code": 0, "raw": "",
+                                                                           "data": {"commit": "0123456789abcdef"}}
+            try:
+                res = sync.run(inst)
+            except Exception as e:   # noqa: BLE001  正是要测出来的错误
+                err = f"{type(e).__name__}: {e}"
+            hist = sync.SYNC_DIR / f"{inst.name}.history.jsonl"
+            rows = [json.loads(x) for x in hist.read_text(encoding="utf-8").splitlines()] if hist.exists() else []
+        finally:
+            sync.cfg, sync.SYNC_DIR, anomaly.call, sync.collect = orig
+    _ok("1.9.4 同步历史：带 .git 的项目推送后不出错，历史记录里的 head 等于项目当时的 HEAD",
+        not err and res.get("status") == "pushed" and rows and rows[-1].get("head") == head and len(head) == 40,
+        json.dumps([err, res.get("status"), rows[-1:] if rows else None, head], ensure_ascii=False)[:600])
+
+
+def _t_goal_check_readonly(_ok):
+    # 1.9.4（审查 concerns）：目标的检查命令要能证明是只读的——只拒“要人批准的 wf 命令”不够（rm、重定向都能混进来）
+    from . import goals, policy
+    base = {"id": "X", "title": "t", "kind": "exec", "pass": {"exit": 0}, "means": "m", "on_fail": "f"}
+    cases = {"wf self-check --probes": True, "wf live-check --rounds 3": True, "wf goals": True,
+             "python3 workflow/m1_check.py --json": True, "grep -n x workflow/a.txt | wc -l": True,
+             "rm -rf build": False, "wf apply x.zip": False, "wf self-check > out.txt": False,
+             "cat a.txt | sh": False, "python3 /tmp/x.py": False, "python3 ../x.py": False, "curl -X POST http://x": False}
+    got = {}
+    for cmd, want in cases.items():
+        iss = goals.validate({"goals": [dict(base, check=cmd)]})
+        got[cmd] = (not iss, policy.readonly_check(cmd))
+    _ok("1.9.4 目标的检查命令必须能证明只读：wf 的只读命令、只读程序、项目里受版本管理的 python 脚本可以；"
+        "rm、要人批准的 wf 命令、重定向、管道接非过滤命令、项目外的脚本都不行",
+        all(got[c] == (w, w) for c, w in cases.items()), json.dumps(got, ensure_ascii=False)[:700])
+
+
+def _t_selftest_failure_report(_ok):
+    # 1.9.4（W95）：自检失败时，安装命令只回显最后 3000 个字符，失败的那一行可能不在里面（第 125 轮 278/279 就是这样）。
+    # 现在完整输出写进文件，提示里列出全部 ✗ 行与文件路径
+    from . import release
+    with tempfile.TemporaryDirectory() as td:
+        lines = ["collab-wf 自检（9.9.9）", "  ✗ 很早就失败的一项  —— 细节"] + [f"  ✓ 第 {i} 项" for i in range(400)]
+        lines += ["  ✗ 最后失败的一项", "", "自检结果：400 / 402 通过"]
+        out = "\n".join(lines) + "\n"
+        msg, path = release.selftest_failure_report("9.9.9", out, "stderr 原文\n", Path(td))
+        full = Path(path).read_text(encoding="utf-8") if path and Path(path).exists() else ""
+    _ok("1.9.4 自检失败的报告：完整输出写进文件；提示里有全部 ✗ 行（包括远在末尾 3000 字符之外的）与文件路径",
+        "很早就失败的一项" in msg and "最后失败的一项" in msg and str(path) in msg and out in full and "stderr 原文" in full,
+        msg[:600])
+
+
 TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("NO_REF", _t_no_ref),
          ("同步凭证", _t_sync_commit), ("交接短消息", _t_short_pinned), ("回复完整性", _t_reply_limit),
          ("暂存目录安全", _t_stage_symlink), ("暂存目录硬链接", _t_stage_hardlink), ("命令间暂停", _t_pause_between),
@@ -919,7 +1153,10 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
          ("共享仲裁", _t_arbiter), ("安装前审查必需", _t_review_gate),
          ("心跳不重发", _t_heartbeat_no_resend),
          ("实景测量", _t_live_check), ("待办检查点", _t_task_progress), ("发送暂时性错误", _t_send_code4),
-         ("待办标记", _t_task_markers)]
+         ("待办标记", _t_task_markers),
+         ("自检不发通知", _t_no_desktop_notify), ("自检环境隔离", _t_selftest_env), ("事件身份恢复", _t_actor_restore),
+         ("不明发送的消息标识", _t_send_meta_poll), ("同步历史HEAD", _t_sync_history_head),
+         ("目标检查只读", _t_goal_check_readonly), ("自检失败报告", _t_selftest_failure_report)]
 
 
 def run_v18(_ok) -> None:
@@ -935,7 +1172,7 @@ def probes_main() -> int:
     """wf self-check --probes：在临时 local/ 里（子进程）跑上面的检查，逐项输出“探针 名称：通过/未通过”。只读：不碰本机状态。"""
     if os.environ.get("WF_PROBE_CHILD") != "1":
         with tempfile.TemporaryDirectory(prefix="wf-probes-") as td:
-            env = {**os.environ, "WF_LOCAL_DIR": str(Path(td) / "local"), "WF_PROBE_CHILD": "1"}
+            env = {**os.environ, "WF_LOCAL_DIR": str(Path(td) / "local"), "WF_PROBE_CHILD": "1", "WF_NOTIFY": "0"}
             env.pop("VIRTUAL_ENV", None)
             r = subprocess.run([sys.executable, str(WF_HOME / "wf.py"), "self-check", "--probes"], env=env, cwd=td,
                                capture_output=True, text=True, timeout=600)
