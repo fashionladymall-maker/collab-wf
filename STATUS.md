@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 144 轮 · 等待计划节点（WAIT_SCHEDULE）
+第 145 轮 · 发送（SEND）
 
 ## 版本
 - 工具：collab-wf 1.9.7
