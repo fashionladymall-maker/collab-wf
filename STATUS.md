@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 139 轮 · 执行与取证（EXECUTE）
+第 139 轮 · 验收（VERIFY）
 
 ## 版本
 - 工具：collab-wf 1.9.4
@@ -31,7 +31,6 @@
 
 ## 待办
 - [executor] 执行端待办 T137-1：为“执行端对话一停就续接”做宿主能力实证，只读、不改调度：宿主有没有可靠的“轮次结束/空闲”事件或回调（写明入口与实测原文）；如果有，触发后怎样证明唤醒被消费（不以 PID 存活或投递 runId 代替）；如果没有，独立观察器能做到的最短检测周期与它判断“空闲且仍有可推进待办”的依据。结果用 wf task done 写回，设计等结果出来再定。
-- [executor] 独立审查 collab-wf-1.9.5.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/collab-wf.tool.collab-wf-1.9.5.request.json
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
