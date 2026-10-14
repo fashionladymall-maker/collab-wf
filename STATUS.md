@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 132 轮 · 发送（SEND）
+第 132 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -9,7 +9,7 @@
 
 ## 最近一轮
 - 第 131 轮验收未通过（0 项）（2026-10-14T01:34:18+00:00）
-- 本方最新消息：`turns/turn-131.md`
+- 本方最新消息：`turns/turn-132.md`
 - Claude 最新回复：`replies/reply-131.md`
 
 ## 目标
