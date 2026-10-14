@@ -1,15 +1,15 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 143 轮 · 落地版本（APPLY）
+第 144 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.9.7
-- 项目：v3.11；a912b0f (HEAD -> main, tag: v3.11) release v3.11
-- 仓库指纹：e1d316e281551ca5（12 个文件）
+- 项目：v3.12；924204a (HEAD -> main, tag: v3.12) release v3.12
+- 仓库指纹：b66b4395f4223063（12 个文件）
 
 ## 最近一轮
-- 第 142 轮验收通过（2026-10-14T11:02:56+00:00）
-- 本方最新消息：`turns/turn-143.md`
+- 第 143 轮验收通过（2026-10-14T11:25:12+00:00）
+- 本方最新消息：`turns/turn-144.md`
 - Claude 最新回复：`replies/reply-143.md`
 
 ## 目标
