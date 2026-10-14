@@ -30,8 +30,8 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
-- [executor] 自动化已暂停（执行端发起）：安装前审读发现1.9.5完整性前门疑似可被REVIEW重启绕过：ops.intake先持久转REVIEW，h_intake后检查continuation_required。先暂停本项目后续安装，等待正式block审查与作者修复；不影响其他项目、不kill构建。
 - [executor] 执行端待办 T137-1：为“执行端对话一停就续接”做宿主能力实证，只读、不改调度：宿主有没有可靠的“轮次结束/空闲”事件或回调（写明入口与实测原文）；如果有，触发后怎样证明唤醒被消费（不以 PID 存活或投递 runId 代替）；如果没有，独立观察器能做到的最短检测周期与它判断“空闲且仍有可推进待办”的依据。结果用 wf task done 写回，设计等结果出来再定。
+- [executor] 独立审查 collab-wf-1.9.5.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/collab-wf.tool.collab-wf-1.9.5.request.json
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
