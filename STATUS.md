@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 138 轮 · 等待 Claude（WAIT_REPLY）
+第 138 轮 · 执行前评审（REVIEW）
 
 ## 版本
 - 工具：collab-wf 1.9.4
@@ -10,7 +10,7 @@
 ## 最近一轮
 - 第 137 轮验收通过（2026-10-14T07:49:16+00:00）
 - 本方最新消息：`turns/turn-138.md`
-- Claude 最新回复：`replies/reply-137.md`
+- Claude 最新回复：`replies/reply-138.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -32,6 +32,7 @@
 ## 待办
 - [executor] 执行端待办 T137-1：为“执行端对话一停就续接”做宿主能力实证，只读、不改调度：宿主有没有可靠的“轮次结束/空闲”事件或回调（写明入口与实测原文）；如果有，触发后怎样证明唤醒被消费（不以 PID 存活或投递 runId 代替）；如果没有，独立观察器能做到的最短检测周期与它判断“空闲且仍有可推进待办”的依据。结果用 wf task done 写回，设计等结果出来再定。
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
+- [executor] 独立审查 collab-wf-dev-v3.11.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/collab-wf-dev.t138.collab-wf-dev-v3.11.request.json
 
 ## 最新产物
 - `artifacts/collab-wf-1.9.4.zip`
