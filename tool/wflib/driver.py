@@ -261,6 +261,45 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
         if r["id"] == "SEND_UNKNOWN_WAIT":   # 1.9.0（W89）：这里只是再核对，不重发
             return "wait", f"[{r['id']}] {why} {delay} 秒后再核对是否已送达（不重发，第 {n} 次）"
         return "wait", f"[{r['id']}] {why} {delay} 秒后重试（第 {n} 次）"
+    if act == "quota_recover":
+        # 额度恢复硬规则：先尝试“已证明独立车队/账号”的新会话；没有独立资源实证时，
+        # 不把等待重置冒充恢复，也不轮换账号规避配额，明确阻塞并保留审计。
+        cfg = anomaly.transport_cfg() or {}
+        independent = bool(cfg.get("independent_fleet") is True and cfg.get("fleet_id") and cfg.get("account_id"))
+        inst.event("quota_recovery_attempt", independent_resource=independent,
+                   fleet_id=(cfg.get("fleet_id") if independent else None), by="driver")
+        if not independent:
+            text = (f"[{r['id']}] 已触发额度恢复门禁：没有配置并核实合法独立车队/账号资源；"
+                    "不等待旧额度、不轮换账号规避配额。请提供合法资源绑定后再由适配器真实创建新会话并交接。")
+            machine.go(inst, "BLOCKED", by="driver", reason=text[:300],
+                       block_reason=text[:800], blocked_from=inst.state["state"], force=True)
+            inst.state["needs_text"] = text
+            inst.state["await_rule"] = r["id"]
+            inst.save()
+            return "user", text
+        # 独立资源已由配置明确声明，交给适配器完成真实创建与回读核验；失败不伪造切换。
+        args = ["--note", f"{inst.name} 额度恢复：独立车队 {cfg['fleet_id']}",
+                "--require-independent-fleet", "--fleet-id", str(cfg["fleet_id"]),
+                "--account-id", str(cfg["account_id"])] + anomaly.conv_new_args(inst)
+        rr = anomaly.call("conv_new", args)
+        data = rr.get("data") or {}
+        if rr.get("code") != 0 or data.get("ok") is not True or not data.get("conv"):
+            text = f"[{r['id']}] 独立车队新会话创建未确认成功：{(data.get('error') or rr.get('raw') or '')[:240]}"
+            machine.go(inst, "BLOCKED", by="driver", reason=text[:300], block_reason=text[:800],
+                       blocked_from=inst.state["state"], force=True)
+            inst.state["needs_text"] = text
+            inst.save()
+            return "user", text
+        old = dict(inst.state.get("conv") or {})
+        inst.state["conv"] = {"since_turn": inst.state.get("turn"), "since": now_iso(),
+                               "chars": 0, "turns": 0, "by": "driver", "conv": data["conv"],
+                               "fleet_id": cfg["fleet_id"], "account_id": cfg["account_id"],
+                               "previous": {k: old.get(k) for k in ("since_turn", "since", "chars", "turns", "conv")}}
+        inst.state.pop("send_ref", None)
+        inst.state.pop("retry_at", None)
+        inst.save()
+        machine.go(inst, "COMPOSE", by="driver", reason="额度恢复已创建并核验独立新会话")
+        return "progress", f"[{r['id']}] 已切换到已核验独立新会话，准备交接"
     if act == "quota_wait":
         until = parse_iso(facts.get("resets_at")) or (now() + timedelta(hours=1))
         write_json(GLOBAL_QUOTA, {"until": until.isoformat(), "set_by": inst.name, "ts": now_iso()})
