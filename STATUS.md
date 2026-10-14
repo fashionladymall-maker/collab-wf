@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 135 轮 · 等待 Claude（WAIT_REPLY）
+第 135 轮 · 执行与取证（EXECUTE）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -10,7 +10,7 @@
 ## 最近一轮
 - 第 134 轮验收通过（2026-10-14T02:39:21+00:00）
 - 本方最新消息：`turns/turn-135.md`
-- Claude 最新回复：`replies/reply-134.md`
+- Claude 最新回复：`replies/reply-135.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -31,6 +31,7 @@
 
 ## 待办
 - [executor] 执行端待办 T134-2：查明第 134 轮回报里 wf tell 附带的第三份原文为什么在“sha256：54f5”处中断，是 wf tell 排队、回报预算还是发送环节截断的，截断时有没有任何提示；只报告，不重发那份原文。
+- [executor] 独立审查 collab-wf-1.9.4.zip：请按 REVIEW.md 五项审实际 diff；请求文件 /Users/admin/.workbuddy-ai/tools/collab-wf/local/reviews/collab-wf.tool.collab-wf-1.9.4.request.json
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
