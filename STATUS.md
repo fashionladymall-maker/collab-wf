@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 140 轮 · 发送（SEND）
+第 140 轮 · 执行与取证（EXECUTE）
 
 ## 版本
 - 工具：collab-wf 1.9.4
@@ -9,8 +9,8 @@
 
 ## 最近一轮
 - 第 139 轮验收未通过（0 项）（2026-10-14T09:29:31+00:00）
-- 本方最新消息：`turns/turn-139.md`
-- Claude 最新回复：`replies/reply-139.md`
+- 本方最新消息：`turns/turn-140.md`
+- Claude 最新回复：`replies/reply-140.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -34,5 +34,5 @@
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
-- `artifacts/collab-wf-1.9.5.zip`
+- `artifacts/collab-wf-1.9.6.zip`
 - `artifacts/collab-wf-dev-v3.11.zip`
