@@ -36,5 +36,5 @@
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
-- `artifacts/collab-wf-1.9.7.zip`
+- `artifacts/collab-wf-1.9.7-818ecd9.zip`
 - `artifacts/collab-wf-dev-v3.12.zip`
