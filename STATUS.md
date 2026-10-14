@@ -31,7 +31,6 @@
 
 ## 待办
 - [executor] 流程阻塞，需要人处理：[QUOTA] 已触发额度恢复门禁：没有配置并核实合法独立车队/账号资源；不等待旧额度、不轮换账号规避配额。请提供合法资源绑定后再由适配器真实创建新会话并交接。
-- [executor] 执行端待办 T137-1：为“执行端对话一停就续接”做宿主能力实证，只读、不改调度：宿主有没有可靠的“轮次结束/空闲”事件或回调（写明入口与实测原文）；如果有，触发后怎样证明唤醒被消费（不以 PID 存活或投递 runId 代替）；如果没有，独立观察器能做到的最短检测周期与它判断“空闲且仍有可推进待办”的依据。结果用 wf task done 写回，设计等结果出来再定。
 - [executor] 执行端待办 T141-2：为三会话 180 秒巡查取宿主事实原文，只读、不启用任何 hook、不 resume、不改 launchd：① 官方 CLI 的可执行文件路径、版本，resume 与非交互（print）模式的帮助原文；② 对一个已存在的会话 resume 时是追加到原会话还是分叉，图形界面开着时是否允许、并发 resume 时会怎样（引用源码行号）；③ hook 的配置位置与格式，Stop、SessionEnd 
 - [executor] 执行端待办 T144-1：按 patrol-0.1.zip 里 README 的“安装”在演练模式下落地并验收（resume_enabled 保持 false，不 resume 任何会话、不运行 wf tick、不改已有 launchd 任务）：① 解压到 /Users/admin/.workbuddy-ai/adapter/patrol/，核对包的 sha256 后运行 patrol.py selftest，应为 16/
 - [executor] 执行端待办 T144-2：适配器接上实景测量需要的字段：发送日志按项目与轮次记录、发送时给出用户消息的 uuid、poll 完成时给出回复的 parent 与可信的 ended_at；改完用一轮真实收发核对 reply_meta.json 与 send_meta.json 的原文，写进 wf task done。
