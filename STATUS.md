@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 137 轮 · 验收（VERIFY）
+第 138 轮 · 等待 Claude（WAIT_REPLY）
 
 ## 版本
 - 工具：collab-wf 1.9.4
@@ -9,7 +9,7 @@
 
 ## 最近一轮
 - 第 137 轮验收通过（2026-10-14T07:49:16+00:00）
-- 本方最新消息：`turns/turn-137.md`
+- 本方最新消息：`turns/turn-138.md`
 - Claude 最新回复：`replies/reply-137.md`
 
 ## 目标
@@ -35,4 +35,4 @@
 
 ## 最新产物
 - `artifacts/collab-wf-1.9.4.zip`
-- `artifacts/collab-wf-dev-v3.10.zip`
+- `artifacts/collab-wf-dev-v3.11.zip`
