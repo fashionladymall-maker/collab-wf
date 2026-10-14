@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 133 轮 · 发送（SEND）
+第 133 轮 · 等待计划节点（WAIT_SCHEDULE）
 
 ## 版本
 - 工具：collab-wf 1.9.1
@@ -8,9 +8,9 @@
 - 仓库指纹：29a0181934f5d903（12 个文件）
 
 ## 最近一轮
-- 第 132 轮验收通过（2026-10-14T01:37:17+00:00）
-- 本方最新消息：`turns/turn-132.md`
-- Claude 最新回复：`replies/reply-132.md`
+- 第 133 轮验收通过（2026-10-14T01:59:50+00:00）
+- 本方最新消息：`turns/turn-133.md`
+- Claude 最新回复：`replies/reply-133.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
@@ -30,6 +30,9 @@
 - 历史阶段 M1 无人值守稳定运行：已完成（2026-10-12）；7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）
 
 ## 待办
+- [executor] 执行端待办 T133-1：让 1.9.3 候选包进入公开仓库——先核对 /Users/admin/.workbuddy-ai/projects/collab-wf-dev/workflow/outbox/collab-wf-1.9.3.zip 的 sha256 仍为 ad541aea5686da4b4c479b643e01d6db248a4dfa2227c10aae61bbdf79fa48d3；一致的话只更新它的修改时间（
+- [executor] 执行端待办 T133-2：用 wf tell 把三份文本原样附在下一份回报里：ad54 审查结论（local/reviews/collab-wf.tool.collab-wf-1.9.3.bed19e2bd798416ab9869e5915c2f940.verdict.json，1802 字节）、collab-wf-193-corrected-reproduction.json（3192 字节）、A 组 failure-c
+- [executor] 执行端待办 T133-3：执行端转述里“不通过轮换账号规避额度限制”如果是用户原话，用 wf said 逐字记下；如果是执行端的归纳，写明这一点。
 - [executor] 告警隔离复核未闭合：此前清除过早：独立复核发现正文推断归属、共享父目录错选和关闭投递误记成功。已修三处并离线回归，仍缺全局运维告警递送与真实双项目验收。
 
 ## 最新产物
