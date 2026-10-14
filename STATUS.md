@@ -1,6 +1,6 @@
 # collab-wf-dev · 项目状态（collab-wf 自动同步）
 
-第 145 轮 · 等待 Claude（WAIT_REPLY）
+第 145 轮 · 接收与解析（INTAKE）
 
 ## 版本
 - 工具：collab-wf 1.9.7
@@ -10,7 +10,7 @@
 ## 最近一轮
 - 第 144 轮验收通过（2026-10-14T11:36:21+00:00）
 - 本方最新消息：`turns/turn-145.md`
-- Claude 最新回复：`replies/reply-144.md`
+- Claude 最新回复：`replies/reply-145.md`
 
 ## 目标
 - 当前阶段 M2 专业基线（第一批）：交接、动态目标与防循环（取代 M1）
