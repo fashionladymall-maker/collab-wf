@@ -20,7 +20,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
-from . import anomaly, fidelity, goals, machine, ops, page, policy, release, roles
+from . import anomaly, fidelity, goals, machine, ops, page, policy, recovery, release, roles
 from .core import (LOCAL, Instance, WfError, append_jsonl, git, now, now_iso, parse_iso, pid_alive, read_json,
                    read_jsonl, secs_since, write_json)
 from .roles import decide
@@ -164,7 +164,15 @@ def _run_locked(inst, max_seconds, max_steps, linger=False):
 
 
 def explain(inst: Instance) -> dict:
-    """回答用户唯一关心的问题：现在卡在哪、为什么、需要谁做什么。"""
+    """回答用户唯一关心的问题：现在卡在哪、为什么、需要谁做什么。B2-A2a：有进行中的恢复期时另给一行 recovery。"""
+    out = _explain(inst)
+    rs = recovery.status(inst)
+    if rs:
+        out["recovery"] = rs["text"]
+    return out
+
+
+def _explain(inst: Instance) -> dict:
     s = machine.status(inst)
     st = inst.state
     where = f"第 {s['turn']} 轮 · {s['name']}（{s['state']}）"
@@ -246,11 +254,28 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
     streak_block = act == "continue" and int(st.get("continue_streak", 0)) >= 3
     if streak_block:   # 1.7.6：续接连续 3 轮仍缺固定块就停下等人看，不再空耗额度（amy-local 第 7–11 轮）
         act = "block"
+    spent = None
+    if act in ("retry", "quota_wait") and recovery.classify(r["id"]):
+        # B2-A2a：原处置算完之后再看恢复期总预算；耗尽就改为阻塞。只会更严：计数、退避、max、then 都不变
+        it = st.get("send_intent") if r["id"] == "SEND_UNKNOWN_WAIT" else None   # r2：同一发送意图只计一次
+        ts = it.get("ts") if isinstance(it, dict) else None
+        same_turn = (isinstance(it, dict) and type(it.get("turn")) is int and type(st.get("turn")) is int
+                     and it["turn"] == st["turn"])
+        key = f"{it['turn']}:{ts}" if same_turn and isinstance(ts, str) and ts and parse_iso(ts) is not None else None
+        rec = recovery.note(inst, r["id"], detail=detail, pol=ctx.pol, key=key)
+        if rec["exhausted"]:
+            spent, act = rec, "block"
     inst.event("auto", rule=r["id"], action=act, attempt=n, detail=detail[:300],
                facts={k: v for k, v in facts.items() if k != "text"} or None, by="driver")
+    if spent:
+        ep = spent["episode"] if isinstance(spent["episode"], dict) else {}
+        inst.event("auto", rule="RECOVERY_EXHAUSTED", action="block", detail=f"{spent['class']}：{spent['why']}"[:300],
+                   episode=ep.get("id"), since=ep.get("since"), by="driver")
     why = r.get("why", "")
     if streak_block:
         why = f"连续 {st.get('continue_streak')} 轮续接后回复仍缺固定块，停下等人看（1.7.6）。" + why
+    if spent:
+        why = f"RECOVERY_EXHAUSTED:{spent['class']}（{spent['why']}），停下等人看。" + why
     if act == "retry":
         b = r.get("backoff_s", [60])
         delay = b[min(n - 1, len(b) - 1)]
@@ -262,7 +287,7 @@ def _anomaly(ctx: Ctx, facts: dict, detail: str):
             return "wait", f"[{r['id']}] {why} {delay} 秒后再核对是否已送达（不重发，第 {n} 次）"
         return "wait", f"[{r['id']}] {why} {delay} 秒后重试（第 {n} 次）"
     if act == "quota_wait":
-        until = parse_iso(facts.get("resets_at")) or (now() + timedelta(hours=1))
+        until = recovery.quota_until(inst, facts.get("resets_at"))   # B2-A2a：第 k 次试探 min(2^(k−1), 24) 小时，不越过截止
         write_json(GLOBAL_QUOTA, {"until": until.isoformat(), "set_by": inst.name, "ts": now_iso()})
         machine.go(inst, "QUOTA_WAIT", by="driver", reason=f"[{r['id']}] {why}", until=until.isoformat(),
                    wait_reason="额度重置")
@@ -791,6 +816,7 @@ def _finalize_send(ctx, out, note, immediate=False):
     model = out.get("model") or anomaly.transport_cfg().get("model")
     append_jsonl(LOCAL / "send_log.jsonl", {"ts": now_iso(), "project": inst.name, "turn": st["turn"]})
     st["send_ref"] = st["send_intent"].get("ref")
+    recovery.close(inst, evidence="send_accepted")   # B2-A2a：通道确认接受（不是只有心跳），或结果不明后经轮询确认
     b = st.setdefault("budget", {"date": now().strftime("%Y-%m-%d"), "rounds": 0})
     b["rounds"] = b.get("rounds", 0) + 1
     inst.save()
@@ -1099,6 +1125,7 @@ def h_wait_reply(ctx):
         inst.save()
         _quota(inst)
         ops.mark_replied(inst, rf, r["data"].get("tools"), by="driver")
+        recovery.close(inst, evidence="reply_landed")   # B2-A2a：回复落地结束恢复期，随下面的释放一起保存
         _slot_release(ctx, "reply_landed")   # 1.8.8（P0-G）：回复落地，释放共享发送槽；B1-A：按本次尝试的 token 精确释放
         return "progress", f"收到回复（交付文件 {len(st['delivered'])} 个）"
     if status == "refused":

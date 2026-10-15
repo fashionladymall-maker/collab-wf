@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .core import WF_HOME
@@ -124,8 +125,29 @@ def run(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
                            "workflow/goals.json": (p / "workflow" / "goals.json").read_text()})
     (fake / "replies" / "3.files").write_text(str(z3))
     rc, o = _user(_wf, env, p, "approve", "approve")
+    quota_started = datetime.now(timezone.utc)
     rc, o = _wf(env, p, "run")
+    quota_finished = datetime.now(timezone.utc)
     _ok("额度用尽：进入等待额度重置（本次唤醒到此为止，不连续重试）", rc == 10 and _state(p)["state"] == "QUOTA_WAIT", o)
+    quota_state = _state(p)
+    quota_hold_path = local / "quota_hold.json"
+    quota_hold = json.loads(quota_hold_path.read_text())
+    try:
+        quota_until = datetime.fromisoformat(quota_state.get("until") or "")
+    except (TypeError, ValueError):
+        quota_until = None
+    _ok("额度旧重置时刻不立即试探：首次等待约一小时，项目与全局等待一致",
+        quota_until is not None and quota_until.tzinfo is not None
+        and quota_started + timedelta(seconds=3599) <= quota_until <= quota_finished + timedelta(seconds=3601)
+        and quota_hold.get("until") == quota_state.get("until"),
+        json.dumps({"project_until": quota_state.get("until"), "global_until": quota_hold.get("until"),
+                    "started": quota_started.isoformat(), "finished": quota_finished.isoformat()}, ensure_ascii=False))
+    # IC-A2a-Q：仅推进临时夹具的两处等待时刻，模拟额度重置；保留其余状态和原有重发断言。
+    quota_past = (quota_finished - timedelta(seconds=60)).isoformat()
+    quota_state["until"] = quota_past
+    quota_hold["until"] = quota_past
+    (p / "workflow" / "state.json").write_text(json.dumps(quota_state))
+    quota_hold_path.write_text(json.dumps(quota_hold))
     rc, o2 = _wf(env, p, "run")
     o += o2
     ev2 = p / "workflow" / "evidence" / "turn-002"

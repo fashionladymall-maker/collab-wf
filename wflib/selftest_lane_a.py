@@ -1379,6 +1379,1160 @@ def _t_a1fix2_checkpoint_types(_ok):
         ok, json.dumps([res, pos, v0["problem"], v1["problem"]], ensure_ascii=False)[:1500])
 
 
+# ---------------- B2-A2a：恢复预算与仲裁身份 ----------------
+# 场景都在临时 WF_LOCAL_DIR 与临时项目目录里真实运行驱动器的处理函数；适配器换成替身脚本，按返回码控制；
+# 时间流逝靠改写磁盘上的 since、until 模拟。并发用真实子进程与真实文件锁。
+
+BUSY = {"code": 2, "raw": "busy", "data": {}}
+NET_ERR = {"code": 4, "raw": "net", "data": {}}
+QUOTA_HIT = {"code": 3, "raw": "quota", "data": {}}
+POLL_GEN = {"code": 0, "raw": "", "data": {"status": "generating"}}
+SEND_TIMEOUT = {"code": 4, "raw": "timeout", "data": {}}
+
+
+def _ep(inst):
+    return _disk(inst).get("recovery")
+
+
+def _rewrite(inst, fn=None, **fields):
+    """直接改磁盘上的状态（模拟时间流逝或外部改动），返回新读的 Instance。
+    since=… 表示恢复期已经过了这么久：since、deadline、upgraded_at、last.ts 一起往前拨，记录内部关系保持一致（r2）。"""
+    from .core import Instance, parse_iso
+    raw = _disk(inst)
+    for k, v in fields.items():
+        if k == "since":
+            ep = raw["recovery"]
+            delta = parse_iso(ep["since"]) - parse_iso(v)
+            for f in ("since", "deadline", "upgraded_at"):
+                if ep.get(f):
+                    ep[f] = (parse_iso(ep[f]) - delta).isoformat(timespec="seconds")
+            if isinstance(ep.get("last"), dict) and ep["last"].get("ts"):
+                ep["last"]["ts"] = (parse_iso(ep["last"]["ts"]) - delta).isoformat(timespec="seconds")
+        else:
+            raw[k] = v
+    if fn:
+        fn(raw)
+    inst.state_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    return Instance(inst.root)
+
+
+@contextmanager
+def _clock(offset_s):
+    """把驱动器、core、recovery 看到的“现在”往后拨 offset_s 秒（磁盘内容不动，发送意图的 key 也不变）。"""
+    from . import core, driver, recovery
+    real = core.now
+    saved = (core.now, driver.now, recovery._now)
+
+    def fake():
+        return real() + timedelta(seconds=offset_s)
+    core.now = driver.now = recovery._now = fake
+    try:
+        yield
+    finally:
+        core.now, driver.now, recovery._now = saved
+
+
+def _unknown_pending(td, name, turn):
+    """一条结果不明、待确认的发送意图：授予、保存、外发前标记都已完成，持有带 token 的槽；适配器从未被调用。"""
+    from . import arbiter
+    a = _sendable(td, name, turn)
+    g = arbiter.acquire(a, 1, 3600)
+    a.state.update(send_slot={"lease_id": g["lease_id"], "turn": turn, "attempt": g["attempt"], "granted_at": g["granted_at"]},
+                   send_intent={"turn": turn, "status": "pending", "ts": _iso(0), "file": a.state["outgoing"]["file"]},
+                   send_ref="R-prev")
+    a.save()
+    arbiter.mark_sending(a, g["lease_id"], turn)
+    return a
+
+
+def _due(inst):
+    """跳过退避等待（驱动器在下一拍才会再来；这里直接让它到点）。"""
+    inst.state.pop("retry_at", None)
+    return inst
+
+
+def _send_fields(st) -> dict:
+    return {k: st.get(k) for k in ("send_ref", "send_intent", "send_slot")}
+
+
+def _waiting_reply(td, name, turn, pol=None):
+    """真实走一次授予、外发前标记、外发，停在等回复：持有带 token 的槽、有 ref。"""
+    from . import driver
+    a = _sendable(td, name, turn)
+    with _patched(_Fake(send=[SENT_OK])):
+        driver.h_send(_ctx(a, pol or {"shared_max_inflight": 1}))
+    a.state.pop("poll_after", None)
+    a.save()
+    return a
+
+
+def _same_name_pair(td, base, turn=1, state="SEND"):
+    """同名、不同根目录的两个项目（例如复制出来的目录）。"""
+    from .core import Instance
+    out = []
+    for d in ("root-a", "root-b"):
+        root = Path(td) / d / base
+        (root / "workflow").mkdir(parents=True)
+        (root / "workflow" / "wf.json").write_text(json.dumps({"project": f"{base}-{os.getpid()}"}), encoding="utf-8")
+        (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+        i = Instance(root)
+        i.state.update(state=state, turn=turn)
+        i.save()
+        out.append(i)
+    return out
+
+
+def _drop_quota_hold():
+    from . import driver
+    if driver.GLOBAL_QUOTA.exists():
+        driver.GLOBAL_QUOTA.unlink()
+
+
+def _delays(texts) -> list:
+    import re as _re
+    out = []
+    for t in texts:
+        m = _re.search(r"(\d+) 秒后", t)
+        out.append(int(m.group(1)) if m else None)
+    return out
+
+
+# ---- 提供方（C1_PROVIDERS）：每类一个正例、一个反例，都实际运行 ----
+
+def _p_busy_pos():
+    from . import driver
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        a = _sendable(td, "a2-busy-p", 3)
+        fake = _Fake(send=[BUSY, BUSY])
+        with _patched(fake):
+            r1 = driver.h_send(_ctx(a, {}))
+            s1 = _ep(a)["since"]
+            r2 = driver.h_send(_ctx(_due(a), {}))
+            r3 = driver._anomaly(_ctx(a, {}), {"source": "transport", "code": 4}, "换成网络错误，仍是同一个恢复期")
+        st = _disk(a)
+    ep = st["recovery"]
+    ok = (r1[0] == r2[0] == r3[0] == "wait" and st["state"] == "SEND" and ep["since"] == s1
+          and ep["rules"] == {"SEND_BUSY": 2, "NET": 1} and ep["attempts"] == {"transient": 3, "quota": 0}
+          and fake.calls.count("send") == 2)
+    return ok, {"returns": [r1[0], r2[0], r3[0]], "state": st["state"], "since_kept": ep["since"] == s1, "rules": ep["rules"],
+                "sends": fake.calls.count("send")}
+
+
+def _p_busy_neg():
+    from . import driver
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        a = _sendable(td, "a2-busy-n", 3)
+        fake = _Fake(send=[BUSY] * 7)
+        acts = []
+        with _patched(fake):
+            for _ in range(7):
+                acts.append(driver.h_send(_ctx(_due(a), {}))[0])
+                if a.state["state"] != "SEND":
+                    break
+        s7 = _disk(a)
+        b = _sendable(td, "a2-busy-x", 3)
+        fb = _Fake(send=[BUSY, BUSY])
+        with _patched(fb):
+            driver.h_send(_ctx(b, {}))
+            b = _rewrite(b, since=_iso(-(14400 + 5)))   # 恢复期已过 4 小时
+            rb = driver.h_send(_ctx(_due(b), {}))
+        sb = _disk(b)
+        ex = [e for e in _events(b, "auto") if e.get("rule") == "RECOVERY_EXHAUSTED"]
+    ok = (acts == ["wait"] * 6 + ["user"] and s7["state"] == "BLOCKED" and "[SEND_BUSY]" in s7.get("block_reason", "")
+          and "RECOVERY_EXHAUSTED" not in s7.get("block_reason", "") and s7["anomaly_counts"].get("3:SEND_BUSY") == 7
+          and fake.calls.count("send") == 7 and s7["recovery"]["attempts"]["transient"] == 6
+          and rb[0] == "user" and sb["state"] == "BLOCKED" and "RECOVERY_EXHAUSTED:transient" in sb.get("block_reason", "")
+          and "损坏" not in sb.get("block_reason", "")
+          and len(ex) == 1 and fb.calls.count("send") == 2)
+    return ok, {"old_max": acts, "old_reason": s7.get("block_reason", "")[:60], "exhausted_reason": sb.get("block_reason", "")[:90],
+                "sends_after_exhausted": fb.calls.count("send")}
+
+
+def _p_network_pos():
+    from . import driver
+    pol = {"shared_max_inflight": 1}
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        a = _waiting_reply(td, "a2-net-p", 4)
+        before, hold = _send_fields(_disk(a)), _holders(a.name)
+        fake = _Fake(poll=[NET_ERR])
+        with _patched(fake):
+            r = driver.h_wait_reply(_ctx(a, pol))
+        st, hold2 = _disk(a), _holders(a.name)
+    ok = (r[0] == "wait" and st["state"] == "WAIT_REPLY" and _send_fields(st) == before and before["send_ref"]
+          and (before["send_slot"] or {}).get("lease_id") and hold2 == hold and st["recovery"]["rules"] == {"NET": 1}
+          and "send" not in fake.calls)
+    return ok, {"ret": r[0], "state": st["state"], "send_fields_kept": _send_fields(st) == before, "holder_kept": hold2 == hold}
+
+
+def _p_network_neg():
+    from . import driver
+    pol = {"shared_max_inflight": 1}
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        a = _waiting_reply(td, "a2-net-n", 4)
+        before, hold = _send_fields(_disk(a)), _holders(a.name)
+        fake = _Fake(poll=[NET_ERR, NET_ERR])
+        with _patched(fake):
+            driver.h_wait_reply(_ctx(a, pol))
+            a = _rewrite(a, since=_iso(-(14400 + 5)), retry_at=None)
+            r = driver.h_wait_reply(_ctx(a, pol))
+        st, hold2 = _disk(a), _holders(a.name)
+    ok = (r[0] == "user" and st["state"] == "BLOCKED" and "RECOVERY_EXHAUSTED:transient" in st.get("block_reason", "")
+          and "损坏" not in st.get("block_reason", "")
+          and _send_fields(st) == before and hold2 == hold and "send" not in fake.calls)
+    return ok, {"ret": r[0], "state": st["state"], "reason": st.get("block_reason", "")[:90],
+                "send_fields_kept": _send_fields(st) == before, "holder_kept": hold2 == hold}
+
+
+def _p_quota_pos():
+    from . import arbiter, driver
+    from .core import parse_iso
+    pol = {"shared_max_inflight": 1}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _fresh_shared()
+            a = _sendable(td, "a2-q-s", 5)
+            ra = _iso(7200)
+            with _patched(_Fake(send=[{"code": 3, "raw": "quota", "data": {"resets_at": ra}}])):
+                r0 = driver.h_send(_ctx(a, {}))
+            s0 = _disk(a)
+            hold_q = json.loads(driver.GLOBAL_QUOTA.read_text(encoding="utf-8"))
+            _drop_quota_hold()
+            p = _waiting_reply(td, "a2-q-w", 6)
+            before = _send_fields(_disk(p))
+            tok = before["send_slot"]["lease_id"]
+            fake = _Fake(poll=[QUOTA_HIT, POLL_GEN])
+            with _patched(fake):
+                r1 = driver.h_wait_reply(_ctx(p, pol))
+                s1 = _disk(p)
+                q = _sendable(td, "a2-q-other", 2)
+                g = arbiter.acquire(q, 1, 3600)   # 另一项目在租约期内：不得把等额度的持有者当作过期回收
+                held = [h.get("lease_id") for h in _holders(p.name)]
+                p = _rewrite(p, until=_iso(-1))
+                r2 = driver.h_quota_wait(_ctx(p, pol))
+                p.state.pop("poll_after", None)
+                p.save()
+                r3 = driver.h_wait_reply(_ctx(p, pol))
+            s3 = _disk(p)
+    finally:
+        _drop_quota_hold()
+    ok = (r0[0] == "wait" and s0["state"] == "QUOTA_WAIT" and parse_iso(s0["until"]) == parse_iso(ra)
+          and hold_q.get("set_by") == a.name and s0["recovery"]["class"] == "quota"
+          and r1[0] == "wait" and s1["state"] == "QUOTA_WAIT" and s1.get("return_to") == "WAIT_REPLY" and _send_fields(s1) == before
+          and not g["granted"] and held == [tok] and r2[0] == "progress" and r3[0] == "wait" and s3["state"] == "WAIT_REPLY"
+          and _send_fields(s3) == before and fake.calls == ["poll", "poll"])
+    return ok, {"send_quota_until_is_resets_at": parse_iso(s0.get("until")) == parse_iso(ra), "global_hold_by": hold_q.get("set_by"),
+                "wait_reply_return_to": s1.get("return_to"), "fields_kept": _send_fields(s1) == before,
+                "other_project_granted": g["granted"], "holder_kept": held == [tok], "after_resume": [r3[0], s3["state"]],
+                "adapter_calls": fake.calls}
+
+
+def _p_quota_neg():
+    from . import driver, recovery
+    from .core import now, parse_iso
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _fresh_shared()
+            a = _sendable(td, "a2-q-13", 7)
+            for i in range(12):
+                recovery.note(a, "QUOTA", detail=f"第 {i + 1} 次试探")
+            a.save()
+            with _patched(_Fake(send=[QUOTA_HIT])):
+                r13 = driver.h_send(_ctx(a, {}))
+            s13 = _disk(a)
+            b = _sendable(td, "a2-q-8d", 7)
+            with _patched(_Fake(send=[QUOTA_HIT, QUOTA_HIT])):
+                driver.h_send(_ctx(b, {}))
+                b = _rewrite(b, since=_iso(-(691200 + 5)), until=_iso(-1))   # 恢复期已过 8 天
+                driver.h_quota_wait(_ctx(b, {}))
+                _drop_quota_hold()
+                r8 = driver.h_send(_ctx(b, {}))
+            s8 = _disk(b)
+            lim = recovery.limits({"recovery_quota_window_s": 30 * 86400, "recovery_quota_attempts": 100,
+                                   "recovery_transient_window_s": -1, "recovery_transient_attempts": "x"})
+            low = recovery.limits({"recovery_quota_window_s": 3600, "recovery_transient_attempts": 3})
+            past, soon = [], []
+            for nm, ra, box in (("a2-q-past", "2000-01-01T00:00:00+00:00", past), ("a2-q-soon", _iso(10), soon)):
+                _drop_quota_hold()
+                x = _sendable(td, nm, 8)
+                t0 = now()
+                with _patched(_Fake(send=[{"code": 3, "raw": "quota", "data": {"resets_at": ra}}])):
+                    driver.h_send(_ctx(x, {}))
+                box.append(round((parse_iso(_disk(x)["until"]) - t0).total_seconds(), 0))
+            c = _sendable(td, "a2-q-k", 8)
+            waits = []
+            with _patched(_Fake(send=[QUOTA_HIT, QUOTA_HIT])):
+                for _ in range(2):
+                    _drop_quota_hold()
+                    t0 = now()
+                    driver.h_send(_ctx(c, {}))
+                    waits.append(round((parse_iso(_disk(c)["until"]) - t0).total_seconds() / 3600, 2))
+                    c = _rewrite(c, until=_iso(-1))
+                    driver.h_quota_wait(_ctx(c, {}))
+    finally:
+        _drop_quota_hold()
+    ok = (r13[0] == "user" and s13["state"] == "BLOCKED" and "RECOVERY_EXHAUSTED:quota" in s13.get("block_reason", "")
+          and s13["recovery"]["attempts"]["quota"] == 13
+          and r8[0] == "user" and s8["state"] == "BLOCKED" and "RECOVERY_EXHAUSTED:quota" in s8.get("block_reason", "")
+          and "损坏" not in s8.get("block_reason", "")
+          and len(past) == 1 and abs(past[0] - 3600) <= 5 and len(soon) == 1 and 55 <= soon[0] <= 65
+          and lim == {"transient": {"window_s": 14400, "attempts": 24}, "quota": {"window_s": 691200, "attempts": 12}}
+          and low["quota"]["window_s"] == 3600 and low["transient"]["attempts"] == 3
+          and len(waits) == 2 and abs(waits[0] - 1) < 0.05 and abs(waits[1] - 2) < 0.05)
+    return ok, {"probe13": s13.get("block_reason", "")[:80], "over_8d": s8.get("block_reason", "")[:80], "policy_30d": lim["quota"],
+                "lowered": low, "waits_h": waits, "past_resets_at_wait_s": past, "resets_in_10s_wait_s": soon}
+
+
+def _p_unknown_pos():
+    from . import driver
+    pol = {"send_unknown_wait": True, "shared_max_inflight": 1}
+    with tempfile.TemporaryDirectory() as td:
+        # A：同一发送意图每 120 秒核对一次，共 31 次（第 31 次在第 60 分钟）；期间不耗尽，最后按旧窗口停下
+        _fresh_shared()
+        a = _unknown_pending(td, "a2-u-31", 9)
+        before = _send_fields(_disk(a))
+        fake = _Fake(poll=lambda op, args: POLL_NONE)
+        acts, ex_seen = [], False
+        with _patched(fake):
+            for i in range(31):
+                with _clock(i * 120):
+                    acts.append(driver.h_send(_ctx(a, pol))[0])
+                    ex_seen = ex_seen or "RECOVERY_EXHAUSTED" in (a.state.get("block_reason") or "")
+                if acts[-1] != "wait":
+                    break
+        sa = _disk(a)
+        it = before["send_intent"]
+        # B：第 55 分钟轮询到“生成中”：恢复期结束，不阻塞
+        _fresh_shared()
+        b = _unknown_pending(td, "a2-u-55", 9)
+        fb = _Fake(poll=[POLL_NONE] * 28 + [POLL_GEN])
+        with _patched(fb):
+            for i in range(28):
+                with _clock(i * 120):
+                    driver.h_send(_ctx(b, pol))
+            with _clock(55 * 60):   # 这一次核对发生在第 55 分钟（不等原定第 56 分钟的退避时刻）
+                rb = driver.h_send(_ctx(_due(b), pol))
+        sb = _disk(b)
+        # C（I6）：只有心跳、accepted:false 都不结束恢复期；经轮询确认已开始才结束
+        _fresh_shared()
+        c = _sendable(td, "a2-u-acc", 9)
+        fc = _Fake(send=[BUSY, {"code": 0, "raw": "", "data": {"accepted": False}}], poll=[POLL_GEN])
+        with _patched(fc):
+            driver.h_send(_ctx(c, {"send_unknown_wait": True}))
+            since_c = _ep(c)["since"]
+            driver.h_send(_ctx(_due(c), {"send_unknown_wait": True}))
+            open_after_false = _ep(c)
+            driver.h_send(_ctx(_due(c), {"send_unknown_wait": True}))
+        sc = _disk(c)
+        d = _sendable(td, "a2-u-hb", 9)
+        fd = _Fake(send=[BUSY, {"code": 0, "raw": "", "data": {"status": "heartbeat_only"}}])
+        with _patched(fd):
+            driver.h_send(_ctx(d, {"send_unknown_wait": True}))
+            since_d = _ep(d)["since"]
+            driver.h_send(_ctx(_due(d), {"send_unknown_wait": True}))
+        sd = _disk(d)
+    hb = (sb.get("recovery_history") or [{}])[-1]
+    hc = (sc.get("recovery_history") or [{}])[-1]
+    ok = (acts == ["wait"] * 30 + ["user"] and not ex_seen and sa["state"] == "BLOCKED"
+          and "[SEND_UNKNOWN_WAIT]" in sa.get("block_reason", "") and "RECOVERY_EXHAUSTED" not in sa.get("block_reason", "")
+          and "send" not in fake.calls and fake.calls.count("poll") == 31 and _send_fields(sa) == before
+          and sa["recovery"]["attempts"] == {"transient": 1, "quota": 0} and sa["recovery"]["rules"] == {"SEND_UNKNOWN_WAIT": 1}
+          and sa["recovery"]["keys"] == [f"{it['turn']}:{it['ts']}"]
+          and rb[0] == "progress" and sb["state"] == "WAIT_REPLY" and sb.get("recovery") is None
+          and hb.get("closed_by") == "send_accepted" and "send" not in fb.calls
+          and open_after_false and open_after_false["since"] == since_c and sc.get("recovery") is None
+          and hc.get("closed_by") == "send_accepted" and hc.get("since") == since_c
+          and sd.get("recovery") and sd["recovery"]["since"] == since_d and (sd.get("send_intent") or {}).get("status") == "pending")
+    return ok, {"checks": len(acts), "stopped_at_min": (len(acts) - 1) * 2, "stop_reason": sa.get("block_reason", "")[:60],
+                "exhausted_seen": ex_seen, "send_calls": fake.calls.count("send"), "fields_kept": _send_fields(sa) == before,
+                "counted": sa["recovery"]["attempts"], "min55": [rb[0], sb["state"], hb.get("closed_by")],
+                "accepted_false_keeps_open": bool(open_after_false), "heartbeat_keeps_open": bool(sd.get("recovery"))}
+
+
+def _p_unknown_neg():
+    from . import driver
+    pol = {"send_unknown_wait": True, "shared_max_inflight": 1}
+    with tempfile.TemporaryDirectory() as td:
+        # 恢复期 since 已在 4 小时前（意图本身是新的）：再核对一次即按恢复期硬上限停下，三项保留、不发送
+        _fresh_shared()
+        a = _unknown_pending(td, "a2-u-4h", 9)
+        before = _send_fields(_disk(a))
+        fake = _Fake(poll=[POLL_NONE, POLL_NONE])
+        with _patched(fake):
+            driver.h_send(_ctx(a, pol))
+            a = _rewrite(a, since=_iso(-14400), retry_at=None)
+            r = driver.h_send(_ctx(a, pol))
+        st = _disk(a)
+        # 旧窗口（一小时）先到：按原规则停下，不重发
+        _fresh_shared()
+        b = _sendable(td, "a2-u-n", 9)
+        fb = _Fake(send=[SEND_TIMEOUT], poll=[POLL_NONE])
+        with _patched(fb):
+            driver.h_send(_ctx(b, {"send_unknown_wait": True}))
+
+            def _old(raw):
+                raw["send_intent"]["ts"] = _iso(-7200)
+            b = _rewrite(b, _old, retry_at=None)
+            rb = driver.h_send(_ctx(b, {"send_unknown_wait": True}))
+        sb = _disk(b)
+    ok = (r[0] == "user" and st["state"] == "BLOCKED" and "RECOVERY_EXHAUSTED:transient" in st.get("block_reason", "")
+          and "损坏" not in st.get("block_reason", "")
+          and _send_fields(st) == before and "send" not in fake.calls
+          and rb[0] == "user" and sb["state"] == "BLOCKED" and "[SEND_UNKNOWN_WAIT]" in sb.get("block_reason", "")
+          and "RECOVERY_EXHAUSTED" not in sb.get("block_reason", "") and fb.calls == ["send", "poll"]
+          and (sb.get("send_intent") or {}).get("status") == "pending")
+    return ok, {"after_4h": [r[0], st["state"], st.get("block_reason", "")[:80]], "fields_kept": _send_fields(st) == before,
+                "send_calls": fake.calls.count("send"), "old_window": [rb[0], sb.get("block_reason", "")[:50]]}
+
+
+def _p_absent_pos():
+    from . import driver, tasks
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2-x-p", {"state": "WAIT_SCHEDULE", "turn": 3, "await_executor": 3, "until": _iso(3600)})
+        tasks.add(a, 3, {"1": "执行端要做的事"})
+        r = driver.h_wait_schedule(_ctx(a, {}))
+        st = _disk(a)
+    ok = (r[0] == "wait" and st["state"] == "WAIT_SCHEDULE" and st.get("await_executor") == 3 and "T3-1" in r[1]
+          and st.get("recovery") is None)
+    return ok, {"ret": list(r), "state": st["state"]}
+
+
+def _p_absent_neg():
+    from . import driver, tasks
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2-x-n", {"state": "WAIT_SCHEDULE", "turn": 3, "await_executor": 3, "until": _iso(-5)})
+        tasks.add(a, 3, {"1": "执行端没做完的事"})
+        r = driver.h_wait_schedule(_ctx(a, {}))
+        st = _disk(a)
+        notes = "\n".join(p.read_text(encoding="utf-8") for p in a.wf.rglob("notes.jsonl"))
+    t = (st.get("executor_tasks") or [{}])[0]
+    ok = (st["state"] not in ("BLOCKED", "AWAITING_USER", "WAIT_SCHEDULE") and "await_executor" not in st
+          and "T3-1" in notes and tasks.status_of(t) == "open")
+    return ok, {"ret": r[0], "state": st["state"], "task_status": tasks.status_of(t), "deviation_lists_task": "T3-1" in notes}
+
+
+def _find_code(obj, kind="approve"):
+    if isinstance(obj, dict):
+        if obj.get("code") and kind in str(obj.get("kind", "")):
+            return obj["code"]
+        obj = list(obj.values())
+    if isinstance(obj, list):
+        for x in obj:
+            c = _find_code(x, kind)
+            if c:
+                return c
+    return None
+
+
+def _p_cred_pos():
+    from . import asks, driver
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2-cred-p", {"state": "REVIEW", "turn": 2})
+        a.turn_dir().mkdir(parents=True, exist_ok=True)
+        (a.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["cat .env"], "directives": {}}), encoding="utf-8")
+        r = driver.h_review(_ctx(a, {"allow": [r"^cat \.env$"]}))   # 白名单放行也不行：底线“密钥”要用户批准
+        st = _disk(a)
+        code = _find_code(asks.pending(a)) or next((x.get("code") for x in asks.pending(a) if x.get("code")), None)
+        rc_a, oa = _wf_cli(a.root, "approve", "--code", code or "X-0000", "--by", "executor", "--reason", "执行端代批")
+        st2 = _disk(a)
+    ok = (r[0] == "user" and st["state"] == "AWAITING_USER" and "密钥" in st.get("needs_text", "") and bool(code)
+          and rc_a != 0 and st2["state"] == "AWAITING_USER")
+    return ok, {"ret": r[0], "state": st["state"], "needs": st.get("needs_text", "")[:80], "code": code,
+                "executor_approve_rc": rc_a, "executor_approve_out": oa.strip()[-160:], "state_after": st2["state"]}
+
+
+def _p_cred_neg():
+    from . import driver
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2-cred-n", {"state": "REVIEW", "turn": 2})
+        a.turn_dir().mkdir(parents=True, exist_ok=True)
+        (a.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["echo hi"], "directives": {}}), encoding="utf-8")
+        r = driver.h_review(_ctx(a, {"allow": [r"^echo hi$"]}))
+        st = _disk(a)
+        rv = json.loads((a.turn_dir() / "review.json").read_text(encoding="utf-8"))
+    ok = st["state"] not in ("AWAITING_USER", "BLOCKED") and rv.get("accepted") is True
+    return ok, {"ret": r[0], "state": st["state"], "review_accepted": rv.get("accepted")}
+
+
+def _p_wrong_pos():
+    from . import arbiter, driver, ops
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        b = _inst(td, "a2-stale", {"state": "EXECUTE", "turn": 4, "exec_binding": {"turn": 4, "tool": "0.0.0", "fp": None}})
+        b.turn_dir().mkdir(parents=True, exist_ok=True)
+        (b.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["echo two"], "directives": {}}), encoding="utf-8")
+        r = driver.h_execute(driver.Ctx(b, {"allow": [r"^echo two$"]}, time.time() + 120))
+        n = len(ops.list_execs(b))
+        p1, p2 = _same_name_pair(td, "a2-twin")
+        g1 = arbiter.acquire(p1, 1, 3600)
+        g2 = arbiter.acquire(p2, 1, 3600)
+        hold = _holders(p1.name)
+    ok = (r[0] == "progress" and n == 0 and "工具版本" in r[1] and g1["granted"] and not g2["granted"] and not g2["reentry"]
+          and [h.get("lease_id") for h in hold] == [g1["lease_id"]] and hold[0].get("root") == str(p1.root))
+    return ok, {"plan_stale": r[1][:80], "executed": n, "twin_granted": g2["granted"], "twin_reentry": g2["reentry"],
+                "holder_root_is_p1": hold[0].get("root") == str(p1.root) if hold else None}
+
+
+def _p_wrong_neg():
+    from . import arbiter
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        p1, _p2 = _same_name_pair(td, "a2-twin-n")
+        g1 = arbiter.acquire(p1, 1, 3600)
+        g1b = arbiter.acquire(p1, 1, 3600)
+        r = arbiter.release(p1, "done", lease_id=g1["lease_id"], turn=1)
+    ok = g1["granted"] and g1b["granted"] and g1b["reentry"] and g1b["lease_id"] == g1["lease_id"] and r["released"]
+    return ok, {"reentry": g1b["reentry"], "same_token": g1b["lease_id"] == g1["lease_id"], "released": r["released"]}
+
+
+def _provider(category, pos, neg):
+    def run() -> dict:
+        why = _guard()
+        out = {"schema": "c1-provider/1", "category": category, "lane": "A", "card": "B2-A2a"}
+        for kind, fn in (("positive", pos), ("negative", neg)):
+            if why:
+                out[kind] = {"ran": False, "ok": False, "evidence": why}
+                continue
+            try:
+                ok, ev = fn()
+                out[kind] = {"ran": True, "ok": bool(ok), "evidence": ev}
+            except Exception:
+                import traceback
+                out[kind] = {"ran": True, "ok": False, "evidence": traceback.format_exc()[-1500:]}
+            finally:
+                _fresh_shared()
+        out["ok"] = out["positive"]["ok"] and out["negative"]["ok"]
+        return out
+    run.__name__ = "provider_" + category.replace("-", "_")
+    return run
+
+
+C1_PROVIDERS = {
+    "2R-busy": _provider("2R-busy", _p_busy_pos, _p_busy_neg),
+    "2R-network": _provider("2R-network", _p_network_pos, _p_network_neg),
+    "2R-quota": _provider("2R-quota", _p_quota_pos, _p_quota_neg),
+    "2R-send-unknown": _provider("2R-send-unknown", _p_unknown_pos, _p_unknown_neg),
+    "2R-executor-absent": _provider("2R-executor-absent", _p_absent_pos, _p_absent_neg),
+    "2S-credential": _provider("2S-credential", _p_cred_pos, _p_cred_neg),
+    "2S-wrong-project": _provider("2S-wrong-project", _p_wrong_pos, _p_wrong_neg),
+}
+
+
+def _t_a2_providers(_ok):
+    for cat, fn in C1_PROVIDERS.items():
+        r = fn()
+        _ok(f"B2-A2a 提供方 {cat}：正例与反例都实际运行并通过（c1-provider/1）",
+            r["ok"] and r["positive"]["ran"] and r["negative"]["ran"], json.dumps(r, ensure_ascii=False, default=str)[:1800])
+
+
+# ---- 不变量 ----
+
+def _t_a2_recovery_unit(_ok):
+    from . import driver, recovery, tasks
+    from .core import WF_HOME, now, parse_iso
+    rules = {r.get("id") for r in json.loads((WF_HOME / "anomalies.json").read_text(encoding="utf-8")).get("rules", [])}
+    ids = set(recovery.TRANSIENT_RULES + recovery.QUOTA_RULES) <= rules
+    cls = [recovery.classify(x) for x in ("SEND_BUSY", "NET", "POLL_NONE", "POLL_READ_ERROR", "SEND_UNKNOWN_WAIT", "QUOTA",
+                                          "SEND_UNKNOWN", "NO_REF", None)]
+    t0 = now()
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2-unit", {"state": "SEND", "turn": 1})
+        dls, ex = [], []
+        for rule, dt in (("SEND_BUSY", 0), ("NET", 1800), ("QUOTA", 3600), ("QUOTA", 7200), ("SEND_BUSY", 18000),
+                         ("NET", 691200 + 1)):
+            r = recovery.note(a, rule, detail=rule, now=t0 + timedelta(seconds=dt))
+            dls.append(r["episode"]["deadline"])
+            ex.append(r["exhausted"])
+        ep = a.state["recovery"]
+        since = parse_iso(ep["since"])
+        i1 = (ep["since"] == t0.isoformat(timespec="seconds") and len(set(dls)) == 2
+              and parse_iso(dls[0]) - since == timedelta(seconds=14400) and parse_iso(dls[2]) - since == timedelta(seconds=691200)
+              and ep["upgraded_at"] == (t0 + timedelta(seconds=3600)).isoformat(timespec="seconds")
+              and ex == [False, False, False, False, False, True] and ep["attempts"] == {"transient": 4, "quota": 2}
+              and ep["rules"] == {"SEND_BUSY": 2, "NET": 2, "QUOTA": 2})
+        b = _inst(td, "a2-unit-b", {"state": "SEND", "turn": 1})
+        caps = [recovery.note(b, "NET", now=t0 + timedelta(seconds=i))["exhausted"] for i in range(25)]
+        c = _inst(td, "a2-unit-c", {"state": "SEND", "turn": 1})
+        low = [recovery.note(c, "NET", now=t0, pol={"recovery_transient_attempts": 2})["exhausted"] for _ in range(3)]
+        bad = []
+        for ev in ("progress", "heartbeat_only", "accepted_false", None):
+            try:
+                recovery.close(b, evidence=ev)
+                bad.append(ev)
+            except ValueError:
+                pass
+        still = b.state.get("recovery") is not None
+        d = _inst(td, "a2-unit-d", {"state": "SEND", "turn": 1})
+        for i in range(12):
+            recovery.note(d, "NET", now=t0)
+            recovery.close(d, evidence="reply_landed" if i % 2 else "send_accepted")
+        hist = d.state.get("recovery_history") or []
+        e = _inst(td, "a2-unit-e", {"state": "SEND", "turn": 1})
+        seq = []
+        for _ in range(12):
+            recovery.note(e, "QUOTA", now=t0)
+            seq.append((recovery.quota_until(e, None, now=t0) - t0).total_seconds() / 3600)
+        fut = recovery.quota_until(e, (t0 + timedelta(hours=3)).isoformat(), now=t0) - t0
+        past = recovery.quota_until(e, (t0 - timedelta(hours=3)).isoformat(), now=t0) - t0
+        far = recovery.quota_until(e, (t0 + timedelta(days=30)).isoformat(), now=t0)
+        junk = recovery.quota_until(e, 12345, now=t0) - t0
+        f = _inst(td, "a2-unit-f", {"state": "SEND", "turn": 1, "recovery": {"schema": "x"}})
+        cor = recovery.note(f, "NET")
+        g = _inst(td, "a2-unit-g", {"state": "VERIFY", "turn": 1})
+        recovery.note(g, "NET", now=t0)
+        g.save()
+        snap = json.dumps(g.state["recovery"], sort_keys=True)
+        x = tasks.add(g, 1, {"1": "执行端待办"})[0]
+        tasks.progress(g, "T1-1", "做到一半", generation=x["generation"])
+        kept = json.dumps(_disk(g).get("recovery"), sort_keys=True) == snap
+        on = driver.explain(g).get("recovery")
+        h = _inst(td, "a2-unit-h", {"state": "VERIFY", "turn": 1})
+        off = "recovery" not in driver.explain(h) and recovery.status(h) is None
+    _ok("B2-A2a 规则分类：五条暂时性、一条额度，其余不进恢复期；这些规则编号都确实在 anomalies.json 里",
+        ids and cls == ["transient"] * 5 + ["quota", None, None, None], json.dumps([sorted(rules)[:40], cls], ensure_ascii=False))
+    _ok("B2-A2a I1 since 不变；截止时刻只在暂时性升级为额度时变一次，且由最初的 since 推出；超过 since 加 8 天即耗尽",
+        i1, json.dumps([ep, dls, ex], ensure_ascii=False, default=str)[:1500])
+    _ok("B2-A2a 次数上限：暂时性第 25 次耗尽；policy 只能调小（调成 2 次时第 3 次耗尽）",
+        caps == [False] * 24 + [True] and low == [False, False, True], json.dumps([caps, low]))
+    _ok("B2-A2a 只有 send_accepted 与 reply_landed 能结束恢复期；结束的移入历史，只留最近 10 条",
+        bad == [] and still and len(hist) == 10 and all(x.get("closed_by") in recovery.EVIDENCE for x in hist),
+        json.dumps([bad, still, len(hist)], ensure_ascii=False))
+    _ok("B2-A2a 额度等待：没有、过去或不可解析的 resets_at 都按第 k 次 min(2^(k−1), 24) 小时（1、2、4…，12 次约 8.3 天；"
+        "r2 按 MAIN 终裁，过去的时刻不再立即试探）；未来的 resets_at 照用；不越过恢复期截止时刻",
+        seq == [1, 2, 4, 8, 16, 24, 24, 24, 24, 24, 24, 24] and fut == timedelta(hours=3) and past == timedelta(hours=24)
+        and junk == timedelta(hours=24) and far == parse_iso(e.state["recovery"]["deadline"]),
+        json.dumps([seq, str(fut), str(past), str(far), str(junk)], ensure_ascii=False))
+    _ok("B2-A2a 恢复期记录损坏按已耗尽处理（只会更严），记录原样保留",
+        cor["exhausted"] and f.state.get("recovery") == {"schema": "x"}, json.dumps(cor, ensure_ascii=False, default=str)[:400])
+    _ok("B2-A2a I8 执行端写待办、记检查点不碰恢复期；explain 在恢复期中另给一行 recovery，没有时不给",
+        kept and bool(on) and "恢复期" in on and off, json.dumps([kept, on, off], ensure_ascii=False))
+
+
+def _t_a2_old_rules(_ok):
+    # I3：计数、退避序列、max 与 then 与旧版逐项相同（期望值直接由未改动的 anomalies.json 推出）
+    from . import driver
+    from .core import WF_HOME
+    rules = {r["id"]: r for r in json.loads((WF_HOME / "anomalies.json").read_text(encoding="utf-8"))["rules"]}
+
+    def expect(rid):
+        r = rules[rid]
+        b = r["backoff_s"]
+        return [b[min(i, len(b) - 1)] for i in range(r["max"])], r["then"]
+    got = {}
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        a = _sendable(td, "a2-old-busy", 2)
+        texts, acts = [], []
+        with _patched(_Fake(send=[BUSY] * 7)):
+            for _ in range(7):
+                r = driver.h_send(_ctx(_due(a), {}))
+                acts.append(r[0])
+                texts.append(r[1])
+                if a.state["state"] != "SEND":
+                    break
+        got["SEND_BUSY"] = (_delays(texts[:-1]), _disk(a)["state"], _disk(a)["anomaly_counts"])
+        for rid, facts, final in (("NET", {"source": "transport", "code": 4}, "BLOCKED"),
+                                  ("POLL_READ_ERROR", {"source": "driver", "kind": "poll_read_error"}, "AWAITING_USER")):
+            b = _inst(td, f"a2-old-{rid.lower()}", {"state": "WAIT_REPLY", "turn": 2, "send_ref": "R"})
+            mx = rules[rid]["max"]
+            outs = [driver._anomaly(_ctx(b, {}), facts, rid) for _ in range(mx + 1)]
+            got[rid] = (_delays(x[1] for x in outs[:-1]), _disk(b)["state"], _disk(b)["anomaly_counts"], outs[-1][0])
+    eb, tb = expect("SEND_BUSY")
+    en, tn = expect("NET")
+    ep, tp = expect("POLL_READ_ERROR")
+    ok = (got["SEND_BUSY"][0] == eb and tb == "block" and got["SEND_BUSY"][1] == "BLOCKED" and got["SEND_BUSY"][2] == {"2:SEND_BUSY": 7}
+          and got["NET"][0] == en and tn == "block" and got["NET"][1] == "BLOCKED" and got["NET"][2] == {"2:NET": 6}
+          and got["POLL_READ_ERROR"][0] == ep and tp == "await_user" and got["POLL_READ_ERROR"][1] == "AWAITING_USER"
+          and got["POLL_READ_ERROR"][2] == {"2:POLL_READ_ERROR": 13})
+    _ok("B2-A2a I3 退避序列、计数、max 与 then 与 anomalies.json 逐项相同（SEND_BUSY 6 次后阻塞、NET 5 次后阻塞、"
+        "POLL_READ_ERROR 12 次后转用户），都没有被恢复期提前改写",
+        ok, json.dumps([got, eb, en, ep], ensure_ascii=False)[:1500])
+
+
+def _t_a2_arbiter_identity(_ok):
+    # I5：同名不同规范 root 之间不重入、不当作本项目回收、不用旧调用释放、不打外发前标记；同 root 照旧
+    from . import arbiter
+    with tempfile.TemporaryDirectory() as td:
+        _fresh_shared()
+        p1, p2 = _same_name_pair(td, "a2-id", 1)
+        g1 = arbiter.acquire(p1, 1, 3600)
+        g2 = arbiter.acquire(p2, 1, 3600)
+        rel_tok = arbiter.release(p2, "冒用", lease_id=g1["lease_id"], turn=1)
+        rel_old = arbiter.release(p2, "冒用", turn=1)
+        mk = arbiter.mark_sending(p2, g1["lease_id"], 1)
+        p2.state["turn"] = 2
+        p2.save()
+        g2b = arbiter.acquire(p2, 1, 3600)   # 同名另一目录进入新一轮：不能把 p1 的记录当作“本项目旧一轮”回收
+        mid = [(h.get("lease_id"), h.get("root")) for h in _holders(p1.name)]
+        reclaims = [x for x in _alog() if x.get("event") == "reclaim"]
+        g1r = arbiter.acquire(p1, 1, 3600)
+        r1 = arbiter.release(p1, "done", lease_id=g1["lease_id"], turn=1)
+        g2c = arbiter.acquire(p2, 1, 3600)
+        _fresh_shared()
+        (_shared() / "arbiter.json").write_text(json.dumps({"holders": [{"project": p1.name, "turn": 1, "since": _iso(0),
+                                                                         "lease_id": "b" * 16}], "queue": []}), encoding="utf-8")
+        l1 = arbiter.acquire(p1, 1, 3600)
+        l2 = arbiter.acquire(p1, 1, 3600)
+        nolog = [x for x in _alog() if x.get("event") == "legacy_no_root"]
+        legacy = [h.get("lease_id") for h in _holders(p1.name) if not h.get("root")]
+        q = _inst(td, "a2-id-q", {"state": "QUOTA_WAIT", "turn": 3, "return_to": "WAIT_REPLY"})
+        live_q = arbiter._live({"project": q.name, "turn": 3, "root": str(q.root)}, arbiter.LIVE)
+        q.state["return_to"] = None
+        q.save()
+        stale_q = arbiter._live({"project": q.name, "turn": 3, "root": str(q.root)}, arbiter.LIVE)
+    ok = (g1["granted"] and not g2["granted"] and not g2["reentry"] and g2["position"] == 1
+          and (rel_tok["released"], rel_tok["reason"]) == (False, "not_held") and not rel_old["released"]
+          and (mk["marked"], mk["reason"]) == (False, "not_held") and not g2b["granted"] and mid == [(g1["lease_id"], str(p1.root))]
+          and reclaims == [] and g1r["reentry"] and g1r["lease_id"] == g1["lease_id"] and r1["released"]
+          and g2c["granted"] and g2c["lease_id"] != g1["lease_id"]
+          and not l1["granted"] and not l2["granted"] and len(nolog) == 1 and legacy == ["b" * 16]
+          and live_q == "live" and stale_q == "stale")
+    _ok("B2-A2a I5 仲裁身份绑定规范 root：同名另一目录不重入、不冒用 token 或旧调用释放、不打外发前标记、进入新一轮也不回收对方；"
+        "同 root 重入照旧；没有 root 的旧记录按外部处理且只记一次 legacy_no_root；等额度时按 return_to 判断活跃",
+        ok, json.dumps([g2, rel_tok, rel_old, mk, g2b, mid, reclaims, g1r.get("reentry"), g2c.get("granted"), l1.get("granted"),
+                        len(nolog), legacy, live_q, stale_q], ensure_ascii=False, default=str)[:1500])
+
+
+_CC_ARB = r'''
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from wflib import arbiter
+from wflib.core import Instance
+inst, n, start = Instance(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+while time.time() < start:
+    time.sleep(0.002)
+got, rel, miss = 0, 0, []
+for i in range(n):
+    g = arbiter.acquire(inst, 1, 3600)
+    if g["granted"]:
+        got += 1
+        time.sleep(0.01)
+        r = arbiter.release(inst, "cc", lease_id=g["lease_id"], turn=inst.state.get("turn"))
+        rel += 1 if r["released"] else 0
+        if not r["released"]:
+            miss.append(r["reason"])
+    time.sleep(0.004)
+print(json.dumps({"got": got, "rel": rel, "miss": miss}))
+'''
+
+_CC_REC = r'''
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from wflib import driver
+from wflib.core import Instance
+root, n, start = sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+while time.time() < start:
+    time.sleep(0.002)
+seen = []
+for i in range(n):
+    inst = Instance(root)
+    driver._anomaly(driver.Ctx(inst, {}, time.time() + 60), {"source": "transport", "code": 4}, "concurrent net %d" % i)
+    seen.append(inst.state["recovery"]["since"])
+    time.sleep(0.01)
+print(json.dumps({"since": seen}))
+'''
+
+_CC_TASKS = r'''
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from wflib import tasks
+from wflib.core import Instance
+root, n, start = sys.argv[2], int(sys.argv[3]), float(sys.argv[4])
+while time.time() < start:
+    time.sleep(0.002)
+for i in range(n):
+    tasks.add(Instance(root), 5, {str(i + 1): "concurrent task %d" % i})
+    time.sleep(0.007)
+print(json.dumps({"added": n}))
+'''
+
+_CC_ACQ = r'''
+import json, sys, time
+sys.path.insert(0, sys.argv[1])
+from wflib import arbiter
+from wflib.core import Instance
+inst, n = Instance(sys.argv[2]), int(sys.argv[3])
+res = []
+for i in range(n):
+    g = arbiter.acquire(inst, 1, 3600)
+    res.append(bool(g["granted"]))
+    if g["granted"]:
+        break
+    time.sleep(0.01)
+print(json.dumps({"granted": res}))
+'''
+
+
+def _children(specs) -> list:
+    """同时启动若干真实子进程（各自的解释器、各自的文件锁），返回各自最后一行 JSON 输出。"""
+    from .core import WF_HOME
+    procs = [subprocess.Popen([sys.executable, "-c", code, str(WF_HOME)] + [str(x) for x in args], cwd=str(WF_HOME),
+                              env=dict(os.environ), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for code, args in specs]
+    out = []
+    for p in procs:
+        o, e = p.communicate(timeout=180)
+        try:
+            out.append(json.loads(o.strip().splitlines()[-1]))
+        except (ValueError, IndexError):
+            out.append({"error": (e or o)[-800:], "rc": p.returncode})
+    return out
+
+
+def _t_a2_concurrency(_ok):
+    from . import driver
+    pol = {"shared_max_inflight": 1}
+    with tempfile.TemporaryDirectory() as td:
+        # 1）同名不同 root 的两个项目在 max=1 下交替 acquire、release
+        _fresh_shared()
+        p1, p2 = _same_name_pair(td, "a2-cc1", 1)
+        r = _children([(_CC_ARB, [p1.root, 25, time.time() + 0.8]), (_CC_ARB, [p2.root, 25, time.time() + 0.8])])
+        active, peak, bad = set(), 0, []
+        for x in _alog():
+            if x.get("event") == "grant":
+                active.add(x.get("lease_id"))
+                peak = max(peak, len(active))
+            elif x.get("event") == "release":
+                active.discard(x.get("lease_id"))
+            elif x.get("event") in ("reclaim", "release_miss", "mark_miss"):
+                bad.append(x)
+        c1 = (all("error" not in x for x in r) and r[0].get("got", 0) >= 1 and r[1].get("got", 0) >= 1
+              and all(x.get("got") == x.get("rel") and not x.get("miss") for x in r) and peak == 1 and not bad
+              and _holders(p1.name) == [])
+        _ok("B2-A2a 并发 1：同名不同 root 的两个子进程在 max=1 下交替 acquire、release，互不释放、互不回收，任一时刻至多一个持有者",
+            c1, json.dumps([r, peak, bad[:3]], ensure_ascii=False)[:1200])
+        # 2）驱动器开恢复期并保存，同时另一进程只写 executor_tasks
+        _fresh_shared()
+        a = _inst(td, "a2-cc2", {"state": "WAIT_REPLY", "turn": 5, "send_ref": "R"})
+        start = time.time() + 0.8
+        r = _children([(_CC_REC, [a.root, 4, start]), (_CC_TASKS, [a.root, 6, start])])
+        st = _disk(a)
+        sinces = r[0].get("since") or []
+        ids = sorted(t["id"] for t in st.get("executor_tasks") or [])
+        c2 = (len(sinces) == 4 and len(set(sinces)) == 1 and (st.get("recovery") or {}).get("since") == sinces[0]
+              and st["recovery"]["attempts"] == {"transient": 4, "quota": 0} and st["recovery"]["rules"] == {"NET": 4}
+              and ids == [f"T5-{i}" for i in range(1, 7)] and st.get("anomaly_counts", {}).get("5:NET") == 4)
+        _ok("B2-A2a 并发 2（I8）：驱动器开恢复期并保存的同时另一进程只写 executor_tasks：两个键都在，since 不变，计数不丢",
+            c2, json.dumps([r, st.get("recovery"), ids, st.get("anomaly_counts")], ensure_ascii=False, default=str)[:1200])
+        # 3）恢复期中途驱动器重启：新进程继续累计，since 不变
+        b = _inst(td, "a2-cc3", {"state": "WAIT_REPLY", "turn": 5, "send_ref": "R"})
+        x1 = _children([(_CC_REC, [b.root, 1, 0])])[0]
+        x2 = _children([(_CC_REC, [b.root, 1, 0])])[0]
+        sb = _disk(b)
+        c3 = (x1.get("since") and x1.get("since") == x2.get("since") and sb["recovery"]["since"] == x1["since"][0]
+              and sb["recovery"]["attempts"]["transient"] == 2)
+        _ok("B2-A2a 并发 3：恢复期中途驱动器重启（两个先后的子进程），新进程接着累计次数，since 不变、不重开",
+            c3, json.dumps([x1, x2, sb.get("recovery")], ensure_ascii=False, default=str)[:900])
+        # 4）P 在 QUOTA_WAIT、Q 在租约内反复 acquire：P 的持有记录一直保留；P 回复落地按 token 释放后 Q 才拿到
+        _fresh_shared()
+        try:
+            p = _waiting_reply(td, "a2-cc4-p", 6)
+            tok = _disk(p)["send_slot"]["lease_id"]
+            reply = Path(td) / "reply-cc4.md"
+            reply.write_text("回复正文\n", encoding="utf-8")
+            fake = _Fake(poll=[QUOTA_HIT, {"code": 0, "raw": "", "data": {"status": "done", "reply_file": str(reply), "files": []}}])
+            with _patched(fake):
+                driver.h_wait_reply(_ctx(p, pol))
+                in_quota = _disk(p).get("state")
+                q = _sendable(td, "a2-cc4-q", 2)
+                during = _children([(_CC_ACQ, [q.root, 15])])[0]
+                held = [h.get("lease_id") for h in _holders(p.name)]
+                p = _rewrite(p, until=_iso(-1))
+                driver.h_quota_wait(_ctx(p, pol))
+                p.state.pop("poll_after", None)
+                p.save()
+                landed = driver.h_wait_reply(_ctx(p, pol))
+            after = _children([(_CC_ACQ, [q.root, 1])])[0]
+            sp = _disk(p)
+        finally:
+            _drop_quota_hold()
+        c4 = (in_quota == "QUOTA_WAIT" and during.get("granted") == [False] * 15 and held == [tok] and landed[0] == "progress"
+              and sp["state"] == "INTAKE" and "send_slot" not in sp and sp.get("recovery") is None
+              and (sp.get("recovery_history") or [{}])[-1].get("closed_by") == "reply_landed"
+              and after.get("granted") == [True] and fake.calls == ["poll", "poll"])
+        _ok("B2-A2a 并发 4（I4）：P 在等回复时额度用尽转 QUOTA_WAIT，Q 的子进程在租约内反复 acquire 都拿不到、P 的持有记录一直在；"
+            "P 恢复后只轮询，回复落地按 token 释放并结束恢复期，Q 随即拿到",
+            c4, json.dumps([in_quota, during, held == [tok], landed, sp.get("state"), after, fake.calls], ensure_ascii=False)[:1200])
+
+
+# ---------------- B2-A2a r2：MAIN 终裁（额度时刻、同一意图只计一次、硬上限）与独立审查 R1/R2（坏记录失败关闭） ----------------
+
+def _t_a2r2_unknown_key(_ok):
+    from . import driver, recovery
+    from .core import now
+    t0 = now()
+    U = "SEND_UNKNOWN_WAIT"
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2r2-k1", {"state": "SEND", "turn": 1})
+        same = [recovery.note(a, U, key="1:T", now=t0 + timedelta(seconds=i))["exhausted"] for i in range(31)]
+        ea = a.state["recovery"]
+        b = _inst(td, "a2r2-k25", {"state": "SEND", "turn": 1})
+        dist = [recovery.note(b, U, key=f"1:T{i}", now=t0 + timedelta(seconds=i))["exhausted"] for i in range(25)]
+        eb = b.state["recovery"]
+        c = _inst(td, "a2r2-knone", {"state": "SEND", "turn": 1})
+        none = [recovery.note(c, U, key=None, now=t0)["exhausted"] for _ in range(25)]
+        d = _inst(td, "a2r2-kbad", {"state": "SEND", "turn": 1})
+        for bad in ([], 123, "x" * 121, "", {"k": 1}):
+            recovery.note(d, U, key=bad, now=t0)
+        ed = d.state["recovery"]
+        e = _inst(td, "a2r2-knet", {"state": "SEND", "turn": 1})
+        for _ in range(3):
+            recovery.note(e, "NET", key="1:T", now=t0)
+        ee = e.state["recovery"]
+        f = _inst(td, "a2r2-kfull", {"state": "SEND", "turn": 1})
+        for i in range(24):
+            recovery.note(f, U, key=f"k{i}", now=t0)
+        again = recovery.note(f, U, key="k0", now=t0)
+        n24 = f.state["recovery"]["attempts"]["transient"]
+        new25 = recovery.note(f, U, key="k24", now=t0)
+        ef = f.state["recovery"]
+        g = _inst(td, "a2r2-kdrv", {"state": "SEND", "turn": 2,
+                                    "send_intent": {"turn": 2, "status": "pending", "ts": 12345, "file": "x"}})
+        for _ in range(3):
+            driver._anomaly(_ctx(_due(g), {"send_unknown_wait": True}), {"source": "driver", "kind": "send_outcome_unknown_wait"},
+                            "意图时刻不是文本")
+        eg = _disk(g)["recovery"]
+    ok_same = (same == [False] * 31 and ea["attempts"] == {"transient": 1, "quota": 0} and ea["rules"] == {U: 1}
+               and ea["keys"] == ["1:T"] and ea["last"]["ts"] == (t0 + timedelta(seconds=30)).isoformat(timespec="seconds"))
+    ok_dist = dist == [False] * 24 + [True] and eb["attempts"]["transient"] == 25 and len(eb["keys"]) == 24
+    ok_none = none == [False] * 24 + [True]
+    ok_bad = ed["attempts"]["transient"] == 5 and ed["keys"] == [] and ee["attempts"]["transient"] == 3 and ee["keys"] == []
+    ok_full = (not again["exhausted"] and n24 == 24 and new25["exhausted"] and ef["attempts"]["transient"] == 25
+               and len(ef["keys"]) == 24)
+    ok_drv = eg["attempts"]["transient"] == 3 and eg["keys"] == []
+    _ok("B2-A2a r2 同一发送意图只计一次：同一 key 记 31 次只算 1 次、只更新 last；25 个不同 key 第 25 次耗尽；"
+        "key 缺失、类型或长度不合法、其他规则带 key 都每次计数，不能绕过预算；记过的 key 最多 24 个",
+        ok_same and ok_dist and ok_none and ok_bad and ok_full and ok_drv,
+        json.dumps([ok_same, ok_dist, ok_none, ok_bad, ok_full, ok_drv, ea["attempts"], eb["attempts"], len(eb["keys"]),
+                    ed["attempts"], ee["attempts"], eg["attempts"]], ensure_ascii=False))
+
+
+def _t_a2r2_deadline_quota(_ok):
+    from . import recovery
+    from .core import now, parse_iso
+    t0 = now().replace(microsecond=0)
+    with tempfile.TemporaryDirectory() as td:
+        hard = {}
+        for dt in (14399, 14400, 14401):
+            a = _inst(td, f"a2r2-d{dt}", {"state": "SEND", "turn": 1})
+            recovery.note(a, "NET", now=t0)
+            hard[dt] = recovery.note(a, "NET", now=t0 + timedelta(seconds=dt))["exhausted"]
+        hq = {}
+        for dt in (691199, 691200):
+            b = _inst(td, f"a2r2-q{dt}", {"state": "SEND", "turn": 1})
+            recovery.note(b, "QUOTA", now=t0)
+            hq[dt] = recovery.note(b, "QUOTA", now=t0 + timedelta(seconds=dt))["exhausted"]
+        c = _inst(td, "a2r2-qu", {"state": "SEND", "turn": 1})
+        recovery.note(c, "QUOTA", now=t0)
+        dl = parse_iso(c.state["recovery"]["deadline"])
+
+        def wait(ra, tt=t0):
+            return (recovery.quota_until(c, ra, now=tt) - tt).total_seconds()
+        cases = {"future_3h": wait((t0 + timedelta(hours=3)).isoformat()), "future_10s": wait((t0 + timedelta(seconds=10)).isoformat()),
+                 "past_1h": wait((t0 - timedelta(hours=1)).isoformat()), "y2000": wait("2000-01-01T00:00:00+00:00"),
+                 "invalid": wait("not-a-time"), "int": wait(12345), "none": wait(None), "y9999": wait("9999-12-31T23:59:59+00:00")}
+        caps = [recovery.quota_until(c, (t0 + timedelta(days=30)).isoformat(), now=t0) == dl,
+                recovery.quota_until(c, None, now=dl - timedelta(minutes=30)) == dl, recovery.quota_until(c, None, now=dl) == dl]
+        at = recovery.note(c, "QUOTA", now=dl)
+        d = _inst(td, "a2r2-qk2", {"state": "SEND", "turn": 1})
+        recovery.note(d, "QUOTA", now=t0)
+        recovery.note(d, "QUOTA", now=t0)
+        k2 = (recovery.quota_until(d, "2000-01-01T00:00:00+00:00", now=t0) - t0).total_seconds()
+    ok = (hard == {14399: False, 14400: True, 14401: True} and hq == {691199: False, 691200: True}
+          and cases == {"future_3h": 10800, "future_10s": 60, "past_1h": 3600, "y2000": 3600, "invalid": 3600, "int": 3600,
+                        "none": 3600, "y9999": 3600}
+          and caps == [True, True, True] and at["exhausted"] and "上限" in at["why"] and k2 == 7200)
+    _ok("B2-A2a r2 硬上限与额度时刻（MAIN 终裁）：到截止那一刻即耗尽（14399 秒否、14400 与 14401 秒是；8 天同理）；"
+        "未来的 resets_at 照用但不短于 60 秒；过去、无效、缺失、越界的都按第 k 次退避（1 小时、2 小时…）；都不越过截止时刻",
+        ok, json.dumps([hard, hq, cases, caps, at.get("why"), k2], ensure_ascii=False, default=str))
+
+
+def _t_a2r2_corrupt(_ok):
+    import copy as _cp
+    from . import driver, recovery
+    from .core import Instance, now, parse_iso
+    t = now().replace(microsecond=0)
+
+    def iso(x):
+        return x.isoformat(timespec="seconds")
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2r2-base", {"state": "SEND", "turn": 1})
+        recovery.note(a, "NET", detail="基准", now=t - timedelta(minutes=10))
+        T = _cp.deepcopy(a.state["recovery"])
+        recovery.note(a, "QUOTA", detail="基准", now=t - timedelta(minutes=5))
+        Q = _cp.deepcopy(a.state["recovery"])
+        since, qdl = parse_iso(T["since"]), parse_iso(Q["deadline"])
+        fut = t + timedelta(days=365)
+
+        def m(base, **kv):
+            e = _cp.deepcopy(base)
+            e.update(kv)
+            return e
+        V = {
+            "class=[]": m(T, **{"class": []}), "class={}": m(T, **{"class": {}}), "class=bogus": m(T, **{"class": "bogus"}),
+            "last=[damaged]": m(T, last=["damaged"]), "last=damaged": m(T, last="damaged"), "last=1": m(T, last=1),
+            "last=[]": m(T, last=[]), "last 缺字段": m(T, last={"ts": T["last"]["ts"]}),
+            "last.ts 早于 since": m(T, last=dict(T["last"], ts=iso(since - timedelta(hours=1)))),
+            "last.rule 未计数": m(T, last=dict(T["last"], rule="QUOTA")),
+            "未来 since（暂时性 4h）": m(T, since=iso(fut), deadline=iso(fut + timedelta(hours=4)), last=dict(T["last"], ts=iso(fut))),
+            "未来 since（额度 8d）": m(Q, since=iso(fut), deadline=iso(fut + timedelta(days=8)), upgraded_at=iso(fut),
+                                    last=dict(Q["last"], ts=iso(fut))),
+            "since 超出时钟偏差 120 秒": m(T, since=iso(t + timedelta(seconds=120)), deadline=iso(t + timedelta(seconds=120 + 14400)),
+                                      last=dict(T["last"], ts=iso(t + timedelta(seconds=120)))),
+            "未来 since 且 deadline 早一天": m(T, since=iso(fut), deadline=iso(fut - timedelta(days=1))),
+            "未来 since 且 deadline==since": m(T, since=iso(fut), deadline=iso(fut)),
+            "deadline 早于 since": m(T, deadline=iso(since - timedelta(days=1))),
+            "deadline==since": m(T, deadline=T["since"]),
+            "deadline 虚增一年": m(T, since=iso(t - timedelta(hours=5)), deadline=iso(t + timedelta(days=365)),
+                                 last=dict(T["last"], ts=iso(t - timedelta(hours=5)))),
+            "upgraded_at 早于 since": m(Q, upgraded_at=iso(since - timedelta(hours=1))),
+            "upgraded_at 晚于 deadline": m(Q, upgraded_at=iso(qdl + timedelta(hours=1))),
+            "upgraded_at 在未来": m(Q, upgraded_at=iso(t + timedelta(days=1))),
+            "暂时性带 upgraded_at": m(T, upgraded_at=T["since"]),
+            "since=deadline=9999": m(T, since="9999-12-31T23:59:59+00:00", deadline="9999-12-31T23:59:59+00:00"),
+            "since 不是文本": m(T, since=12345),
+            "attempts 与 rules 不符": m(T, attempts={"transient": 3, "quota": 0}),
+            "attempts 为负": m(T, attempts={"transient": -1, "quota": 0}),
+            "attempts 是真假值": m(T, attempts={"transient": True, "quota": 0}),
+            "attempts 是列表": m(T, attempts=[1, 0]),
+            "rules 未知规则": m(T, rules={"NET": 1, "BOGUS": 1}),
+            "rules 计数为 0": m(T, rules={"NET": 0}, attempts={"transient": 0, "quota": 0}),
+            "rules 是列表": m(T, rules=[["NET", 1]]),
+            "keys 过多": m(T, keys=[f"k{i}" for i in range(25)], rules={"NET": 1, "SEND_UNKNOWN_WAIT": 25},
+                         attempts={"transient": 26, "quota": 0}),
+            "keys 非文本": m(T, keys=[1], rules={"NET": 1, "SEND_UNKNOWN_WAIT": 1}, attempts={"transient": 2, "quota": 0}),
+            "keys 重复": m(T, keys=["k", "k"], rules={"NET": 1, "SEND_UNKNOWN_WAIT": 2}, attempts={"transient": 3, "quota": 0}),
+            "keys 多于已计次数": m(T, keys=["k1"]),
+            "额度类没有额度计数": m(T, **{"class": "quota", "deadline": iso(since + timedelta(days=8))}),
+            "未知字段": m(T, extra=1), "id 不合法": m(T, id="x"), "schema 不符": m(T, schema="recovery/0"),
+            "顶层是列表": [1, 2], "顶层是文本": "damaged", "顶层是数字": 7,
+        }
+        res, bad = {}, []
+        iso_now = iso(t)
+        sentinel = {"send_ref": "R-sentinel", "send_intent": {"turn": 2, "status": "accepted", "ts": iso_now, "file": "x"},
+                    "send_slot": {"lease_id": "c" * 16, "turn": 2, "attempt": 1, "granted_at": iso_now},
+                    "executor_tasks": [{"id": "T1-1", "turn": 1, "text": "哨兵", "since": iso_now, "done": None, "note": ""}]}
+        for i, (name, v) in enumerate(V.items()):
+            p = _inst(td, f"a2r2-c{i}", dict({"state": "WAIT_REPLY", "turn": 2, "recovery": v}, **_cp.deepcopy(sentinel)))
+            raw0 = json.dumps(_disk(p)["recovery"], sort_keys=True)
+            row = {}
+            try:
+                s_ = recovery.status(p)
+                ex_ = driver.explain(p).get("recovery") or ""
+                n_ = recovery.note(p, "NET", detail="x")
+                row["status"] = bool(s_ and s_.get("corrupt"))
+                row["explain"] = "损坏" in ex_
+                row["note"] = bool(n_["exhausted"] and n_.get("corrupt")) and json.dumps(p.state.get("recovery"), sort_keys=True) == raw0
+                q = Instance(p.root)
+                r_ = driver._anomaly(_ctx(q, {}), {"source": "transport", "code": 4}, "网络错误")
+                d = _disk(q)
+                row["anomaly"] = (r_[0] == "user" and d["state"] == "BLOCKED" and "RECOVERY_EXHAUSTED" in d.get("block_reason", "")
+                                  and "损坏" in d.get("block_reason", ""))
+                row["kept"] = (json.dumps(d.get("recovery"), sort_keys=True) == raw0
+                               and all(d.get(k) == sentinel[k] for k in sentinel))
+            except Exception as e:   # noqa: BLE001
+                row["raised"] = f"{type(e).__name__}: {e}"[:120]
+            res[name] = row
+            if row.get("raised") or not all(row.get(k) for k in ("status", "explain", "note", "anomaly", "kept")):
+                bad.append(name)
+        # 正常记录不得误判：r1 形状（没有 keys）、秒精度、重启、时间推移、合法升级、调小的窗口、60 秒内的时钟偏差
+        P = {}
+        b1 = _inst(td, "a2r2-p1", {"state": "SEND", "turn": 1})
+        recovery.note(b1, "NET")
+        r1shape = _cp.deepcopy(b1.state["recovery"])
+        r1shape.pop("keys")
+        b2 = _inst(td, "a2r2-p1b", {"state": "WAIT_REPLY", "turn": 1, "recovery": r1shape})
+        n = recovery.note(b2, "NET")
+        P["r1 形状"] = (not recovery.status(b2)["corrupt"] and not n["exhausted"] and n["episode"]["id"] == r1shape["id"]
+                       and n["episode"]["since"] == r1shape["since"])
+        tt = now() - timedelta(minutes=5)
+        micro = {"schema": "recovery/1", "id": "0" * 32, "class": "transient", "since": tt.isoformat(),
+                 "deadline": (tt + timedelta(hours=4)).isoformat(), "upgraded_at": None, "attempts": {"transient": 1, "quota": 0},
+                 "rules": {"NET": 1}, "last": {"ts": tt.isoformat(timespec="seconds"), "rule": "NET", "detail": ""}}
+        b3 = _inst(td, "a2r2-p2", {"state": "WAIT_REPLY", "turn": 1, "recovery": micro})
+        P["秒精度"] = not recovery.status(b3)["corrupt"] and not recovery.note(b3, "NET")["exhausted"]
+        b4 = _inst(td, "a2r2-p3", {"state": "WAIT_REPLY", "turn": 1})
+        recovery.note(b4, "NET")
+        b4.save()
+        s4 = b4.state["recovery"]["since"]
+        n4 = recovery.note(Instance(b4.root), "NET")
+        P["重启"] = not n4["exhausted"] and n4["episode"]["since"] == s4 and n4["episode"]["attempts"]["transient"] == 2
+        b5 = _inst(td, "a2r2-p4", {"state": "WAIT_REPLY", "turn": 1})
+        recovery.note(b5, "NET", now=t)
+        later = t + timedelta(days=30)
+        n5 = recovery.note(b5, "NET", now=later)
+        P["时间推移"] = (not recovery.status(b5, now=later)["corrupt"] and n5["exhausted"] and not n5.get("corrupt")
+                        and "上限" in n5["why"])
+        b6 = _inst(td, "a2r2-p5", {"state": "WAIT_REPLY", "turn": 1})
+        recovery.note(b6, "NET", now=t)
+        recovery.note(b6, "QUOTA", now=t + timedelta(hours=1))
+        up = b6.state["recovery"]["upgraded_at"]
+        recovery.note(b6, "QUOTA", now=t + timedelta(hours=2))
+        P["合法升级"] = (not recovery.status(b6, now=t + timedelta(hours=2))["corrupt"] and b6.state["recovery"]["upgraded_at"] == up
+                        and b6.state["recovery"]["since"] == iso(t))
+        b7 = _inst(td, "a2r2-p6", {"state": "WAIT_REPLY", "turn": 1})
+        recovery.note(b7, "NET", pol={"recovery_transient_window_s": 3600})
+        P["调小的窗口"] = not recovery.status(b7)["corrupt"]
+        sk = t + timedelta(seconds=30)
+        skew = {"schema": "recovery/1", "id": "1" * 32, "class": "transient", "since": iso(sk),
+                "deadline": iso(sk + timedelta(hours=4)), "upgraded_at": None, "attempts": {"transient": 1, "quota": 0},
+                "rules": {"NET": 1}, "last": {"ts": iso(sk), "rule": "NET", "detail": ""}}
+        b8 = _inst(td, "a2r2-p7", {"state": "WAIT_REPLY", "turn": 1, "recovery": skew})
+        P["30 秒时钟偏差"] = not recovery.status(b8)["corrupt"]
+    _ok(f"B2-A2a r2 坏恢复记录失败关闭（{len(V)} 种：class/last 类型、未来 since、矛盾时序、9999 越界、计数关系、keys、未知字段、顶层类型）："
+        "status 与 explain 不崩并显示损坏；note 不改写记录；真实 _anomaly 转 RECOVERY_EXHAUSTED 阻塞，原记录与发送三项、待办原样保留",
+        not bad, json.dumps({k: res[k] for k in (bad or list(res)[:3])}, ensure_ascii=False)[:1500])
+    _ok("B2-A2a r2 正常记录不误判：r1 形状、秒精度、重启、时间推移（30 天后按期限耗尽而非损坏）、合法升级、调小的窗口、60 秒内的时钟偏差",
+        all(P.values()), json.dumps(P, ensure_ascii=False))
+
+
+def _t_a2gpt_intent_identity(_ok):
+    """去重只接受当前轮次、非空且可解析的意图时刻；坏身份仍按每次核对计数。"""
+    import copy as _cp
+    from . import driver
+    from .core import now_iso
+    ts = now_iso()
+    variants = {
+        "合法身份": {"turn": 2, "ts": ts},
+        "空时刻": {"turn": 2, "ts": ""},
+        "非法时刻": {"turn": 2, "ts": "not-a-timestamp"},
+        "缺时刻": {"turn": 2},
+        "缺轮次": {"ts": ts},
+        "错轮次": {"turn": 1, "ts": ts},
+        "真假值轮次": {"turn": True, "ts": ts},
+        "小数轮次": {"turn": 2.0, "ts": ts},
+    }
+    results = {}
+    with tempfile.TemporaryDirectory() as td:
+        for index, (label, identity) in enumerate(variants.items()):
+            inst = _inst(td, f"a2gpt-id-{index}", {"state": "SEND", "turn": 2,
+                "send_intent": {"status": "pending", **identity}, "send_ref": "synthetic-ref",
+                "send_slot": {"turn": 2, "lease_id": "synthetic-token"}})
+            protected = _cp.deepcopy(_send_fields(inst.state))
+            fake = _Fake()
+            with _patched(fake):
+                for _ in range(25):
+                    result = driver._anomaly(_ctx(_due(inst), {"send_unknown_wait": True}),
+                        {"source": "driver", "kind": "send_outcome_unknown_wait"}, "synthetic identity probe")
+            st = _disk(inst)
+            ep = st["recovery"]
+            valid = label == "合法身份"
+            expected_keys = [f"2:{ts}"] if valid else []
+            passed = (ep["attempts"]["transient"] == (1 if valid else 25) and ep["keys"] == expected_keys
+                and st["state"] == ("SEND" if valid else "BLOCKED")
+                and result[0] == ("wait" if valid else "user")
+                and ("RECOVERY_EXHAUSTED:transient" in result[1]) == (not valid)
+                and _send_fields(st) == protected and fake.calls == [])
+            results[label] = {"ok": passed, "count": ep["attempts"]["transient"], "state": st["state"],
+                              "keys": ep["keys"], "adapter_calls": fake.calls}
+    _ok("B2-A2a GPT 最小修复：仅当前整型轮次与非空可解析意图时刻获得去重 key；合法身份 25 次只计 1 次；"
+        "空/非法/缺失时刻、缺轮次/错轮次/非整型轮次都逐次计数并在第 25 次耗尽；发送三项不变、适配器调用 0 次",
+        all(row["ok"] for row in results.values()), json.dumps(results, ensure_ascii=False))
+
+
 TESTS = [
     ("同轮授予与精确释放", _t_grant_release), ("先到先得与回收", _t_fifo_reclaim), ("错身份不释放", _t_wrong_identity),
     ("旧记录迁移", _t_legacy), ("坏文件与缺文件", _t_bad_file), ("授予保存外发与落地释放", _t_send_order_and_landing),
@@ -1394,6 +2548,12 @@ TESTS = [
     ("B2-FIX-A1 R3 显式 null", _t_a1fix_null_shape), ("B2-FIX-A1 R4 证据别名", _t_a1fix_evidence_alias),
     ("B2-FIX-A1 R5 坏数据只读", _t_a1fix_bad_shapes), ("B2-FIX-A1 R6 接替者代次", _t_a1fix_successor),
     ("B2-FIX-A1 R7 不适用参数", _t_a1fix_cli_args), ("B2-FIX2-A1 检查点与状态类型", _t_a1fix2_checkpoint_types),
+    ("B2-A2a 恢复期单元与不变量", _t_a2_recovery_unit), ("B2-A2a I3 旧规则逐项相同", _t_a2_old_rules),
+    ("B2-A2a I5 仲裁身份", _t_a2_arbiter_identity), ("B2-A2a 提供方", _t_a2_providers),
+    ("B2-A2a 并发子进程", _t_a2_concurrency),
+    ("B2-A2a r2 同一意图只计一次", _t_a2r2_unknown_key), ("B2-A2a r2 硬上限与额度时刻", _t_a2r2_deadline_quota),
+    ("B2-A2a r2 坏恢复记录", _t_a2r2_corrupt),
+    ("B2-A2a GPT 意图身份校验", _t_a2gpt_intent_identity),
 ]
 
 
@@ -1429,10 +2589,10 @@ def main() -> int:
         tmp = Path(tempfile.mkdtemp(prefix="wf-lane-a-"))
         try:
             r = subprocess.run([sys.executable, "-m", "wflib.selftest_lane_a"], cwd=str(selftest.WF_HOME),
-                               env=selftest.child_env(os.environ, tmp / "local"), timeout=600)
+                               env=selftest.child_env(os.environ, tmp / "local"), timeout=1200)
             return r.returncode
         except subprocess.TimeoutExpired:
-            print("B1-A 模块测试子进程超过 600 秒没有结束，按未通过处理", flush=True)
+            print("B1-A 模块测试子进程超过 1200 秒没有结束，按未通过处理", flush=True)
             return 1
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
