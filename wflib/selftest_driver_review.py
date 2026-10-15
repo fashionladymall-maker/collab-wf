@@ -169,6 +169,22 @@ def run(_ok):
                     result[0] == "user" and (inst.root / "app.py").read_text() == "external change\n"
                     and not list((inst.root / "workflow/evidence/install").glob("tx-*/started.json")), str(result))
 
+                inst, package = setup("tamper-active")
+
+                def corrupt_record(rid, **kwargs):
+                    decision = real_run(rid, **kwargs)
+                    intent = next((inst.root / "workflow/evidence/install/driver-review").glob("*-intent.json"))
+                    intent.chmod(0o600)
+                    intent.write_text("{}")
+                    return decision
+
+                with patch.object(review, "run", corrupt_record):
+                    result = driver.h_apply(ctx(inst))
+                _ok("驱动器同次审查意图被改写：追加后续阶段前重读旧阶段，拒绝安装",
+                    result[0] == "user" and "driver_review_corrupt" in result[1]
+                    and (inst.root / "app.py").read_bytes() == b"print('v1')\n"
+                    and not list((inst.root / "workflow/evidence/install").glob("tx-*/started.json")), str(result))
+
                 inst, package = setup("lock")
                 script = ("from pathlib import Path\nfrom wflib.core import Instance, WfError\n"
                           "from wflib.driver_review import Attempt\n"

@@ -53,6 +53,7 @@ class Attempt:
         self.fd = self.lockfd = None
         self.binding = self.prefix = self.request_id = None
         self.created_intent = False
+        self.records = {}
 
     def __enter__(self):
         try:
@@ -144,6 +145,9 @@ class Attempt:
     @review._boundary("driver_review_write", code="driver_review_corrupt")
     def write(self, phase, **values):
         self.verify()
+        for recorded_phase, recorded in self.records.items():
+            if self.read(recorded_phase) != recorded:
+                raise WfError(f"驱动器审查阶段记录已改变（driver_review_corrupt）：{recorded_phase}")
         body = {"schema": "driver-install-review/1", "phase": phase, "target": self.identity,
                 "turn": self.turn, "at": review._iso(review._now()), **values}
         if self.binding is not None:
@@ -162,6 +166,7 @@ class Attempt:
         self.verify()
         if self.read(phase) != doc:
             raise WfError("驱动器审查记录写后核验不符（driver_review_corrupt）")
+        self.records[phase] = doc
         return doc
 
     def reviewed_request(self, timeout_s=None):
