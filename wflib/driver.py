@@ -650,6 +650,7 @@ def h_send(ctx):
             return "wait", (f"上一条回复 {int(waited)} 秒前才落地，等满 {gap} 秒再发"
                             "（min_send_gap_s，W42：太早发送会接到上一条残留的生成，被误判为已接受）")
     if intent and intent.get("turn") == turn and intent.get("status") == "pending":
+        _slot_missing_check(ctx, "发送结果不明的核对")   # B1-A r2：缺 token 也留痕；只核对，不 acquire、不借用、不重发
         pargs = ["--project", inst.name, "--turn", turn, "--ref", intent.get("ref") or "", "--out", tdir / "delivered"]
         pargs += anomaly.conv_args(inst)   # 1.7.0（ISOLATION.md S1）：本项目的对话
         if anomaly.transport_cfg().get("poll_since"):
@@ -685,15 +686,50 @@ def h_send(ctx):
             decide(inst, "rate", f"推迟发送到 {st['retry_at']}", f"{win} 秒内已发送 {len(recent)} 条（上限 {rate['max_sends']}）")
             return "wait", f"全局限速：{win} 秒内已发送 {len(recent)} 条，推迟到 {st['retry_at']}"
     mx = int(ctx.pol.get("shared_max_inflight", 0) or 0)
+    fresh = None
+    if mx <= 0 and st.get("send_slot"):
+        _slot_release(ctx, "arbitration_disabled")   # B1-A：仲裁已关闭就不再持有发送槽：按 token 退回上一次尝试留下的槽
     if mx > 0:   # 1.8.8（P0-G，ISOLATION.md S4）：同一账号的发送槽，先到先得；拿不到不算失败，30 秒后再看
         from . import arbiter
         g = arbiter.acquire(inst, mx, int(ctx.pol.get("shared_lease_s", 3600) or 3600))
+        if g.get("error"):   # B1-A：仲裁状态读不了：不授予、不发送、不改写文件；每轮只记一次，等人修复
+            flags = st.setdefault("turn_flags", {})
+            if not flags.get("arbiter_unreadable"):
+                flags["arbiter_unreadable"] = True
+                inst.event("auto", rule="ARBITER_UNREADABLE", action="wait", detail=str(g["error"])[:200], by="driver")
+            st["retry_at"] = (now() + timedelta(seconds=30)).isoformat(timespec="seconds")
+            inst.save()
+            return "wait", f"共享发送槽的状态读不了（{g['error']}），没有发送；修复 local/shared/arbiter.json 之前每 30 秒再看"
         if not g["granted"]:
             st["retry_at"] = (now() + timedelta(seconds=30)).isoformat(timespec="seconds")
             inst.save()
             return "wait", f"共享发送槽被占用（{g['holder']}），本项目排第 {g['position']} 位，30 秒后再看"
+        fresh, early = _slot_bind(ctx, g, out)
+        if early:
+            return early
     st["send_intent"] = {"turn": turn, "status": "pending", "ts": now_iso(), "file": out.get("file")}
-    inst.save()
+    try:
+        inst.save()   # B1-A：授予 → 保存（send_slot 与发送意图同一次落盘）→ 之后才调用适配器
+    except Exception:
+        if fresh:   # 新授予还没落盘就出错：这次尝试没有外发，按 token 退回，不留无主的持有记录
+            try:
+                from . import arbiter
+                arbiter.release(inst, "save_failed", lease_id=fresh["lease_id"], turn=fresh["turn"])
+            except Exception:   # noqa: BLE001 退回失败不掩盖原来的错误，持有记录留给回收
+                pass
+        raise
+    if mx > 0:   # B1-A r2：外发前必经的持久标记（绑定本次 token，fsync 后才返回）；写不成就不调用适配器
+        slot = st.get("send_slot") or {}
+        mk = arbiter.mark_sending(inst, slot.get("lease_id"), slot.get("turn"))
+        if not mk["marked"]:
+            st["send_intent"] = None   # 还没调用适配器：这次尝试确定没有外发
+            if mk["reason"] in ("not_held", "turn_mismatch", "token_mismatch", "legacy_holder"):
+                st.pop("send_slot", None)
+                _slot_event(inst, "SLOT_LEASE_LOST", f"外发前标记时，第 {turn} 轮的发送槽（{slot.get('lease_id')}）已不在本项目名下"
+                                                     f"（{mk['reason']}）：没有外发，30 秒后重新排队")
+            st["retry_at"] = (now() + timedelta(seconds=30)).isoformat(timespec="seconds")
+            inst.save()
+            return "wait", f"外发前的持久标记没有写成（{mk['reason']}），没有发送，30 秒后再看"
     _quota(inst)
     send_args = ["--project", inst.name, "--turn", turn, "--message", out.get("file"),
                  "--effort", out.get("effort") or "high",
@@ -726,8 +762,7 @@ def h_send(ctx):
                         "适配器只收到心跳、没确认生成开始：保留发送意图、轮询确认，不重发（W84）")
     if code != 4:  # 4 = 暂时性错误或超时：结果可能不明，保留意图留待下次轮询确认
         st["send_intent"] = None
-        from . import arbiter
-        arbiter.release(inst, "send_failed")   # 1.8.8（P0-G）
+        _slot_release(ctx, "send_failed")   # 1.8.8（P0-G）；B1-A：按本次尝试的 token 精确释放
     inst.save()
     facts = {"source": "transport", "op": "send", "code": code, "resets_at": r["data"].get("resets_at"),
              "kind": r.get("kind"), "text": r["raw"]}
@@ -776,6 +811,154 @@ def _quota(inst):
         r = anomaly.call("quota", ["--project", inst.name, "--out", inst.usage_path], timeout=60)
         if r["code"] != 0:
             inst.event("auto", rule="QUOTA_READ", action="ignore", detail=r["raw"][:200], by="driver")
+
+
+# ---------------- B1-A：发送槽的精确持有者 ----------------
+# 状态里的 send_slot={lease_id, turn, attempt, granted_at} 是本次发送尝试持有的槽：授予后与发送意图同一次落盘，
+# 之后才调用适配器；贯穿等回复与结果不明的等待；回复落地或发送明确失败时按 token 精确释放。
+# r2：调用适配器之前，还要用 arbiter.mark_sending 为这个 token 持久写入外发前标记；收养只认这个标记，不认适配器日志。
+
+
+def _slot_of(g: dict, turn) -> dict:
+    return {"lease_id": g.get("lease_id"), "turn": turn, "attempt": g.get("attempt"), "granted_at": g.get("granted_at")}
+
+
+def _slot_event(inst, rule: str, detail: str) -> None:
+    # 只留证据（事件与本轮偏离），不改变状态流转，也不把它记成发送成功或失败
+    inst.event("auto", rule=rule, action="report", detail=detail[:300], by="driver")
+    ops.add_note(inst, "deviation", f"[{rule}] {detail}", by="driver")
+
+
+def _slot_release(ctx, why: str) -> dict:
+    """按 send_slot 的 token 精确释放并清掉 send_slot；没对上记 SLOT_LEASE_LOST，不当成功。
+    没有 send_slot 时：仲裁关闭就不碰仲裁文件；仲裁开启只释放本项目本轮没有 token 的旧记录，
+    遇到带 token 的记录不释放（不能借别的身份释放），记 SLOT_TOKEN_MISSING，留给回收。"""
+    inst, st = ctx.inst, ctx.st
+    slot = st.pop("send_slot", None)
+    if not slot and int(ctx.pol.get("shared_max_inflight", 0) or 0) <= 0:
+        return {"released": False, "reason": "arbitration_off"}
+    from . import arbiter
+    if isinstance(slot, dict) and slot.get("lease_id"):
+        r = arbiter.release(inst, why, lease_id=slot["lease_id"], turn=slot.get("turn"))
+        if not r["released"]:
+            _slot_event(inst, "SLOT_LEASE_LOST",
+                        f"第 {slot.get('turn')} 轮第 {slot.get('attempt')} 次授予的发送槽（{slot['lease_id']}）在 {why} 时"
+                        f"已不在本项目名下（{r['reason']}）：这段时间的独占不成立，不算仲裁成功")
+    else:
+        r = arbiter.release(inst, why, turn=st.get("turn"))
+        if r["reason"] == "token_required":
+            _slot_missing(inst, f"{why} 时状态里没有 send_slot，仲裁里本项目第 {st.get('turn')} 轮的记录带 token，"
+                                "不能用无 token 的调用释放，留给回收")
+    inst.save()
+    return r
+
+
+def _slot_missing(inst, detail: str) -> None:
+    # r2：SLOT_TOKEN_MISSING 每轮只记一次（事件与偏离），只留证，不改变状态流转
+    flags = inst.state.setdefault("turn_flags", {})
+    if flags.get("slot_token_missing"):
+        return
+    flags["slot_token_missing"] = True
+    _slot_event(inst, "SLOT_TOKEN_MISSING", detail)
+
+
+def _slot_missing_check(ctx, where: str) -> None:
+    """r2：仲裁开启、本轮发送尝试在途（结果不明的核对、等回复），状态里却没有本轮的 send_slot：记 SLOT_TOKEN_MISSING。
+    只留证：不 acquire、不借用仲裁里的 token、不重发，核对与轮询照常；仲裁关闭时与 1.9.7 相同，什么都不做。"""
+    st = ctx.st
+    if int(ctx.pol.get("shared_max_inflight", 0) or 0) <= 0:
+        return
+    slot = st.get("send_slot")
+    if isinstance(slot, dict) and slot.get("lease_id") and slot.get("turn") == st.get("turn"):
+        return
+    _slot_missing(ctx.inst, f"{where}：仲裁开启，第 {st.get('turn')} 轮的发送尝试在途，状态里没有本轮的 send_slot："
+                            "不收养、不借用、不重发，照常核对")
+
+
+def _slot_bind(ctx, g: dict, out: dict) -> tuple:
+    """把本次发送尝试持有的槽记进 send_slot，返回 (新授予的 send_slot 或 None, 需要提前返回的结果或 None)。
+    新授予：记下新 token。重入且本地 token 一致（叶子被拒后同轮重发、wf resend 之后）：照旧发送。
+    重入但本地没有这个 token（授予之后、保存之前中断，或旧版留下的无 token 记录）：只在 _slot_adoptable 证明
+    这次授予之后没有外发时收养；否则记 SLOT_TOKEN_MISSING，按发送结果不明核对：不发送、不收养、不借用、不释放。
+    r2：不能收养时绝不把仲裁里观测到的 token 写进 send_slot（那会让旧尝试在回复落地时释放新记录）；
+    状态里原有的 send_slot 原样保留，缺就保持缺失，观测到的 token 只写进事件与偏离。"""
+    inst, st = ctx.inst, ctx.st
+    turn = st["turn"]
+    if not g.get("reentry"):
+        st["send_slot"] = _slot_of(g, turn)
+        return st["send_slot"], None
+    cur, tok = st.get("send_slot"), g.get("lease_id")
+    if tok and isinstance(cur, dict) and cur.get("lease_id") == tok and cur.get("turn") == turn:
+        return None, None
+    ok, why = _slot_adoptable(inst, turn, g)
+    if ok:
+        st["send_slot"] = _slot_of(g, turn)
+        inst.event("auto", rule="SLOT_ADOPTED", action="adopt", detail=f"第 {turn} 轮的持有记录 {tok}：{why}"[:300],
+                   by="driver")
+        return None, None
+    detail = (f"仲裁里第 {turn} 轮的发送槽由本项目持有（观测到 {tok or '旧版无 token 记录'}，不据此授权），状态里没有对应的 "
+              f"send_slot，不能证明这次授予之后没有外发（{why}）：不发送、不收养、不借用、不释放，按发送结果不明核对")
+    _slot_missing(inst, detail)
+    it = st.get("send_intent")
+    if isinstance(it, dict) and it.get("turn") == turn:   # 已有本轮意图（可能带 ref）：降为结果不明，不另造
+        it["status"] = "pending"
+        it.setdefault("origin", "slot_token_missing")
+    else:
+        st["send_intent"] = {"turn": turn, "status": "pending", "ts": g.get("granted_at") or now_iso(),
+                             "file": out.get("file"), "origin": "slot_token_missing"}
+    inst.save()
+    return None, _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)}, detail)
+
+
+def _slot_adoptable(inst, turn, g: dict) -> tuple:
+    """r2：收养只认租约自身的外发前标记。h_send 调用适配器之前，必先用 arbiter.mark_sending 在锁内为该 token 持久写入
+    send_marked_at（fsync 后才返回；写不成就不外发），而 h_send 是租约下唯一调用适配器 send 的地方。所以带 premark、
+    从未写过标记的租约，下面没有发生过外发。另外仍要求：处于 SEND；状态里没有 send_slot、没有本轮的发送意图，
+    也没有本轮的发送记录（last_sent、turns.jsonl、无法归属的 send_ref）。适配器动作日志不作为证据：追加可能静默失败。
+    旧版无 token 记录与非 premark 租约没有这种标记，一律不能证明。"""
+    st = inst.state
+    if not g.get("lease_id") or g.get("legacy"):
+        return False, "旧版无 token 记录没有外发前标记，无法证明没有外发"
+    if g.get("premark") is not True:
+        return False, "这个租约不是按外发前标记协议授予的，无法证明没有外发"
+    if g.get("send_marked_at"):
+        return False, f"这个租约在 {g['send_marked_at']} 写过外发前标记，可能已经外发"
+    if st.get("state") != "SEND":
+        return False, f"当前是 {st.get('state')}，不在发送状态"
+    cur = st.get("send_slot")
+    if cur:
+        return False, f"状态里已有另一个 send_slot（{cur.get('lease_id') if isinstance(cur, dict) else cur}）"
+    it = st.get("send_intent")
+    if it and (not isinstance(it, dict) or it.get("turn") == turn):
+        return False, "状态里有本轮的发送意图"
+    ls = st.get("last_sent") if isinstance(st.get("last_sent"), dict) else None
+    if ls and ls.get("turn") == turn:
+        return False, "本轮已有发送记录（last_sent）"
+    if st.get("send_ref") and not ls:
+        return False, "有 send_ref，但无法判定它属于哪一轮"
+    ok, why = _turns_unsent(inst, turn)
+    if not ok:
+        return False, why
+    return True, "租约按外发前标记协议授予且从未写过标记，状态里也没有本轮的发送记录：这次授予之后没有外发"
+
+
+def _turns_unsent(inst, turn) -> tuple:
+    import json
+    p = inst.turns_path
+    try:
+        text = p.read_text(encoding="utf-8") if p.exists() else ""
+    except (OSError, UnicodeDecodeError) as e:
+        return False, f"读不了 turns.jsonl（{type(e).__name__}）"
+    for i, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            return False, f"turns.jsonl 第 {i} 行损坏，不能据此证明"
+        if isinstance(r, dict) and r.get("turn") == turn and (r.get("status") == "sent" or r.get("ts_sent")):
+            return False, "turns.jsonl 里本轮已登记发送"
+    return True, ""
 
 
 def _landed_since(st):
@@ -832,6 +1015,7 @@ def h_wait_reply(ctx):
                         "本轮消息是手动发出的、没有登记 ref，驱动器无法轮询接续。批准解决不了这个问题（1.8.2 起 wf approve 会拒绝）："
                         "补登记 wf mark sent --ref <适配器返回的 ref>，或整轮手动收尾 wf mark replied --reply-file <回复全文>；"
                         "同一轮再次出现 NO_REF 会转为阻塞")
+    _slot_missing_check(ctx, "等回复")   # B1-A r2：缺 token 也留痕；照常轮询，不借用
     pa = st.get("poll_after")
     if pa and (secs_since(pa) or 0) < 0:
         return "wait", "Claude 正在处理（稍后检查）"
@@ -915,8 +1099,7 @@ def h_wait_reply(ctx):
         inst.save()
         _quota(inst)
         ops.mark_replied(inst, rf, r["data"].get("tools"), by="driver")
-        from . import arbiter
-        arbiter.release(inst, "reply_landed")   # 1.8.8（P0-G）：回复落地，释放共享发送槽
+        _slot_release(ctx, "reply_landed")   # 1.8.8（P0-G）：回复落地，释放共享发送槽；B1-A：按本次尝试的 token 精确释放
         return "progress", f"收到回复（交付文件 {len(st['delivered'])} 个）"
     if status == "refused":
         # 叶子被通道的安全防护拒绝，无法从它继续：回退到上一条健康消息，重新组织并重发本轮消息（§10）
