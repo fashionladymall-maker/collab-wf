@@ -37,6 +37,38 @@ NA_FIELDS = ("condition", "scope", "reason", "by")
 LIVE_SEGMENTS = tuple(range(1, 11))
 _TOOL_ROOT = WF_HOME   # 工具文件摘要与 dirty 的来源；自检里只在隔离子进程内临时指向夹具版本库
 
+SKELETON_VERSION = "default-goals/1"
+# B2-C1：默认骨架的两条可执行判据是固定常量，只读、可经 policy.readonly_check；项目名永远不进入命令
+_SKELETON_SELF_CHECK = "wf self-check"
+_SKELETON_PROBES = "wf self-check --probes"
+
+
+def default_goals(project: str, *, today: str | None = None) -> dict:
+    """B2-C1：新项目的默认目标骨架（default-goals/1）。纯函数：不读时钟、不读写磁盘、不批准、不改正式目标；
+    同样的 (project, today) 每次返回内容相同、互不共享的新 dict。today 为 None 时 since 为空字符串（不取当前日期）。
+    骨架只到机械层：没有 live 映射（不会产生 verified），不预写不适用（NA 只能在目标获批后由 mark_na 记录）。
+    由 B 的 init 在 workflow/goals.json 不存在时写入；是否生效仍由用户批准决定。"""
+    if not isinstance(project, str):
+        raise WfError(f"default_goals 的 project 必须是字符串，收到 {type(project).__name__}")
+    if today is not None and not isinstance(today, str):
+        raise WfError(f"default_goals 的 today 必须是字符串或 None，收到 {type(today).__name__}")
+    return {
+        "_说明": f"collab-wf 默认目标骨架（{SKELETON_VERSION}）。未经用户批准不生效；只到机械层，不含实景（verified）映射。",
+        "_skeleton": SKELETON_VERSION,
+        "phase": {"id": "P0", "title": "工程基线", "since": today if today is not None else "", "scope": project},
+        "goals": [
+            {"id": "BASE-SELF", "kind": "exec", "title": "工具文件与清单一致", "check": _SKELETON_SELF_CHECK,
+             "pass": {"exit": 0}, "means": "安装的工具没有漂移", "on_fail": "交给 Claude 修复"},
+            {"id": "BASE-PROBES", "kind": "exec", "title": "行为探针全部通过", "check": _SKELETON_PROBES,
+             "pass": {"exit": 0, "contains": ["探针结果："]}, "means": "已安装代码的行为符合预期（机械层）",
+             "on_fail": "交给 Claude 修复"},
+            {"id": "BASE-SMOKE", "kind": "manual", "title": "项目冒烟命令已声明，或按四项记为不适用",
+             "means": "项目自身有冒烟判据", "on_fail": "补冒烟命令或经 mark_na 记不适用"},
+            {"id": "BASE-ACCEPT", "kind": "manual", "depends_on": "all_exec", "title": "用户验收本阶段",
+             "means": "前置都满足后由用户本人确认", "on_fail": "按用户意见补齐"},
+        ],
+    }
+
 
 def load(inst: Instance):
     return read_json(inst.wf / "goals.json")

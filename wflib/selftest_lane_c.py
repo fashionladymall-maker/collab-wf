@@ -478,8 +478,119 @@ def _t_manifest_rule(_ok):
                     "diff_hash": sorted(k for k in set(a) & set(b) if a[k] != b[k])[:10]}, ensure_ascii=False))
 
 
+def _t_default_goals(_ok):
+    """B2-C1：默认目标骨架 default_goals 的纯函数性质与边界（只在临时目录里读写，不起子进程、不执行探针）。"""
+    import builtins
+    import io
+    import time as _time
+    from . import goals, policy
+    from .core import WfError
+    f = goals.default_goals
+    g1, g2 = f("demo", today="2026-10-15"), f("demo", today="2026-10-15")
+    g1["goals"][0]["pass"]["exit"] = 9
+    g1["goals"].append({"id": "X"})
+    g1["phase"]["title"] = "改"
+    g3 = f("demo", today="2026-10-15")
+    _ok("B2-C1 骨架确定且互不共享：同样输入内容相同；改动一份返回值不影响另一份或之后的调用",
+        g2 == g3 and json.dumps(g2, sort_keys=True, ensure_ascii=False) == json.dumps(g3, sort_keys=True, ensure_ascii=False)
+        and g2 is not g3 and g2["goals"] is not g3["goals"] and g2["goals"][0]["pass"] is not g3["goals"][0]["pass"]
+        and g2["goals"][0]["pass"]["exit"] == 0 and len(g2["goals"]) == 4 and g2["phase"]["title"] == "工程基线",
+        json.dumps([g2, g3], ensure_ascii=False)[:600])
+
+    # 不读时钟、不读写磁盘：调用期间让时钟与文件接口一律抛错
+    calls, saved = [], {}
+
+    def boom(name):
+        def _f(*a, **k):
+            calls.append(name)
+            raise RuntimeError(f"default_goals 不应调用 {name}")
+        return _f
+    targets = [(builtins, "open"), (io, "open"), (_time, "time"), (_time, "localtime"), (_time, "strftime"),
+               (goals, "now_iso"), (goals, "read_json"), (goals, "write_json"),
+               (Path, "read_text"), (Path, "read_bytes"), (Path, "write_text"), (Path, "exists"), (os, "stat")]
+    try:
+        for mod, name in targets:
+            saved[(mod, name)] = getattr(mod, name)
+            setattr(mod, name, boom(f"{getattr(mod, '__name__', mod)}.{name}"))
+        n1, n2 = f("demo"), f("demo", today=None)
+        err = ""
+    except Exception as e:   # noqa: BLE001
+        n1 = n2 = None
+        err = f"{type(e).__name__}: {e}"
+    finally:
+        for (mod, name), v in saved.items():
+            setattr(mod, name, v)
+    _ok("B2-C1 骨架不读时钟、不读写磁盘；today 为 None 时 since 为空字符串（不取当前日期）",
+        not calls and not err and n1 == n2 and n1["phase"]["since"] == "" and g2["phase"]["since"] == "2026-10-15",
+        json.dumps([calls, err], ensure_ascii=False)[:600])
+
+    # 校验通过；判据固定且只读；不含正式 M2、实景映射、不适用、权限类键
+    names = ["demo", "", "x; rm -rf /", "$(touch pwn)", "`id`", "a\nb\rc", "../../etc", '"\'', "项目 中文", "--probes", "&&"]
+    bad = []
+    for nm in names:
+        g = f(nm, today="2026-10-15")
+        dump = json.dumps(g, ensure_ascii=False)
+        ex = [x for x in g["goals"] if x["kind"] == "exec"]
+        man = [x for x in g["goals"] if x["kind"] == "manual"]
+        probs = []
+        if goals.validate(g):
+            probs.append(("validate", goals.validate(g)))
+        if [x["check"] for x in ex] != ["wf self-check", "wf self-check --probes"]:
+            probs.append(("checks", [x["check"] for x in ex]))
+        if not all(policy.readonly_check(x["check"]) and x["pass"].get("exit") == 0 for x in ex):
+            probs.append("readonly/exit0")
+        if [x["id"] for x in man] != ["BASE-SMOKE", "BASE-ACCEPT"] or man[1].get("depends_on") != "all_exec":
+            probs.append("manual")
+        if g["phase"]["scope"] != nm or g["phase"]["id"] != "P0" or g.get("_skeleton") != goals.SKELETON_VERSION:
+            probs.append("phase")
+        if any("live" in x or "verified" in x or "not_applicable" in x or "na" in x for x in g["goals"]):
+            probs.append("live/na")
+        if any(x["id"].startswith("M2") for x in g["goals"]) or '"M2' in dump.replace(json.dumps(nm, ensure_ascii=False), ""):
+            probs.append("M2")
+        if set(g) - {"_说明", "_skeleton", "phase", "goals"} or "history" in g:
+            probs.append(("keys", sorted(g)))
+        if nm and any(nm in x.get("check", "") for x in ex) and nm not in ("wf self-check", "--probes"):
+            probs.append("injected")
+        if probs:
+            bad.append((nm, probs))
+    _ok("B2-C1 骨架校验通过；两条可执行判据固定为只读的 wf self-check 与 wf self-check --probes 且要求 exit 0；"
+        "冒烟与验收为人工目标；不含正式 M2、live 映射、不适用记录或权限类键；恶意项目名只进 phase.scope、不进命令",
+        not bad and goals.SKELETON_VERSION == "default-goals/1", json.dumps(bad, ensure_ascii=False)[:800])
+
+    rej = []
+    for args, kw in (((None,), {}), ((123,), {}), ((b"x",), {}), (("demo",), {"today": 20261015}), (("demo",), {"today": b"x"})):
+        try:
+            f(*args, **kw)
+            rej.append("accepted")
+        except WfError:
+            rej.append("refused")
+    pos_only = False
+    try:
+        f("demo", "2026-10-15")
+    except TypeError:
+        pos_only = True
+    _ok("B2-C1 骨架参数类型：project 非字符串、today 非字符串且非 None 都拒绝；today 只能按关键字传入",
+        rej == ["refused"] * 5 and pos_only, json.dumps(rej))
+
+    # 写进临时项目后：不会自行批准、不产生 verified 或 NA、不新建批准记录；进度只是待定
+    with tempfile.TemporaryDirectory() as td:
+        inst = _inst(td, "lc-c1", {"state": "IDLE", "turn": 1})
+        before = sorted(str(p.relative_to(inst.root)) for p in inst.root.rglob("*"))
+        sk = f(inst.name, today="2026-10-15")
+        after_call = sorted(str(p.relative_to(inst.root)) for p in inst.root.rglob("*"))
+        (inst.wf / "goals.json").write_text(json.dumps(sk, ensure_ascii=False, indent=1), encoding="utf-8")
+        p = goals.progress(inst)
+        st = policy.status(inst, "goals")
+        no_appr = not policy.approvals_path(inst).exists()
+    _ok("B2-C1 骨架不自授权限：调用不写任何文件；写入后目标未批准、reached 为假、没有 verified 或不适用、没有批准记录",
+        before == after_call and st["approved"] is False and p["approved"] is False and p["reached"] is False
+        and p["done"] == 0 and p["total"] == 4 and p["counts"]["verified"] == 0 and p["counts"]["not_applicable"] == 0
+        and all(i["layer"] == "pending" for i in p["items"]) and no_appr and p["issues"] == [],
+        json.dumps([before == after_call, st, p.get("counts"), [i["layer"] for i in p["items"]], no_appr], ensure_ascii=False)[:800])
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
-         ("工具摘要规则", _t_manifest_rule)]
+         ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals)]
 
 
 def run_lane_c(_ok) -> None:
