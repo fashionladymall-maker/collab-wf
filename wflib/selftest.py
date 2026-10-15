@@ -155,9 +155,15 @@ def _run_install_regressions():
     problems = {test.id(): detail for test, detail in result.errors + result.failures
                 + result.skipped + result.expectedFailures}
     problems.update((test.id(), "unexpected success") for test in result.unexpectedSuccesses)
+    case_ids = {test.id() for test in cases}
+    suite_errors = [detail for test, detail in result.errors + result.failures if test.id() not in case_ids]
+    if result.testsRun != len(cases):
+        suite_errors.append(f"suite ran {result.testsRun} of {len(cases)} registered cases")
+    suite_detail = "\n".join(suite_errors)
     for test in cases:
-        detail = problems.get(test.id(), "")
-        _ok(test.id(), test.id() not in problems, detail + output.getvalue()[-2000:] if detail else "")
+        detail = suite_detail or problems.get(test.id(), "")
+        _ok(test.id(), not suite_errors and test.id() not in problems,
+            detail + output.getvalue()[-2000:] if detail else "")
 
 
 def run() -> int:
