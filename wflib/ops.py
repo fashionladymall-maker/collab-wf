@@ -270,8 +270,9 @@ def run_install(inst: Instance, cmd: str, install, *, label="apply", by="driver"
     安装前先分配持久的 install-exec/1 身份（元数据、0600 收据、空输出均已落盘）；身份与收据句柄经
     install(invocation) 作为显式参数交给安装器，不经过、也不改动进程环境。before(context) 在分配之后、
     安装之前调用，用来把身份写进调用方自己的尝试记录。结果与 ops.run_exec 写同一套证据和 exec 事件：
-    成功 0；异常 1；KeyboardInterrupt 130 并记中断；其他进程级中断记中断、退出码未知。失败照常抛出。
-    这里没有强制超时：中途打断进程内的受保护事务比让它走完更危险。"""
+    成功 0；异常或收据与结果不符 1；KeyboardInterrupt 130 并记中断；其他进程级中断记中断、退出码未知。
+    失败照常抛出。本调用自己追加的 exec 事件是唯一的成功提交点；事件追加前进程被杀，补记时一律按中断记
+    （见 close_orphan_installs）。这里没有强制超时：中途打断进程内的受保护事务比让它走完更危险。"""
     inv = _Invocation(inst, INPROCESS_PREFIX + cmd, label, runner=INPROCESS_RUNNER)
     print(f"[wf exec {inv.cid}] $ {inv.cmd}", flush=True)
     t0 = time.time()
@@ -298,44 +299,56 @@ def run_install(inst: Instance, cmd: str, install, *, label="apply", by="driver"
             if isinstance(exc, Exception):
                 raise WfError(f"{exc}；安装调用证据未能闭合（install_exec_unrecorded）：{record_error}") from exc
         raise exc
-    meta = inv.finish(0, None, round(time.time() - t0, 1), by)
+    duration = round(time.time() - t0, 1)
+    refs, receipt_error = _read_receipts(inv.receipt_path, inv.invocation)
+    if receipt_error is not None or refs != [result.get("install_ref")]:
+        # 先判收据再提交：不一致时事件记失败，不能先记 exit 0 再报错。
+        error = WfError(f"安装已返回，但调用 {inv.cid} 的收据与安装结果不一致（install_receipt_mismatch），须人工核对")
+        inv.err_path.write_text(f"WfError: {error}\n", encoding="utf-8")
+        inv.finish(1, None, duration, by)
+        raise error
+    meta = inv.finish(0, None, duration, by)
     print(f"[wf exec {inv.cid}] exit=0  耗时 {meta['duration_s']}s  证据：{inv.dir.relative_to(inst.root)}/{inv.cid}.*",
           flush=True)
-    if meta["install_receipt_error"] is not None or meta["install_refs"] != [result.get("install_ref")]:
-        raise WfError(f"安装已返回，但调用 {inv.cid} 的收据与安装结果不一致（install_receipt_mismatch），须人工核对")
     return result
 
 
 def close_orphan_installs(inst: Instance, by="driver") -> list:
-    """补记被杀的驱动器进程内安装调用：只有开始元数据、没有 exec 事件的，记为中断（退出码未知）。
+    """补记被杀的驱动器进程内安装调用（所有轮次）：没有同身份 exec 事件的，一律记为中断、退出码未知。
 
-    每个身份只补一次（已有同身份 exec 事件即跳过），只记账、绝不重跑安装。调用方须持有本目标的驱动器
-    审查锁——进程内调用只在该锁内创建，所以持锁时看到的未结束调用都属于已退出的进程。"""
-    d = inst.turn_dir()
+    只有仍在运行的调用在写完结束元数据后自己追加的 exec 事件才是成功提交点。落盘元数据里的 exit 0
+    不能代替它：结束元数据已写、事件未追加时被杀，原值移到 unconfirmed 里留作证据，元数据与补记事件都按
+    中断记。每个身份只补一次（已有同身份 exec 事件即跳过），事件归属调用原来的轮次；只记账，绝不重跑安装。
+    调用方须持有本目标的驱动器审查锁：进程内调用只在该锁内创建，持锁时看到的未提交调用都属于已退出的进程。"""
     recorded = [e.get("install_exec") for e in read_jsonl(inst.events_path) if e.get("type") == "exec"]
     closed = []
-    for path in sorted(d.glob("c*.json"), key=lambda p: (len(p.stem), p.stem)):
+    order = lambda p: (len(p.parent.name), p.parent.name, len(p.stem), p.stem)
+    for path in sorted(inst.evidence.glob("turn-*/c*.json"), key=order):
         meta = read_json(path)
         if (not isinstance(meta, dict) or meta.get("runner") != INPROCESS_RUNNER
                 or not isinstance(meta.get("install_exec"), dict) or meta["install_exec"] in recorded):
             continue
-        cid = meta["id"]
+        turn = meta["install_exec"].get("turn")
+        if type(turn) is not int or path.parent.name != f"turn-{turn:03d}":
+            raise WfError(f"进程内安装调用的轮次与证据目录不符（install_exec_unrecorded）：{path}")
+        d, cid = path.parent, meta["id"]
         out_p, err_p, receipt = d / f"{cid}.out", d / f"{cid}.err", d / f"{cid}.install.jsonl"
+        if meta.get("end") is not None and "recovered_at" not in meta:
+            meta["unconfirmed"] = {k: meta.get(k) for k in ("end", "duration_s", "exit_code", "interrupted",
+                                                             "install_refs", "install_receipt_error")}
+        for p in (out_p, err_p):
+            if not p.exists():
+                p.write_bytes(b"")
         stamp = now_iso()
-        if meta.get("end") is None:
-            for p in (out_p, err_p):
-                if not p.exists():
-                    p.write_bytes(b"")
-            started, ended = parse_iso(meta.get("start")), parse_iso(stamp)
-            refs, receipt_error = _read_receipts(receipt, meta["install_exec"])
-            meta.update(end=stamp, duration_s=max(0.0, round((ended - started).total_seconds(), 1)) if started else None,
-                        exit_code=None, interrupted=True, out_bytes=out_p.stat().st_size,
-                        err_bytes=err_p.stat().st_size, install_refs=refs, install_receipt_error=receipt_error)
-        meta["recovered_at"] = stamp
+        started, ended = parse_iso(meta.get("start")), parse_iso(stamp)
+        refs, receipt_error = _read_receipts(receipt, meta["install_exec"])
+        meta.update(end=stamp, duration_s=max(0.0, round((ended - started).total_seconds(), 1)) if started else None,
+                    exit_code=None, interrupted=True, out_bytes=out_p.stat().st_size, err_bytes=err_p.stat().st_size,
+                    install_refs=refs, install_receipt_error=receipt_error, recovered_at=stamp)
         write_json(path, meta)
-        _exec_event(inst, meta, by, recovered=True)
+        _exec_event(inst, meta, by, recovered=True, turn=turn)
         recorded.append(meta["install_exec"])
-        closed.append(cid)
+        closed.append(f"{d.name}/{cid}")
     return closed
 
 

@@ -82,6 +82,8 @@ class Attempt:
             self.identity = {k: target[k] for k in ("kind", "root", "project", "scope", "tool")}
             self.turn = turn
             self.prefix = release._digest({"target": self.identity, "turn": turn})
+            # 持锁后、任何新送审或安装之前，先补记本目标所有轮次里被杀的进程内安装调用。
+            note, unrecorded = self._close_orphans()
             prior = self.read("intent")
             if prior is not None:
                 self.binding = prior
@@ -92,7 +94,9 @@ class Attempt:
                 if req and req.get("intent_sha256") != prior["body_sha256"]:
                     raise WfError("驱动器审查请求未绑定意图（driver_review_corrupt）")
                 self.request_id = req.get("request_id") if req else None
-                raise WfError(self.recovery("本轮已有安装审查意图，不自动重审或重装" + self._close_orphans()))
+                raise WfError(self.recovery("本轮已有安装审查意图，不自动重审或重装" + note))
+            if unrecorded:
+                raise WfError("遗留安装调用无法补记，不开始新的送审或安装" + note)
             if any(n.startswith(self.prefix + "-") for n in os.listdir(self.fd)):
                 raise WfError("驱动器审查阶段记录缺少意图（driver_review_corrupt）")
             return self
@@ -209,12 +213,12 @@ class Attempt:
         self.write("installing", request_id=self.request_id, content_id=self.content_id, install_exec=install_exec)
 
     def _close_orphans(self):
-        """持本目标审查锁时，把被杀的驱动器进程内安装调用补记为中断：只记一次，绝不重跑。"""
+        """持本目标审查锁时，把所有轮次里被杀的驱动器进程内安装调用补记为中断：只记一次，绝不重跑。"""
         try:
             closed = ops.close_orphan_installs(self.inst)
         except Exception as e:
-            return f"；遗留安装调用补记失败（install_exec_unrecorded）：{type(e).__name__}: {e}"
-        return ("；安装调用 " + "、".join(closed) + " 已补记为中断（install_exec_interrupted）") if closed else ""
+            return f"；遗留安装调用补记失败（install_exec_unrecorded）：{type(e).__name__}: {e}", True
+        return (("；安装调用 " + "、".join(closed) + " 已补记为中断（install_exec_interrupted）") if closed else ""), False
 
     def recovery(self, text):
         return (f"{text}（driver_review_incomplete，request_id={self.request_id or '尚未登记'}）。"

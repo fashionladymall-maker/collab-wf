@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from . import core, driver, live, live_history, ops, release, review
+from . import core, driver, driver_review, live, live_history, ops, release, review
 from . import selftest_c5_integration as c5
 from . import selftest_install_history as history_tests
 from .selftest import _project_md
@@ -28,6 +28,24 @@ from .selftest_review import AUTHOR_SESSION
 
 def _events(inst):
     return [json.loads(line) for line in inst.events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+# Real SIGKILL in the protected consumer, after part of the tree is written.
+KILL_IN_COPY = (
+    "real = release._copy_tree\n"
+    "def die(*a, **k):\n"
+    "    real(*a, **k)\n"
+    "    os.kill(os.getpid(), signal.SIGKILL)\n"
+    "release._copy_tree = die\n")
+# Real SIGKILL in the exact commit window: finish() has written end/exit 0
+# metadata for the in-process invocation, its exec event is not yet appended.
+KILL_BEFORE_EXEC_EVENT = (
+    "real = ops._exec_event\n"
+    "def die(inst, meta, by, **extra):\n"
+    "    if meta.get('runner') == 'in-process':\n"
+    "        os.kill(os.getpid(), signal.SIGKILL)\n"
+    "    return real(inst, meta, by, **extra)\n"
+    "ops._exec_event = die\n")
 
 
 class DriverInstallIdentityTests(unittest.TestCase):
@@ -102,6 +120,19 @@ class DriverInstallIdentityTests(unittest.TestCase):
 
     def tx_dirs(self, inst):
         return sorted(p.name for p in (inst.evidence / "install").glob("tx-*"))
+
+    def kill_driver(self, inst, hook):
+        code = (
+            "import os, signal, time\nfrom pathlib import Path\n"
+            "from wflib import core, anomaly, review, release, driver, live, ops\n"
+            f"core.LOCAL = anomaly.LOCAL = live.LOCAL = Path({str(core.LOCAL)!r})\n"
+            f"review._tool_home = lambda: Path({str(self.env.tool)!r})\n"
+            "core.ACTOR['actor'] = 'driver'\n" + hook +
+            f"inst = core.Instance(Path({str(inst.root)!r}))\n"
+            "driver.h_apply(driver.Ctx(inst, {}, time.time() + 120))\n")
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), WF_LOCAL_DIR=str(core.LOCAL))
+        child = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=120)
+        self.assertEqual(child.returncode, -signal.SIGKILL, child.stderr.decode(errors="replace")[-2000:])
 
     # ---------------- positive: real h_apply through C5 ----------------
 
@@ -217,22 +248,7 @@ class DriverInstallIdentityTests(unittest.TestCase):
 
     def test_killed_driver_leaves_visible_invocation_closed_once_without_reinstall(self):
         inst, _ = self.staged("killed")
-        code = (
-            "import os, signal, time\nfrom pathlib import Path\n"
-            "from wflib import core, anomaly, review, release, driver, live\n"
-            f"core.LOCAL = anomaly.LOCAL = live.LOCAL = Path({str(core.LOCAL)!r})\n"
-            f"review._tool_home = lambda: Path({str(self.env.tool)!r})\n"
-            "core.ACTOR['actor'] = 'driver'\n"
-            "real = release._copy_tree\n"
-            "def die(*a, **k):\n"
-            "    real(*a, **k)\n"
-            "    os.kill(os.getpid(), signal.SIGKILL)\n"
-            "release._copy_tree = die\n"
-            f"inst = core.Instance(Path({str(inst.root)!r}))\n"
-            "driver.h_apply(driver.Ctx(inst, {}, time.time() + 120))\n")
-        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), WF_LOCAL_DIR=str(core.LOCAL))
-        child = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, timeout=120)
-        self.assertEqual(child.returncode, -signal.SIGKILL, child.stderr.decode(errors="replace")[-2000:])
+        self.kill_driver(inst, KILL_IN_COPY)
         orphans = [json.loads(p.read_bytes()) for p in inst.turn_dir().glob("c*.json")]
         self.assertEqual([(m["runner"], "end" in m) for m in orphans], [("in-process", False)])
         self.assertEqual(self.driver_execs(core.Instance(inst.root)), [])
@@ -252,6 +268,53 @@ class DriverInstallIdentityTests(unittest.TestCase):
         self.assertEqual(self.tx_dirs(inst), txs)
         [entry] = self.histories(core.Instance(inst.root))["entries"]
         self.assertTrue(live_history.entry_problem(entry))
+
+    def test_kill_after_success_metadata_before_exec_event_is_never_success(self):
+        inst, _ = self.staged("commit window")
+        self.kill_driver(inst, KILL_BEFORE_EXEC_EVENT)
+        [meta] = [json.loads(p.read_bytes()) for p in inst.turn_dir().glob("c*.json")]
+        # The exact window: success metadata is on disk, the exec event is not.
+        self.assertEqual((meta["runner"], meta["exit_code"], meta["interrupted"], "end" in meta),
+                         ("in-process", 0, None, True))
+        self.assertEqual(self.driver_execs(core.Instance(inst.root)), [])
+        txs = self.tx_dirs(inst)
+        self.assertTrue((inst.evidence / "install" / txs[0] / "completed.json").exists())
+        first = self.reapply(inst)
+        self.assertEqual(first[0], "user")
+        self.assertIn("driver_review_incomplete", first[1])
+        self.assertIn("install_exec_interrupted", first[1])
+        [event] = self.driver_execs(core.Instance(inst.root))
+        self.assertEqual((event.get("exit_code"), event["interrupted"], event["recovered"], event["turn"]),
+                         (None, True, True, 1))
+        recovered = json.loads((inst.turn_dir() / (meta["id"] + ".json")).read_bytes())
+        self.assertEqual((recovered["exit_code"], recovered["interrupted"]), (None, True))
+        self.assertEqual((recovered["unconfirmed"]["exit_code"], recovered["unconfirmed"]["end"]), (0, meta["end"]))
+        histories = self.histories(core.Instance(inst.root))
+        [entry] = histories["entries"]
+        self.assertEqual(entry["state"], "valid")   # the transaction itself completed
+        self.assertEqual(live_history.entry_problem(entry), "installation_invocation_unsuccessful")
+        why = live_history.window_authorization(histories, _events(inst), {"rounds": [{"turn": 1}]})["why"]
+        self.assertIn("install_history:installation_invocation_unsuccessful", why)
+        self.assertIn("apply_install_reference_unavailable", why)
+        self.reapply(inst)
+        self.assertEqual(len(self.driver_execs(core.Instance(inst.root))), 1)
+        self.assertEqual(self.tx_dirs(inst), txs)
+
+    def test_orphan_from_earlier_turn_is_recorded_before_next_attempt(self):
+        inst, package = self.staged("cross turn")
+        self.kill_driver(inst, KILL_BEFORE_EXEC_EVENT)
+        [meta] = [json.loads(p.read_bytes()) for p in inst.turn_dir().glob("c*.json")]
+        later = core.Instance(inst.root)
+        later.state.update(state="APPLY", turn=2)
+        later.save()
+        for _ in range(2):
+            with driver_review.Attempt(core.Instance(inst.root), package):
+                pass
+        [event] = self.driver_execs(core.Instance(inst.root))
+        self.assertEqual((event["turn"], event["install_exec"], event.get("exit_code"), event["interrupted"]),
+                         (1, meta["install_exec"], None, True))
+        [entry] = self.histories(core.Instance(inst.root))["entries"]
+        self.assertEqual((entry["turn"], live_history.entry_problem(entry)), (1, "installation_invocation_unsuccessful"))
 
     # ---------------- consumer parameter contract ----------------
 
