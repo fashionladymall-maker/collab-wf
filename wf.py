@@ -364,7 +364,13 @@ def main(argv=None):
     x.add_argument("--ref", help="适配器 send 返回的 ref；手动发送时登记它，驱动器才能接续本轮")
     x = sub.add_parser("intake"); x.add_argument("reply_file")
     x = sub.add_parser("review"); x.add_argument("--accept", action="store_true"); x.add_argument("--user-approved")
-    x = sub.add_parser("apply"); x.add_argument("zip")
+    x.add_argument("action", nargs="?", choices=["prepare", "run", "status"])
+    x.add_argument("subject", nargs="?")
+    x.add_argument("--kind", choices=["project", "tool"])
+    x.add_argument("--author")
+    x.add_argument("--timeout-s", type=int)
+    x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    x = sub.add_parser("apply"); x.add_argument("zip"); x.add_argument("--review-id")
     x = sub.add_parser("rollback"); x.add_argument("--to", required=True)
     x = sub.add_parser("exec"); x.add_argument("--label"); x.add_argument("--timeout", type=float)
     x.add_argument("command", nargs=argparse.REMAINDER)
@@ -442,6 +448,7 @@ def main(argv=None):
     sub.add_parser("ledger")   # 1.8.7（P0-D）：失败模式台账检查（只读）
     sub.add_parser("self-manifest")
     x = sub.add_parser("self-update"); x.add_argument("zip"); x.add_argument("--skip-test", action="store_true")
+    x.add_argument("--review-id")
     x.add_argument("--auto", action="store_true")   # 1.5.8：驱动器自动安装；改动护栏文件的版本会被拒绝（DRIVER.md 第 18 节）
     x.add_argument("--allow-same", action="store_true")
     x = sub.add_parser("self-rollback"); x.add_argument("tag")
@@ -588,6 +595,34 @@ def main(argv=None):
                 print(f"  {i:>2}. {cmd}")
             print(f"当前：{inst.state['state']}")
     elif c == "review":
+        if args.action:
+            from wflib import review
+            if args.accept or args.user_approved is not None:
+                raise WfError("包审查 prepare/run/status 不接受命令评审批准参数")
+            if not args.subject:
+                raise WfError("用法：wf review prepare <zip> --kind project|tool；run/status <request_id>")
+            if args.action == "prepare":
+                if not args.kind or args.timeout_s is not None:
+                    raise WfError("review prepare 需要 --kind，不接受 --timeout-s")
+                target = _p(args) if args.kind == "project" else release.WF_HOME
+                result = review.prepare(target, Path(args.subject), kind=args.kind, author=args.author)
+            elif args.action == "run":
+                if args.kind is not None or args.author is not None:
+                    raise WfError("review run 只接受 request_id 和 --timeout-s")
+                if args.timeout_s is not None and args.timeout_s <= 0:
+                    raise WfError("--timeout-s 必须是正整数")
+                result = review.run(args.subject, timeout_s=args.timeout_s)
+            else:
+                if args.author is not None or args.timeout_s is not None:
+                    raise WfError("review status 不接受 --author 或 --timeout-s")
+                target = release.WF_HOME if args.kind == "tool" else _p(args)
+                result = review.status(target, args.subject)
+            out(result)
+            if args.action != "prepare" and not result.get("allowed"):
+                sys.exit(1)
+            return
+        if args.subject is not None or args.kind is not None or args.author is not None or args.timeout_s is not None:
+            raise WfError("包审查参数需要 prepare、run 或 status 子操作")
         inst = _p(args)
         r = ops.review(inst, accept=args.accept, user_approved=args.user_approved)
         if args.json:
@@ -614,7 +649,7 @@ def main(argv=None):
         elif st not in ("APPLY", "EXECUTE"):
             raise WfError(f"当前是 {st}，落地版本需要在评审接受之后进行。")
         try:
-            r = release.apply_zip(inst, Path(args.zip))
+            r = release.apply_zip(inst, Path(args.zip), review_id=args.review_id)
         except WfError as e:
             machine.fail(inst, str(e).splitlines()[0], symptom="AP")
             raise
@@ -1317,7 +1352,8 @@ def main(argv=None):
     elif c == "self-init":
         print(f"工具版本库已就绪：wf-v{tool_version()}（{release.self_init()}）")
     elif c == "self-update":
-        r = release.self_update(Path(args.zip), args.skip_test, args.allow_same, auto=bool(getattr(args, "auto", False)))
+        r = release.self_update(Path(args.zip), args.skip_test, args.allow_same,
+                                auto=bool(getattr(args, "auto", False)), review_id=args.review_id)
         print(f"工具已升级：{r['from']} → {r['to']}（{r['commit']}），自检{'已通过' if r['tested'] else '已跳过'}")
         if r.get("board_restarted"):
             print("看板已重启以加载新版本")
@@ -1327,10 +1363,13 @@ def main(argv=None):
     elif c == "self-rollback":
         r = release.self_rollback(args.tag)
         print(f"工具已回滚：{r['from']} → {r['to']}（新提交 {r['commit']}）。已接入项目的固定版本请用 wf doctor 核对。")
-        from wflib import server as _srv
-        m = _srv.restart_if_running()
-        if m:
-            print(f"看板已重启以加载回滚后的版本：{m}")
+        runtime = r.get("runtime") or {}
+        if runtime.get("verified"):
+            print("看板运行版本已核验与回滚后的磁盘版本一致")
+        elif runtime.get("status") == "not_running":
+            print("看板未在运行；磁盘已回滚")
+        else:
+            print("磁盘已回滚；看板运行版本尚未核验")
     elif c == "selftest":
         from wflib.selftest import run
         sys.exit(run())
