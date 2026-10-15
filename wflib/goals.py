@@ -252,7 +252,7 @@ def _manifest_files(root) -> dict:
     return out
 
 
-def _tool_state(root=None) -> dict:
+def _tool_state(root=None, *, git_inputs=None) -> dict:
     """工具实际安装文件的摘要（按 MANIFEST 的文件选择规则）与 git dirty 状态（单独绑定）。
     没有版本库或 git 读不出时 dirty 为 None（无法确认），不授予 verified。只读。"""
     from .core import git
@@ -264,6 +264,10 @@ def _tool_state(root=None) -> dict:
         return out
     out.update(digest=hashlib.sha256("".join(f"{h}  {p}\n" for p, h in sorted(files.items())).encode()).hexdigest(),
                files=len(files))
+    if git_inputs is not None:
+        if git_inputs.get("root") == str(root.resolve()) and isinstance(git_inputs.get("status"), list):
+            out.update(head=git_inputs["head"], dirty=list(git_inputs["status"]))
+        return out
     if not (root / ".git").exists():
         return out
     try:
@@ -286,7 +290,7 @@ def _project_fp(inst: Instance):
 
 
 def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snapshot=None, closure=None, capture_problem=None) -> dict:
-    """C2c-1：由冻结输入直接评价并留存采集证据；完整闭包/C5 未就绪前不授予新版 verified。"""
+    """Evaluate frozen inputs; C5 provenance and the complete closure govern grants."""
     from . import live
     spec = x.get("live") or {}
     segs = spec.get("segments") or []
@@ -313,9 +317,9 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snap
         collection["closure_sha256"] = hashlib.sha256(live._canonical(closure).encode()).hexdigest()
         collection["report_sha256"] = hashlib.sha256(live._canonical(collection["report"]).encode()).hexdigest()
         r = collection["report"]
-        # C2c-1 collects a strict read set. Complete project/tool closure and
-        # historical installation verification are intentionally still pending.
-        why.append("install_history_unavailable（C2c-1 仅采集，尚未开放新版 verified）")
+        if collection.get("authorization") != "available":
+            why.extend((collection.get("history_authorization") or {}).get("why")
+                       or ["install_history_unavailable（历史安装关联尚未完成）"])
     except live._InputProblem as e:
         r = {}
         collection = {"state": e.state, "source": e.source, "detail": e.detail, "authorization": "unavailable"}
@@ -336,7 +340,7 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snap
     bad = [n for n in segs if not (sm.get("segments") or {}).get(str(n))]
     if sm and bad:
         why.append("这些实景段在连续达标窗口里没有全部达标：" + "、".join(map(str, bad)))
-    tool = _tool_state()
+    tool = _tool_state(git_inputs=closure.get("git_tool") if isinstance(closure, dict) else None)
     if tool["dirty"] is None:
         why.append("无法确认工具是否有未提交改动（没有版本库或 git 读取失败）")
     elif tool["dirty"]:
@@ -344,6 +348,8 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snap
     fp = _project_fp(inst)
     if not fp:
         why.append("算不出项目指纹")
+    if not st.get("approved"):
+        why.append("目标尚未批准")
     ev = d / f"{stamp}-{x['id']}-live.json"
     write_json(ev, {"goal": x["id"], "summary": sm, "rounds": (r or {}).get("rounds"), "collection": collection})
     try:
@@ -351,17 +357,21 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snap
     except Exception as e:
         dependencies = None
         why.append(f"递归依赖无法核对：{type(e).__name__}")
-    binding = {"schema": "live-collection/2", "project": inst.name, "segments": segs, "rounds": rounds, "tool_digest": tool["digest"],
+    modern = isinstance((collection or {}).get("history_authorization"), dict)
+    authorization = (collection or {}).get("authorization", "unavailable")
+    binding = {"schema": "live-collection/3" if modern else "live-collection/2",
+               "project": inst.name, "segments": segs, "rounds": rounds, "tool_digest": tool["digest"],
                "tool_head": tool["head"], "tool_dirty": tool["dirty"] != [], "project_fp": fp, "goals_sha": st["current"],
                "summary_sha256": sm.get("rounds_sha256"), "evidence": str(ev.relative_to(inst.root)),
-               "evidence_sha256": _sha256_file(ev), "authorization": "unavailable",
+               "evidence_sha256": _sha256_file(ev), "authorization": authorization,
                "window_inputs_sha256": (collection or {}).get("inputs_sha256"),
                "closure_sha256": (collection or {}).get("closure_sha256"),
                "report_sha256": (collection or {}).get("report_sha256"),
                "goal_sha256": _goal_def_sha(x), "dependency_definitions": dependencies,
                "content_complete": isinstance(closure, dict) and closure.get("complete") is True,
-               "authorization_complete": False}
-    return {"granted": False, "why": why, "ts": now_iso(), "binding": binding,
+               "authorization_complete": modern and authorization == "available"}
+    granted = bool(modern and not why and _live_grant_ready(inst, x, st, collection, binding))
+    return {"granted": granted, "why": why, "ts": now_iso(), "binding": binding,
             "collection": collection}
 
 
@@ -1364,7 +1374,11 @@ def run_checks(inst: Instance, timeout=900, by="driver") -> dict:
                     record["collection_validation"] = validation
                     record["closure_validation"] = closure_validation
                     if not validation["valid"]:
+                        record["granted"] = False
                         record["why"].append(f"提交前实景输入 {validation['state']}")
+                    if not closure_validation["valid"]:
+                        record["granted"] = False
+                        record["why"].append(f"提交前完整闭包 {closure_validation['state']}")
             write_json(inst.wf / "goals_state.json", gs)
     else:
         write_json(inst.wf / "goals_state.json", gs)
@@ -1437,6 +1451,26 @@ def _na_valid(na, r: dict, x: dict, st: dict) -> tuple:
     return not why, why
 
 
+def _live_grant_ready(inst, x, st, collection, binding):
+    """Compute eligibility from re-evaluated inputs, never the stored granted bit."""
+    summary = collection.get("report", {}).get("summary", {})
+    history = collection.get("history_authorization", {})
+    spec = x.get("live", {})
+    segments = spec.get("segments")
+    tool = _tool_state(git_inputs=collection.get("closure", {}).get("git_tool"))
+    fingerprint = _project_fp(inst)
+    return (st.get("approved") is True and collection.get("authorization") == "available"
+            and history.get("eligible") is True and history.get("complete") is True and history.get("synthetic") is False
+            and collection.get("closure", {}).get("complete") is True
+            and summary.get("schema") == "live-summary/1" and summary.get("project") == inst.name
+            and summary.get("passed") is True and summary.get("passed_strict") is True
+            and isinstance(segments, list) and bool(segments)
+            and all(type(n) is int and n in LIVE_SEGMENTS and summary.get("segments", {}).get(str(n)) is True for n in segments)
+            and tool["dirty"] == [] and bool(fingerprint)
+            and binding.get("tool_digest") == tool["digest"] and binding.get("tool_head") == tool["head"]
+            and binding.get("tool_dirty") is False and binding.get("project_fp") == fingerprint)
+
+
 def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict) -> dict:
     """One strict consumer for collection/display/authorization; no legacy grant."""
     from . import live
@@ -1446,21 +1480,28 @@ def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict)
     if not isinstance(v, dict):
         return failure("unknown", "还没有严格实景采集记录")
     b = v.get("binding")
-    if not isinstance(b, dict) or b.get("schema") != "live-collection/2":
+    if not isinstance(b, dict) or b.get("schema") not in ("live-collection/2", "live-collection/3"):
         return failure("unsupported", "旧版或未知实景凭证缺少完整严格输入闭包，必须重新采集；granted/summary 自报不能授权")
     c = v.get("collection")
     if not isinstance(c, dict) or c.get("state") != "collected":
         state = c.get("state", "unknown") if isinstance(c, dict) else "unknown"
         return failure(state, (c or {}).get("detail", "严格采集未完成") if isinstance(c, dict) else "严格采集未完成")
-    key = ("live-collection/2", x.get("id"), hashlib.sha256(_canon(v).encode()).hexdigest())
+    modern = b["schema"] == "live-collection/3"
+    key = (b["schema"], x.get("id"), hashlib.sha256(_canon(v).encode()).hexdigest())
     if key in cache:
         return cache[key]
     try:
         descriptor, closure, report = c["window_inputs"], c["closure"], c["report"]
         contract = live._validate_output_contract(inst, descriptor["output_contract"])
-        if v.get("granted") is not False or b.get("authorization") != "unavailable" \
-                or c.get("authorization") != "unavailable":
+        if not modern and (v.get("granted") is not False or b.get("authorization") != "unavailable"
+                           or c.get("authorization") != "unavailable"):
             raise live._InputProblem("corrupt", "binding", "C5 unavailable 时不能自报 granted/authorization")
+        if modern and (type(v.get("granted")) is not bool
+                       or c.get("authorization") not in ("unavailable", "available")
+                       or b.get("authorization") != c["authorization"]
+                       or b.get("authorization_complete") is not (c["authorization"] == "available")
+                       or b.get("content_complete") is not True):
+            raise live._InputProblem("corrupt", "binding", "C5 授权绑定字段不一致")
         if not st.get("approved") or b.get("project") != inst.name or b.get("goals_sha") != st.get("current"):
             raise live._InputProblem("changed", "goals", "目标批准或项目身份已改变")
         if b.get("goal_sha256") != _goal_def_sha(x) or b.get("dependency_definitions") != _dep_defs(load(inst), x):
@@ -1499,9 +1540,11 @@ def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict)
             # goal cannot hide arbitrary data in another replaced slot.
             for gid, output in contract["evidence"].items():
                 peer = records[gid].get("verified")
-                if not isinstance(peer, dict) or peer.get("granted") is not False \
+                if not isinstance(peer, dict) or type(peer.get("granted")) is not bool \
                         or set(peer) != {"granted", "why", "ts", "binding", "collection", "collection_validation", "closure_validation"} \
-                        or not isinstance(peer.get("binding"), dict) or peer["binding"].get("schema") != "live-collection/2":
+                        or not isinstance(peer.get("binding"), dict) \
+                        or peer["binding"].get("schema") not in ("live-collection/2", "live-collection/3") \
+                        or (peer["binding"]["schema"] == "live-collection/2" and peer["granted"] is not False):
                     raise live._InputProblem("corrupt", "goals_state", "同批实景输出槽位格式不正确")
                 pb, pc = peer["binding"], peer.get("collection")
                 for field in ("collection_validation", "closure_validation"):
@@ -1520,11 +1563,44 @@ def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict)
                         or document["summary"] != pc.get("report", {}).get("summary") \
                         or document["rounds"] != pc.get("report", {}).get("rounds"):
                     raise live._InputProblem("corrupt", output, "实景证据与冻结采集不一致")
-            recomputed = live._evaluate_snapshot(snapshot)["report"]
-            if report != recomputed:
+                if pb["schema"] == "live-collection/3":
+                    definitions = load(inst)
+                    definition = next((item for item in definitions["goals"] if item["id"] == gid), None)
+                    if definition is None or not isinstance(definition.get("live"), dict):
+                        raise live._InputProblem("changed", gid, "同批实景目标定义已改变")
+                    pspec = definition["live"]
+                    pdescriptor = snapshot.descriptor
+                    pdescriptor["parameters"] = {"rounds": pspec.get("rounds", 3), "budget_s": pspec.get("budget_s", 300)}
+                    if pc.get("window_inputs") != pdescriptor or pb.get("segments") != pspec.get("segments") \
+                            or pb.get("goal_sha256") != _goal_def_sha(definition) \
+                            or pb.get("dependency_definitions") != _dep_defs(definitions, definition):
+                        raise live._InputProblem("corrupt", gid, "同批历史输入或目标绑定不一致")
+                    psnapshot = live._FrozenInputs(snapshot.root, snapshot.project, dict(snapshot.raw), pdescriptor)
+                    pevaluated = live._evaluate_snapshot(psnapshot)
+                    if any(pc.get(field) != pevaluated.get(field) for field in
+                           ("report", "history_authorization", "authorization", "reason", "inputs_sha256")):
+                        raise live._InputProblem("corrupt", gid, "同批历史报告与冻结来源重新评价不一致")
+                    pevaluated["closure"] = closure
+                    if peer["granted"] != bool(_live_grant_ready(inst, definition, st, pevaluated, pb)) \
+                            or pb.get("authorization") != pevaluated["authorization"] \
+                            or pb.get("authorization_complete") is not (pevaluated["authorization"] == "available"):
+                        raise live._InputProblem("corrupt", gid, "同批 granted 与完整事实重新评价不一致")
+            evaluated = live._evaluate_snapshot(snapshot)
+            if report != evaluated["report"]:
                 raise live._InputProblem("corrupt", "summary", "自报报告与冻结输入重新评价不一致")
-        result = {"valid": True, "state": "stable", "why": ["install_history_unavailable"],
-                  "authorization": "unavailable", "complete": True,
+            granted, authorization, why = False, "unavailable", ["install_history_unavailable"]
+            if modern:
+                if c.get("history_authorization") != evaluated.get("history_authorization") \
+                        or c.get("authorization") != evaluated.get("authorization") or c.get("reason") != evaluated.get("reason"):
+                    raise live._InputProblem("corrupt", "history", "历史授权事实与冻结来源重新评价不一致")
+                evaluated["closure"] = closure
+                granted = bool(_live_grant_ready(inst, x, st, evaluated, b))
+                if v["granted"] != granted:
+                    raise live._InputProblem("corrupt", "binding", "granted 与当前完整事实重新评价不一致")
+                authorization = evaluated["authorization"]
+                why = [] if granted else evaluated["history_authorization"]["why"] or ["严格实景判据或工具状态未达到授权条件"]
+        result = {"valid": True, "state": "stable", "why": why, "granted": granted,
+                  "authorization": authorization, "complete": True,
                   "inputs_sha256": b["window_inputs_sha256"], "closure_sha256": b["closure_sha256"]}
     except live._InputProblem as e:
         result = failure(e.state, f"{e.source}：{e.detail}")
@@ -1538,8 +1614,7 @@ def _verified_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict) -> 
     if not isinstance(x.get("live"), dict):
         return False, []
     validation = _live_binding_valid(inst, r, x, st, cache)
-    # This card deliberately cannot grant: the C5 history provider is absent.
-    return False, validation["why"]
+    return bool(validation["valid"] and validation.get("granted") is True), validation["why"]
 
 
 def _evidence_problems(inst: Instance, ev: Path, b: dict, spec: dict) -> list:

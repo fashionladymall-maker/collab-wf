@@ -18,9 +18,9 @@ material to inspect, never an authorization from this collector.
 The stability check is optimistic. It does not provide an OS transaction or
 protection against malicious changes by the same user between reads.
 
-## Required B-owned historical API
+## B-owned historical API
 
-The following is a proposed next interface, not an implemented public API:
+The historical verifier is separate from the preparatory material collector:
 
 ```text
 collect_install_history(context, install_ref, reader)
@@ -62,8 +62,13 @@ queries against the recorded commit/tree. The executable, environment,
 repository configuration and exact query arguments must be frozen and replayed
 by C. Reads outside the collected set are rejected. B must perform every
 semantic file read, selector enumeration and Git query through this reader.
-C can wrap its strict readers and add every result to the frozen window
-descriptor, then replay the same selectors and queries during revalidation.
+C wraps its strict readers in `live_history.CaptureReader` and adds every
+result to the frozen window descriptor. `FrozenReader` replays raw bytes,
+directory members and binary Git replies without opening disk or running Git.
+Fresh progress rediscovers the same sources and selectors and repeats every
+controlled query. Git object reads accept only complete commit/tree/blob OIDs;
+HEAD substitution, config includes, replace refs, shallow repositories,
+alternates and partial clones are unsupported.
 
 The historical result should use a versioned schema, with state
 `valid|failed|unknown|corrupt|unsupported|changed`. Its facts must separately
@@ -91,8 +96,46 @@ Required historical checks:
   target. Do not silently drop failed, partial, recovered, late or unknown
   attempts.
 
-Once the B API and exec reference are available, C can bind them into the
-frozen read set and replace the legacy fourth-segment lookup. The complete C5
-timing and provenance work remains pending until its positive and negative
-integration tests pass. Goals verification remains disabled for the new
-collection protocol until the separate authorization integration is complete.
+## Live and goals consumption
+
+`ops.run_exec` allocates the execution ID and nonce before starting the command.
+The protected consumer writes its prepared reference to that invocation's
+inherited receipt FD; ops preserves the receipt, metadata and event. C compares
+all three representations and output sizes before calling the historical
+verifier. The structured fourth segment uses those references even when paths
+contain spaces or the command ends in flags or Python source. Legacy command
+parsing remains a reporting path and cannot supply modern authorization.
+
+Historical review times are compared to the original installation start, not
+the exec start or the current clock. C additionally requires installation
+start/completion to fall within the actual invocation. Ops currently records
+whole seconds, so its end represents that entire second. A project apply event
+counts as an automatic child operation only when its exact reference and exec
+identity match a valid project transaction and a driver-owned exec event.
+
+Modern goals use `live-collection/3`. A stored `granted` bit is never accepted on
+its own: normal progress freshly captures the inputs, reruns the historical
+provider, re-evaluates the report, validates the full tool/project closure,
+checks goal/dependency definitions and verifies each replaced output's evidence.
+The selected candidate rounds must contain both tool and project transaction
+histories, and all ten strict live criteria must pass even for a narrow segment
+mapping. A grant also requires approved goals, a clean matching tool, a matching
+project fingerprint and non-synthetic provenance. `live-collection/2` remains a
+collection-only protocol.
+
+Tool cleanliness uses controlled Git status with repository fsmonitor and the
+untracked cache disabled. Its envelope binds the index and local ignore and
+attribute files as well as status output. External filters, submodule settings,
+and external attribute/exclude configuration are unsupported. A changed ignore
+dependency invalidates reuse even when status still reports a clean checkout.
+
+Synthetic histories can be complete and historically valid while authorization
+remains unavailable. The real-install integration tests always use explicitly
+synthetic review/verifier fixtures and never produce a production grant.
+Missing, corrupt, failed, recovered, late or unmatched attempts stay visible;
+newly registered blocks, raw-material drift and current trust-root changes
+invalidate reuse.
+
+The reader probes run in `wflib.selftest_live_history`; the actual exec,
+protected installation, frozen replay and goals tests run in
+`wflib.selftest_c5_integration`. Both are included in the isolated C lane.

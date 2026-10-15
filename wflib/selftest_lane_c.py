@@ -2443,6 +2443,39 @@ def _t_c5_materials(_ok):
             live.LOCAL = old_local
 
 
+def _t_c5_reader(_ok):
+    from .selftest_live_history import run_reader_tests
+    run_reader_tests(_ok)
+
+
+def _t_c5_integration(_ok):
+    import io
+    import unittest
+    from contextlib import redirect_stdout, redirect_stderr
+    from .selftest_c5_integration import C5IntegrationTests
+    outcomes = []
+
+    class Result(unittest.TestResult):
+        def addSuccess(self, test):
+            super().addSuccess(test)
+            outcomes.append(("C5 actual history: " + test._testMethodName, True, ""))
+
+        def addFailure(self, test, error):
+            super().addFailure(test, error)
+            outcomes.append(("C5 actual history: " + test._testMethodName, False, self._exc_info_to_string(error, test)))
+
+        def addError(self, test, error):
+            super().addError(test, error)
+            outcomes.append(("C5 actual history: " + test._testMethodName, False, self._exc_info_to_string(error, test)))
+
+    # Installation commands remain real; their expected fixture output is not
+    # part of the lane's assertion stream.
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        unittest.defaultTestLoader.loadTestsFromTestCase(C5IntegrationTests).run(Result())
+    for outcome in outcomes:
+        _ok(*outcome)
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
          ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals), ("指标 C3", _t_metrics),
          ("指标真实 API C3", _t_metrics_real_api),
@@ -2452,7 +2485,8 @@ TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景
          ("site 启动与中央缓存 C2b FIX3", _t_mech_startup_inputs),
          ("禁用 distutils 模板 C2b FIX4", _t_mech_disabled_pth),
          ("严格冻结采集与共同周期 C2c-1", _t_c2c_collection),
-         ("只读安装历史材料 C5", _t_c5_materials)]
+         ("只读安装历史材料 C5", _t_c5_materials), ("冻结历史 reader C5", _t_c5_reader),
+         ("真实执行与安装历史 C5", _t_c5_integration)]
 
 
 def run_lane_c(_ok) -> None:
