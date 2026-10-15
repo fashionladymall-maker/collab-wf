@@ -59,6 +59,13 @@
 2. 再用 `b3_fixtures.tier_r_contract()` 生成新的指纹；
 3. 在同一个提交里同时更新 `TIER_R_CONTRACT`，并写明是谁复审的。
 
+自检里的这项行为契约探针（`_t_tier_r_contract`）使用专属布局：替身工具 `semantic-tool`，以及本次生成专属的 0700 私有
+TMPDIR `semantic-private-tmpdir`；两者互不包含，生成目标位于该 TMPDIR 之内。探针运行前把 TMPDIR 设为它（同时清掉
+TEMP、TMP 和 `tempfile.tempdir` 缓存），结束后恢复。原因：在 macOS 私有 TMPDIR（如 `/var/folders/.../T`）下，若替身
+工具位于 TMPDIR 之内，临时目录护栏会先报 "contains the tool checkout"，根本测不到行为契约；Linux 默认的 `/tmp`
+是共享 sticky 目录，不触发这条检查，以前只是碰巧通过。现在每个平台都走私有分支。另有一项反例保留：TMPDIR 包含替身
+工具时照旧拒绝、不创建目标，并且不计为行为契约通过（B3-AB-MAC-FIXTURE）。
+
 ## 安全护栏
 
 根目录必须满足以下全部条件：

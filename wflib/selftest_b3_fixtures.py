@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -710,6 +711,26 @@ def _copy_tool(src: Path, dst: Path):
     shutil.copytree(str(src / "wflib"), str(dst / "wflib"), ignore=shutil.ignore_patterns("__pycache__"))
 
 
+@contextmanager
+def _private_tmpdir(path: Path):
+    """Make ``path`` the only temp base for this block, then restore the environment and tempfile's cache."""
+    keys = ("TMPDIR", "TEMP", "TMP")
+    saved, saved_cache = {k: os.environ.get(k) for k in keys}, tempfile.tempdir
+    for k in keys:
+        os.environ.pop(k, None)
+    os.environ["TMPDIR"] = str(path)
+    tempfile.tempdir = None
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        tempfile.tempdir = saved_cache
+
+
 def _edit(path: Path, old: str, new: str):
     text = path.read_text(encoding="utf-8")
     if text.count(old) != 1:
@@ -748,24 +769,60 @@ def _t_tier_r_contract(_ok, fx, tmp: Path):
         "tier R dependency drift" in msg and "class:Env" in msg and not target.exists(), msg[:400])
     # Behavioural layer: pins refreshed without re-review must still fail when the stand-in stops
     # declaring itself synthetic (the CT4 shape).
+    # Layout (B3-AB-MAC-FIXTURE): with a private per-user TMPDIR (macOS /var/folders/.../T, 0700) the
+    # temp guard refuses a temp base that contains the tool checkout. The stand-in tool and this
+    # generation's own private TMPDIR therefore must not contain each other, and the target lies
+    # strictly inside that TMPDIR. The private branch is exercised on every platform, not only when
+    # the default temp happens to be a shared sticky /tmp.
     sem = tmp / "semantic-tool"
     _copy_tool(WF_HOME, sem)
     _edit(sem / "wflib" / "selftest_review.py", '"path": str(self.verifier), "synthetic": True,', '"path": str(self.verifier),')
     _edit(sem / "wflib" / "selftest_review.py", '"ok": b.get("ok", True), "synthetic": True,',
           '"ok": b.get("ok", True), "synthetic": False,')
-    target2 = tmp / "semantic-fixtures"
+    gen_tmp = tmp / "semantic-private-tmpdir"
+    gen_tmp.mkdir(mode=0o700)
+    target2 = gen_tmp / "semantic-fixtures"
+    bad_tmp = tmp / "contains-tool-tmpdir"   # the refused shape: a private TMPDIR that contains the stand-in tool
+    bad_tmp.mkdir(mode=0o700)
+    bad_tool = bad_tmp / "semantic-tool"
+    _copy_tool(sem, bad_tool)
+    bad_target = bad_tmp / "semantic-fixtures"
+    local = Path(os.environ["WF_LOCAL_DIR"]) if os.environ.get("WF_LOCAL_DIR") else None
+    production = [p for p in (local, WF_HOME / "local", sem / "local") if p is not None]
+    before = {str(p): {k: _sha(v) for k, v in _walk_files(p).items()} if p.exists() else None for p in production}
+    saved_env, saved_cache = {k: os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP")}, tempfile.tempdir
     saved_root, saved_pins = fx._TOOL_ROOT, fx.TIER_R_CONTRACT
-    fx._TOOL_ROOT, fx.TIER_R_CONTRACT = sem, fx.tier_r_contract(sem)
-    try:
-        try:
-            fx.generate(target2, scenarios=[R_IDS[0]], tier_r=True)
-            msg2 = "generated"
-        except fx.FixtureRefused as e:
-            msg2 = str(e)
-    finally:
-        fx._TOOL_ROOT, fx.TIER_R_CONTRACT = saved_root, saved_pins
+
+    def attempt(tool, temp_base, target):
+        with _private_tmpdir(temp_base):
+            fx._TOOL_ROOT, fx.TIER_R_CONTRACT = tool, fx.tier_r_contract(tool)
+            try:
+                try:
+                    seen = fx._temp_base()
+                except fx.FixtureRefused as e:
+                    seen = "refused: " + str(e)
+                try:
+                    fx.generate(target, scenarios=[R_IDS[0]], tier_r=True)
+                    return seen, "generated"
+                except fx.FixtureRefused as e:
+                    return seen, str(e)
+            finally:
+                fx._TOOL_ROOT, fx.TIER_R_CONTRACT = saved_root, saved_pins
+
+    seen2, msg2 = attempt(sem, gen_tmp, target2)
+    seen3, msg3 = attempt(bad_tool, bad_tmp, bad_target)
+    after = {str(p): {k: _sha(v) for k, v in _walk_files(p).items()} if p.exists() else None for p in production}
+    mode = os.stat(str(gen_tmp)).st_mode
+    restored = ({k: os.environ.get(k) for k in saved_env} == saved_env and tempfile.tempdir == saved_cache
+                and fx._TOOL_ROOT == saved_root and fx.TIER_R_CONTRACT is saved_pins)
+    _ok("B3 夹具私有 TMPDIR 布局：替身工具与本次生成专属的 0700 TMPDIR 互不包含，目标在其内，_temp_base 走私有分支",
+        seen2 == str(gen_tmp) and not mode & 0o077 and not mode & 0o1000 and target2.parent == gen_tmp
+        and not (sem == gen_tmp or sem in gen_tmp.parents or gen_tmp in sem.parents), [seen2, oct(mode)])
+    _ok("B3 夹具私有 TMPDIR 布局：TMPDIR 包含替身工具时照旧拒绝且不创建目标，不计为行为契约",
+        "contains the tool checkout" in msg3 and "behavioural contract" not in msg3 and not bad_target.exists(), msg3[:400])
     _ok("B3 夹具第二层依赖契约：只刷新指纹而未复审时，行为契约仍拦下不再自报 synthetic 的替身",
-        "behavioural contract" in msg2 and "synthetic" in msg2, msg2[:400])
+        "tier R behavioural contract failed" in msg2 and "synthetic" in msg2 and "not a sandbox" not in msg2
+        and before == after and restored, [msg2[:400], restored, before == after])
 
 
 # ---------------------------------------------------------------- entry
