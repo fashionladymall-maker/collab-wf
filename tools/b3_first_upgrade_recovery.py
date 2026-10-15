@@ -155,11 +155,6 @@ def _clean(root: Path):
         raise Refused("dirty_or_unknown_worktree", dirty.replace("\0", " ")[:300])
 
 
-def _dirty_paths(root: Path) -> set:
-    raw = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
-    return {row[3:] for row in raw.split("\0") if row}
-
-
 def _head(root: Path) -> dict:
     return {"commit": _git(root, "rev-parse", "--verify", "HEAD^{commit}").strip(),
             "tree": _git(root, "rev-parse", "--verify", "HEAD^{tree}").strip()}
@@ -209,6 +204,34 @@ def _state(root: Path) -> list:
 
 # ---------------- freeze ----------------
 
+def _qualified_old_source(root: Path, files: dict, rows: list) -> dict:
+    """The old install must pass its own release manifest before it can be frozen as a recovery source.
+
+    Counterexample (2026-10-16): MANIFEST.files.VERSION = 64 zeros was recorded as a mismatch and still
+    frozen. Every listed file must exist with that sha256, every tracked file except MANIFEST.json must
+    be listed, and the manifest version must equal VERSION.
+    """
+    if "MANIFEST.json" not in files or "VERSION" not in files:
+        raise Refused("old_source_manifest_missing", "MANIFEST.json and VERSION must be tracked")
+    try:
+        doc = json.loads(_regular_under(root, "MANIFEST.json").read_bytes())
+        listed, mver = doc["files"], doc["version"]
+        if not isinstance(listed, dict) or not isinstance(mver, str) \
+                or any(not isinstance(k, str) or not isinstance(v, str) for k, v in listed.items()):
+            raise ValueError("files must map paths to sha256 strings")
+    except (ValueError, KeyError, TypeError, UnicodeError) as e:
+        raise Refused("old_source_manifest_corrupt", str(e)[:200]) from None
+    by = {r["path"]: r["sha256"] for r in rows}
+    version = _regular_under(root, "VERSION").read_text(encoding="utf-8").strip()
+    check = {"listed": len(listed), "version": mver,
+             "mismatch": sorted(p for p, h in listed.items() if by.get(p) != h),
+             "unlisted": sorted(set(by) - {"MANIFEST.json"} - set(listed)),
+             "version_matches": mver == version}
+    if check["mismatch"] or check["unlisted"] or not check["version_matches"]:
+        raise Refused("old_source_manifest_mismatch", json.dumps(check, sort_keys=True)[:600])
+    return check
+
+
 def freeze(install_root, snapshot_dir, *, review_id=None, package=None) -> dict:
     root = _directory(install_root, "install_root")
     snap = Path(os.path.normpath(str(snapshot_dir)))
@@ -233,12 +256,10 @@ def freeze(install_root, snapshot_dir, *, review_id=None, package=None) -> dict:
         sha = _sha256(data)
         rows.append({"path": rel, "mode": mode, "size": len(data), "sha256": sha, "git_blob": blob})
         blobs[sha] = data
-    mf = root / "MANIFEST.json"
-    manifest_check = None
-    if "MANIFEST.json" in files:
-        listed = json.loads(mf.read_bytes()).get("files", {})
-        by = {r["path"]: r["sha256"] for r in rows}
-        manifest_check = {"listed": len(listed), "mismatch": sorted(p for p, h in listed.items() if by.get(p) != h)}
+    manifest_check = _qualified_old_source(root, files, rows)
+    residue = _disk_vs(_code_inventory(root), {r["path"]: (r["sha256"], r["mode"]) for r in rows})
+    if residue:
+        raise Refused("unexplained_code_residue", ", ".join(residue[:8]))
     gate = None
     if review_id or package:
         gate = {"review_id": review_id, "package": str(package) if package else None,
@@ -287,6 +308,9 @@ def _load_snapshot(snap, expected_sha256) -> dict:
         raise Refused("snapshot_manifest_corrupt", str(e)) from None
     if doc.get("schema") != SCHEMA or not isinstance(doc.get("files"), list):
         raise Refused("snapshot_schema_unsupported", str(doc.get("schema")))
+    bd = snap / "blobs"
+    if not os.path.lexists(bd) or not stat.S_ISDIR(os.lstat(bd).st_mode):
+        raise Refused("snapshot_blobs_not_directory", str(bd))
     seen = set()
     for row in doc["files"]:
         rel = _safe_rel(row["path"])
@@ -310,17 +334,252 @@ def _target_id(root, ident, head, snapshot_sha256) -> str:
     return _sha256(_canon({"install_root": str(root), "identity": ident, "head": head, "snapshot": snapshot_sha256}))
 
 
-def _journal(snap: Path) -> dict:
-    j = snap / "journal"
+# ---------------- trusted derivation ----------------
+# The recovery plan is derived only from trusted inputs: the frozen manifest (bound by the
+# --snapshot-sha256 recorded at freeze time) and content-addressed git objects of the current
+# HEAD tree. The journal is a mutable, untrusted copy of that plan: it is accepted only if it is
+# byte-for-byte the derived plan, and it is fully validated before anything is written,
+# deleted or cleaned up.
+
+def _git_raw(root: Path, *args, inp=None) -> bytes:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_ENV)
+    r = subprocess.run(["git", *GIT_CFG, *args], cwd=str(root), env=env, input=inp, capture_output=True)
+    if r.returncode != 0:
+        raise Refused("git_failed", f"git {' '.join(args[:3])}: {r.stderr.decode(errors='replace').strip()[:300]}")
+    return r.stdout
+
+
+def _tree_listing(root: Path, tree: str) -> dict:
+    """path -> (mode, blob) of a git tree object; independent of the index and of the disk."""
     out = {}
-    for name in ("apply.json", "completed.json"):
-        p = j / name
-        if os.path.lexists(p):
-            if not stat.S_ISREG(os.lstat(p).st_mode):
-                raise Refused("journal_corrupt", name)
-            out[name] = json.loads(p.read_bytes())
-    out["failed"] = sorted(p.name for p in j.glob("failed-*.json")) if j.is_dir() else []
+    for row in filter(None, _git_raw(root, "ls-tree", "-r", "-z", "--full-tree", tree).split(b"\0")):
+        meta, path = row.split(b"\t", 1)
+        mode, kind, blob = meta.decode("ascii").split(" ")
+        path = path.decode("utf-8")
+        if path.split("/")[0] in PROTECTED:
+            raise Refused("protected_state_tracked", path)
+        if kind != "blob" or mode not in ("100644", "100755"):
+            raise Refused("unsupported_tracked_mode", f"{mode} {path}")
+        out[_safe_rel(path)] = (mode, blob)
     return out
+
+
+def _blob_sha256(root: Path, blobs) -> dict:
+    """sha256 of git blob contents, read and re-hashed from the object store in one batch."""
+    blobs = sorted(set(blobs))
+    if not blobs:
+        return {}
+    raw = _git_raw(root, "cat-file", "--batch", inp=("\n".join(blobs) + "\n").encode("ascii"))
+    out, pos = {}, 0
+    for b in blobs:
+        nl = raw.index(b"\n", pos)
+        head = raw[pos:nl].decode("ascii", errors="replace").split(" ")
+        if len(head) != 3 or head[0] != b or head[1] != "blob":
+            raise Refused("git_object_unavailable", b)
+        size = int(head[2])
+        data = raw[nl + 1:nl + 1 + size]
+        if len(data) != size or _git_blob(data) != b:
+            raise Refused("git_object_corrupt", b)
+        out[b] = _sha256(data)
+        pos = nl + 1 + size + 1
+    return out
+
+
+def _derive_plan(snap: dict, base: dict, base_sha: dict) -> dict:
+    frozen = {r["path"]: r for r in snap["files"]}
+    writes = [{"path": p, "mode": r["mode"], "post": r["sha256"],
+               "pre": base_sha[base[p][1]] if p in base else None}
+              for p, r in sorted(frozen.items()) if base.get(p) != (r["mode"], r["git_blob"])]
+    deletes = [{"path": p, "pre": base_sha[b]} for p, (_m, b) in sorted(base.items()) if p not in frozen]
+    return {"writes": writes, "deletes": deletes}
+
+
+def _plan_sha256(snapshot_sha256: str, target_id: str, base_head: dict, derived: dict) -> str:
+    return _sha256(_canon({"snapshot_sha256": snapshot_sha256, "target_id": target_id, "base_head": base_head,
+                           "writes": derived["writes"], "deletes": derived["deletes"]}))
+
+
+def _temp_rel(snapshot_sha256: str, base_tree: str, rel: str) -> str:
+    """The only temp name this runner may create or clean up for rel: registered by derivation."""
+    name = ".b3-recovery-" + _sha256(_canon([snapshot_sha256, base_tree, rel]))[:32] + ".tmp"
+    return rel.rsplit("/", 1)[0] + "/" + name if "/" in rel else name
+
+
+# ---------------- complete disk inventory ----------------
+
+def _code_inventory(root: Path) -> dict:
+    """Every path below the install root except the protected .git/ and local/, ignore rules notwithstanding.
+
+    Allowed non-code: *.pyc inside a __pycache__ directory (interpreter cache, not importable without
+    its source). Everything else that is not a frozen code file is residue; it is reported and refused,
+    never deleted.
+    """
+    code, cache, odd = {}, [], []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        rel_dir = here.relative_to(root)
+        if here == root:
+            dirnames[:] = [d for d in dirnames if d not in PROTECTED]
+        for d in list(dirnames):
+            if not stat.S_ISDIR(os.lstat(here / d).st_mode):
+                odd.append((rel_dir / d).as_posix())
+                dirnames.remove(d)
+        for name in filenames:
+            fp = here / name
+            rel = (rel_dir / name).as_posix()
+            st = os.lstat(fp)
+            if not stat.S_ISREG(st.st_mode):
+                odd.append(rel)
+            elif "__pycache__" in rel.split("/")[:-1] and name.endswith(".pyc"):
+                cache.append(rel)
+            else:
+                code[rel] = (st, fp)
+    return {"code": code, "cache": sorted(cache), "non_regular": sorted(odd)}
+
+
+def _disk_vs(inv: dict, expect: dict) -> list:
+    """Compare the full inventory with path -> (sha256, mode); exec bit compared as git does."""
+    out = [f"non_regular:{p}" for p in inv["non_regular"]]
+    out += [f"extra:{p}" for p in sorted(set(inv["code"]) - set(expect))]
+    out += [f"missing:{p}" for p in sorted(set(expect) - set(inv["code"]))]
+    for rel in sorted(set(expect) & set(inv["code"])):
+        st, fp = inv["code"][rel]
+        sha, mode = expect[rel]
+        if _sha256(fp.read_bytes()) != sha:
+            out.append(f"content:{rel}")
+        elif bool(st.st_mode & 0o100) != (mode == "100755"):
+            out.append(f"mode:{rel}")
+    return out
+
+
+def _check_resume_disk(inv, base, base_sha, derived, blobs_dir: Path, snapshot_sha256, base_tree) -> list:
+    """An interrupted apply: every file must be explained by the derived plan; returns registered temps."""
+    writes = {w["path"]: w for w in derived["writes"]}
+    deletes = {d["path"]: d for d in derived["deletes"]}
+    temps = {_temp_rel(snapshot_sha256, base_tree, p): w for p, w in writes.items()}
+    concurrent, problems, found = [], [f"non_regular:{p}" for p in inv["non_regular"]], []
+    for rel, (_st, fp) in sorted(inv["code"].items()):
+        data = fp.read_bytes()
+        if rel in temps:   # a temp this runner registered for exactly one write; must be a prefix of that blob
+            if not (blobs_dir / temps[rel]["post"]).read_bytes().startswith(data):
+                problems.append(f"foreign_temp:{rel}")
+            found.append(rel)
+            continue
+        sha = _sha256(data)
+        if rel in writes:
+            if sha not in (writes[rel]["pre"], writes[rel]["post"]):
+                concurrent.append(rel)
+        elif rel in deletes:
+            if sha != deletes[rel]["pre"]:
+                concurrent.append(rel)
+        elif rel in base:
+            if sha != base_sha[base[rel][1]]:
+                problems.append(f"content:{rel}")
+        else:
+            problems.append(f"extra:{rel}")
+    concurrent += [p for p, w in writes.items() if p not in inv["code"] and w["pre"] is not None]
+    problems += [f"missing:{p}" for p in sorted(set(base) - set(writes) - set(deletes) - set(inv["code"]))]
+    if concurrent:
+        raise Refused("blocked_concurrent_change", ", ".join(sorted(concurrent)[:8]))
+    if problems:
+        raise Refused("blocked_unexplained_change", ", ".join(problems[:8]))
+    return sorted(found)
+
+
+# ---------------- journal (untrusted) ----------------
+
+_APPLY_KEYS = {"schema", "state", "at", "target_id", "base_head", "snapshot_sha256", "plan_sha256", "writes", "deletes"}
+
+
+def _jdir(snap_dir: Path, create=False):
+    j = snap_dir / "journal"
+    if not os.path.lexists(j):
+        if not create:
+            return None
+        os.mkdir(j, 0o700)
+    if not stat.S_ISDIR(os.lstat(j).st_mode):   # lstat: a symlinked journal is refused, never followed
+        raise Refused("journal_not_directory", str(j))
+    return j
+
+
+def _journal_read(snap_dir: Path) -> dict:
+    out = {"failed": []}
+    j = _jdir(snap_dir)
+    if j is None:
+        return out
+    for entry in sorted(os.listdir(j)):
+        if not stat.S_ISREG(os.lstat(j / entry).st_mode):
+            raise Refused("journal_corrupt", f"non-regular journal entry {entry}")
+        if entry in ("apply.json", "completed.json"):
+            try:
+                doc = json.loads((j / entry).read_bytes())
+            except (ValueError, UnicodeError) as e:
+                raise Refused("journal_corrupt", f"{entry}: {e}"[:200]) from None
+            if not isinstance(doc, dict):
+                raise Refused("journal_corrupt", entry)
+            out[entry] = doc
+        elif re.fullmatch(r"failed-[0-9]+\.json", entry):
+            out["failed"].append(entry)
+        else:
+            raise Refused("journal_corrupt", f"unknown journal entry {entry}")
+    return out
+
+
+def _journal_write(snap_dir: Path, name: str, doc: dict):
+    j = _jdir(snap_dir, create=True)
+    dfd = os.open(j, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400, dir_fd=dfd)
+        with os.fdopen(fd, "wb") as f:
+            f.write(_canon(doc))
+            f.flush()
+            os.fsync(f.fileno())
+    finally:
+        os.close(dfd)
+
+
+def _journal_path(rel) -> str:
+    try:
+        return _safe_rel(rel)
+    except Refused:
+        raise Refused("journal_unsafe_path", str(rel)[:200]) from None
+
+
+def _check_apply_record(rec: dict, *, root, ident, head, snapshot_sha256, derived):
+    if set(rec) != _APPLY_KEYS or rec.get("schema") != APPLY_SCHEMA or rec.get("state") != "started" \
+            or not isinstance(rec.get("at"), str):
+        raise Refused("journal_corrupt", "apply.json schema/keys")
+    if not isinstance(rec["base_head"], dict) or set(rec["base_head"]) != {"commit", "tree"}:
+        raise Refused("journal_corrupt", "apply.json base_head")
+    seen = set()
+    for kind, keys in (("writes", {"path", "mode", "pre", "post"}), ("deletes", {"path", "pre"})):
+        if not isinstance(rec[kind], list):
+            raise Refused("journal_corrupt", f"apply.json {kind}")
+        for row in rec[kind]:
+            if not isinstance(row, dict) or set(row) != keys or not isinstance(row["path"], str):
+                raise Refused("journal_corrupt", f"apply.json {kind} record")
+            rel = _journal_path(row["path"])
+            if rel in seen:
+                raise Refused("journal_duplicate_path", rel)
+            seen.add(rel)
+    if rec["snapshot_sha256"] != snapshot_sha256:
+        raise Refused("journal_plan_mismatch", "snapshot_sha256")
+    if rec["base_head"] != head:
+        raise Refused("blocked_head_moved_during_interrupted_apply", head["commit"])
+    if rec["target_id"] != _target_id(root, ident, head, snapshot_sha256):
+        raise Refused("journal_plan_mismatch", "target_id does not match root identity, base head and snapshot")
+    if rec["writes"] != derived["writes"] or rec["deletes"] != derived["deletes"]:
+        raise Refused("journal_plan_mismatch", "writes/deletes differ from the plan derived from the frozen "
+                                               "manifest and the base tree")
+    if rec["plan_sha256"] != _plan_sha256(snapshot_sha256, rec["target_id"], head, derived):
+        raise Refused("journal_plan_mismatch", "plan_sha256")
+
+
+def _check_completed(rec: dict, head: dict, snapshot_sha256: str):
+    if rec.get("schema") != APPLY_SCHEMA or rec.get("state") != "completed" or rec.get("head") != head \
+            or rec.get("snapshot_sha256", snapshot_sha256) != snapshot_sha256:
+        raise Refused("journal_corrupt", "completed.json does not describe the current restored head")
 
 
 def _current_sha(root, rel):
@@ -328,37 +587,65 @@ def _current_sha(root, rel):
     return None if p is None else _sha256(p.read_bytes())
 
 
+def _public(d: dict) -> dict:
+    return {k: v for k, v in d.items() if not k.startswith("_")}
+
+
+# ---------------- plan ----------------
+
 def plan(install_root, snapshot_dir, snapshot_sha256) -> dict:
     snap = _load_snapshot(snapshot_dir, snapshot_sha256)
     root = _directory(install_root, "install_root")
-    if str(root) != snap["install_root"] or _identity(root) != snap["root_identity"]:
+    ident = _identity(root)
+    if str(root) != snap["install_root"] or ident != snap["root_identity"]:
         raise Refused("install_root_identity_mismatch", str(root))
     if _overlap(snap["_dir"], root):
         raise Refused("snapshot_overlaps_install_root", str(snap["_dir"]))
     _repo(root)
-    journal = _journal(snap["_dir"])
-    current = _tracked(root)
+    journal = _journal_read(snap["_dir"])
     head = _head(root)
-    frozen = {r["path"]: r for r in snap["files"]}
-    if "apply.json" not in journal:
-        _clean(root)   # resume after an interrupted apply is validated against the recorded plan instead
-    writes = [{"path": p, "mode": r["mode"], "post": r["sha256"], "pre": _current_sha(root, p)}
-              for p, r in sorted(frozen.items()) if current.get(p) != (r["mode"], r["git_blob"])]
-    deletes = [{"path": p, "pre": _current_sha(root, p)} for p in sorted(current) if p not in frozen]
+    base = _tree_listing(root, head["tree"])
+    base_sha = _blob_sha256(root, [b for _m, b in base.values()])
+    derived = _derive_plan(snap, base, base_sha)
+    frozen = {r["path"]: (r["sha256"], r["mode"]) for r in snap["files"]}
+    inv = _code_inventory(root)
+    temps = []
+    if head["tree"] == snap["git"]["tree"]:
+        # Never trust HEAD/index alone: the disk must be the frozen code, byte for byte, with no residue.
+        drift = _disk_vs(inv, frozen)
+        if drift:
+            raise Refused("restored_disk_drift", ", ".join(drift[:8]))
+        _clean(root)
+        code = "already_restored"
+    elif "apply.json" in journal:
+        _check_apply_record(journal["apply.json"], root=root, ident=ident, head=head,
+                            snapshot_sha256=snapshot_sha256, derived=derived)
+        temps = _check_resume_disk(inv, base, base_sha, derived, snap["_dir"] / "blobs", snapshot_sha256, head["tree"])
+        code = "resume_interrupted_apply"
+    else:
+        _clean(root)
+        residue = _disk_vs(inv, {p: (base_sha[b], m) for p, (m, b) in base.items()})
+        if residue:
+            raise Refused("unexplained_code_residue", ", ".join(residue[:8]))
+        code = "restorable"
+    if "completed.json" in journal:
+        if code != "already_restored":
+            raise Refused("completed_record_but_target_differs", head["tree"])
+        _check_completed(journal["completed.json"], head, snapshot_sha256)
+    restored = code == "already_restored"
     state_now = _state(root)
     state_diff = _state_diff(snap["state"], state_now)
-    restored = head["tree"] == snap["git"]["tree"] and not writes and not deletes
-    if "completed.json" in journal and not restored:
-        raise Refused("completed_record_but_tree_differs", head["tree"])
-    code = ("already_restored" if restored else "resume_interrupted_apply" if "apply.json" in journal
-            else "restorable")
     schema = ("unchanged_since_freeze" if not state_diff
               else "unverified: newer code wrote runtime state after freeze; old code compatibility not proven")
+    target_id = _target_id(root, ident, head, snapshot_sha256)
     return {
         "result": "plan", "snapshot_sha256": snapshot_sha256, "install_root": str(root), "head": head,
         "frozen": {"git": snap["git"], "version": snap["version"], "files": len(frozen)},
-        "target_id": _target_id(root, _identity(root), head, snapshot_sha256),
-        "writes": writes, "deletes": deletes, "journal": {k: bool(v) if k != "failed" else v for k, v in journal.items()},
+        "target_id": target_id, "plan_sha256": _plan_sha256(snapshot_sha256, target_id, head, derived),
+        "writes": derived["writes"], "deletes": derived["deletes"],
+        "inventory": {"code_files": len(inv["code"]), "interpreter_cache_files": len(inv["cache"]),
+                      "registered_temps_found": temps},
+        "journal": {k: bool(v) if k != "failed" else v for k, v in journal.items()},
         "conclusions": {
             "code_recovery": code,
             "state_preservation": {"status": "never_written_by_runner",
@@ -374,7 +661,7 @@ def plan(install_root, snapshot_dir, snapshot_sha256) -> dict:
                                      "no driver/board process from the newer code still running (not checked)"]},
         },
         "external_gate": snap.get("external_gate") or {"status": "none_recorded", "enforced_by_old_host": False},
-        "_snapshot": snap,
+        "_snapshot": snap, "_derived": derived, "_temps": temps,
     }
 
 
@@ -392,16 +679,7 @@ def _state_diff(before: list, after: list) -> list:
 
 # ---------------- apply ----------------
 
-def _write_new(path: Path, doc: dict):
-    path.parent.mkdir(mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-    with os.fdopen(fd, "wb") as f:
-        f.write(_canon(doc))
-        f.flush()
-        os.fsync(f.fileno())
-
-
-def _restore_file(root: Path, rel: str, data: bytes, mode: str):
+def _restore_file(root: Path, rel: str, data: bytes, mode: str, temp_rel: str):
     target = root / rel
     cur = root
     for part in rel.split("/")[:-1]:
@@ -411,7 +689,7 @@ def _restore_file(root: Path, rel: str, data: bytes, mode: str):
                 raise Refused("non_regular_path", rel)
         else:
             os.mkdir(cur, 0o755)
-    tmp = target.parent / f".b3-recovery-{os.getpid()}-{target.name}"
+    tmp = root / temp_rel
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -426,40 +704,32 @@ def _restore_file(root: Path, rel: str, data: bytes, mode: str):
 
 
 def apply(install_root, snapshot_dir, snapshot_sha256, confirm_target) -> dict:
-    p = plan(install_root, snapshot_dir, snapshot_sha256)
+    p = plan(install_root, snapshot_dir, snapshot_sha256)   # complete validation; nothing has been written
     snap, root = p["_snapshot"], Path(p["install_root"])
-    jdir = snap["_dir"] / "journal"
-    journal = _journal(snap["_dir"])
+    sdir, derived, head = snap["_dir"], p["_derived"], p["head"]
+    journal = _journal_read(sdir)
     if p["conclusions"]["code_recovery"] == "already_restored":
         if "apply.json" in journal and "completed.json" not in journal:
-            _write_new(jdir / "completed.json", {"schema": APPLY_SCHEMA, "state": "completed", "at": _now(),
-                                                 "head": p["head"], "note": "recorded on re-entry"})
-        return {k: v for k, v in p.items() if k != "_snapshot"} | {"result": "already_restored"}
+            _journal_write(sdir, "completed.json", {"schema": APPLY_SCHEMA, "state": "completed", "at": _now(),
+                                                    "head": head, "snapshot_sha256": snapshot_sha256,
+                                                    "note": "recorded on re-entry"})
+        return _public(p) | {"result": "already_restored"}
     if "apply.json" in journal:
-        rec = journal["apply.json"]
-        if confirm_target != rec["target_id"]:
+        if confirm_target != journal["apply.json"]["target_id"]:
             raise Refused("confirm_target_mismatch", "resume must confirm the recorded target")
-        writes, deletes = rec["writes"], rec["deletes"]
-        if rec["base_head"] != p["head"]:
-            raise Refused("blocked_head_moved_during_interrupted_apply", p["head"]["commit"])
-        recorded = {w["path"] for w in writes} | {d["path"] for d in deletes}
-        for w in writes:   # only this runner's own temp files, next to paths it was restoring
-            for leftover in (root / w["path"]).parent.glob(".b3-recovery-*"):
-                if stat.S_ISREG(os.lstat(leftover).st_mode):
-                    os.unlink(leftover)
-        unexplained = sorted(_dirty_paths(root) - recorded)
-        if unexplained:
-            raise Refused("blocked_unexplained_change", ", ".join(unexplained[:5]))
     else:
         if confirm_target != p["target_id"]:
             raise Refused("confirm_target_mismatch", "take target_id from a plan of the current install root")
-        writes, deletes = p["writes"], p["deletes"]
-        _write_new(jdir / "apply.json", {"schema": APPLY_SCHEMA, "state": "started", "at": _now(),
-                                         "target_id": p["target_id"], "base_head": p["head"],
-                                         "snapshot_sha256": snapshot_sha256, "writes": writes, "deletes": deletes})
-    blobs = snap["_dir"] / "blobs"
+        _journal_write(sdir, "apply.json", {"schema": APPLY_SCHEMA, "state": "started", "at": _now(),
+                                            "target_id": p["target_id"], "base_head": head,
+                                            "snapshot_sha256": snapshot_sha256, "plan_sha256": p["plan_sha256"],
+                                            "writes": derived["writes"], "deletes": derived["deletes"]})
+    blobs = sdir / "blobs"
     try:
-        for w in writes:
+        for rel in p["_temps"]:   # only registered temps, validated by plan before any write
+            if os.path.lexists(root / rel) and stat.S_ISREG(os.lstat(root / rel).st_mode):
+                os.unlink(root / rel)
+        for w in derived["writes"]:
             now = _current_sha(root, w["path"])
             if now == w["post"]:
                 st = os.lstat(root / w["path"])
@@ -467,34 +737,40 @@ def apply(install_root, snapshot_dir, snapshot_sha256, confirm_target) -> dict:
                     continue
             elif now != w["pre"]:
                 raise Refused("blocked_concurrent_change", w["path"])
-            _restore_file(root, w["path"], (blobs / w["post"]).read_bytes(), w["mode"])
-        for d in deletes:
+            _restore_file(root, w["path"], (blobs / w["post"]).read_bytes(), w["mode"],
+                          _temp_rel(snapshot_sha256, head["tree"], w["path"]))
+        for d in derived["deletes"]:
             now = _current_sha(root, d["path"])
             if now is None:
                 continue
             if now != d["pre"]:
                 raise Refused("blocked_concurrent_change", d["path"])
             os.unlink(root / d["path"])
-        paths = "\0".join(sorted({w["path"] for w in writes} | {d["path"] for d in deletes})) + "\0"
+        paths = "\0".join(sorted({w["path"] for w in derived["writes"]} | {d["path"] for d in derived["deletes"]})) + "\0"
         _git(root, "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul", inp=paths.encode())
         if _git(root, "write-tree").strip() != snap["git"]["tree"]:
             raise Refused("restored_tree_mismatch", "index tree differs from the frozen tree")
         _git(root, "-c", "user.name=b3-first-upgrade-recovery", "-c", "user.email=recovery@localhost",
              "commit", "-q", "--no-verify", "-m",
              f"b3 first-upgrade recovery: restore frozen {snap['version']} tree {snap['git']['tree']}\n\n"
-             f"snapshot sha256 {snapshot_sha256}; from {p['head']['commit']}")
+             f"snapshot sha256 {snapshot_sha256}; from {head['commit']}")
     except BaseException as e:   # record, never convert into success; the original error propagates
-        n = len(list(jdir.glob("failed-*.json"))) + 1
-        _write_new(jdir / f"failed-{n}.json", {"schema": APPLY_SCHEMA, "state": "failed", "at": _now(),
-                                               "error": f"{type(e).__name__}: {e}"[:2000]})
+        n = len(_journal_read(sdir)["failed"]) + 1
+        _journal_write(sdir, f"failed-{n}.json", {"schema": APPLY_SCHEMA, "state": "failed", "at": _now(),
+                                                  "error": f"{type(e).__name__}: {e}"[:2000]})
         raise
-    head = _head(root)
-    if head["tree"] != snap["git"]["tree"]:
-        raise Refused("restored_tree_mismatch", head["tree"])
+    new_head = _head(root)
+    if new_head["tree"] != snap["git"]["tree"]:
+        raise Refused("restored_tree_mismatch", new_head["tree"])
     _clean(root)
-    _write_new(jdir / "completed.json", {"schema": APPLY_SCHEMA, "state": "completed", "at": _now(), "head": head})
+    drift = _disk_vs(_code_inventory(root), {r["path"]: (r["sha256"], r["mode"]) for r in snap["files"]})
+    if drift:
+        raise Refused("restored_disk_drift", ", ".join(drift[:8]))
+    _journal_write(sdir, "completed.json", {"schema": APPLY_SCHEMA, "state": "completed", "at": _now(),
+                                            "head": new_head, "snapshot_sha256": snapshot_sha256,
+                                            "plan_sha256": p["plan_sha256"]})
     after = plan(install_root, snapshot_dir, snapshot_sha256)
-    return {k: v for k, v in after.items() if k != "_snapshot"} | {"result": "restored", "restore_commit": head["commit"]}
+    return _public(after) | {"result": "restored", "restore_commit": new_head["commit"]}
 
 
 def main(argv=None) -> int:
@@ -517,7 +793,7 @@ def main(argv=None) -> int:
         if a.cmd == "freeze":
             out = freeze(a.install_root, a.snapshot_dir, review_id=a.external_review_id, package=a.package)
         elif a.cmd == "plan":
-            out = {k: v for k, v in plan(a.install_root, a.snapshot_dir, a.snapshot_sha256).items() if k != "_snapshot"}
+            out = _public(plan(a.install_root, a.snapshot_dir, a.snapshot_sha256))
         else:
             out = apply(a.install_root, a.snapshot_dir, a.snapshot_sha256, a.confirm_target)
     except Refused as e:
