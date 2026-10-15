@@ -2,6 +2,7 @@
 wf self-update 在安装新版本之前会先运行新版本的自检。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -59,6 +60,43 @@ def _make_zip(path: Path, top: str, files: dict):
             info = zipfile.ZipInfo(f"{top}/{rel}")
             info.external_attr = (0o755 if rel.endswith(".sh") else 0o644) << 16
             z.writestr(info, content)
+
+
+def _synthetic_review_host(env, root):
+    """Selftest-only host programs; never borrow the user's runner or verifier."""
+    from .selftest_review import AUTHOR_SESSION, REVIEWER, RUNNER, VERIFIER
+    host = Path(root) / "review-host"
+    host.mkdir()
+    runner, verifier = host / "runner.py", host / "verifier.py"
+    runner.write_text(RUNNER.format(py=sys.executable), encoding="utf-8")
+    verifier.write_text(VERIFIER.format(py=sys.executable, identity=json.dumps(REVIEWER)), encoding="utf-8")
+    for path in (runner, verifier):
+        path.chmod(0o755)
+    (host / "behavior.json").write_text("{}")
+    (host / "vbehavior.json").write_text("{}")
+    local = Path(env["WF_LOCAL_DIR"])
+    local.mkdir(parents=True, exist_ok=True)
+    (local / "transport.json").write_text(json.dumps({
+        "review": str(runner),
+        "review_verifier": {"path": str(verifier), "synthetic": True,
+                            "sha256": hashlib.sha256(verifier.read_bytes()).hexdigest()},
+    }), encoding="utf-8")
+    (local / "lanes.json").write_text(json.dumps({"lanes": {"selftest": {"sessions": [AUTHOR_SESSION]}}}),
+                                    encoding="utf-8")
+
+
+def _reviewed_request(env, cwd, package, *, kind="project", wf=None):
+    """Freeze after the last target write; install consumes this exact request."""
+    rc, prepared = _wf(env, cwd, "review", "prepare", str(package), "--kind", kind,
+                       "--author", "selftest", "--json", wf=wf)
+    if rc:
+        raise RuntimeError(f"synthetic prepare failed: {prepared}")
+    rid = json.loads(prepared)["request_id"]
+    rc, output = _wf(env, cwd, "review", "run", rid, "--json", wf=wf)
+    decision = json.loads(output) if rc == 0 else {}
+    if (rc or not decision.get("allowed") or not (decision.get("provenance") or {}).get("synthetic")):
+        raise RuntimeError(f"synthetic review refused: {output}")
+    return rid
 
 
 REPLY = """【本轮结论】
@@ -137,6 +175,7 @@ def _run_checks() -> int:
     env.pop("VIRTUAL_ENV", None)
     try:
         proj = tmp / "demo"
+        _synthetic_review_host(env, tmp)
         # 1. 新建项目
         rc, o = _wf(env, tmp, "init", "--name", "demo", "--root", str(proj))
         _ok("新建项目", rc == 0 and (proj / "PROJECT.md").exists() and (proj / "workflow" / "wf.json").exists(), o)
@@ -179,7 +218,12 @@ def _run_checks() -> int:
                                "app.py": "print('v0.2')\n", "run.sh": "echo run\n",
                                "RELEASE.json": json.dumps({"delete": ["old.txt"], "notes": "测试"}),
                                "workflow/state.json": "{\"evil\": true}"})
-        rc, o = _wf(env, proj, "apply", str(z2))
+        # CLI apply otherwise moves REVIEW -> APPLY before consuming the request.
+        # Finalize that write first, then freeze and review the exact installation.
+        rc, o = _wf(env, proj, "go", "APPLY")
+        _ok("进入 APPLY 后再冻结安装审查材料", rc == 0, o)
+        rid2 = _reviewed_request(env, proj, z2)
+        rc, o = _wf(env, proj, "apply", str(z2), "--review-id", rid2)
         _ok("落地版本：提交、打标签、按清单删除、受保护文件不被覆盖、保留执行权限",
             rc == 0 and (proj / "app.py").exists() and not (proj / "old.txt").exists()
             and "evil" not in (proj / "workflow" / "state.json").read_text()
@@ -187,13 +231,22 @@ def _run_checks() -> int:
             and _state(proj)["state"] == "EXECUTE" and os.access(proj / "run.sh", os.X_OK), o)
         bad = tmp / "demo-bad.zip"
         _make_zip(bad, "demo", {"PROJECT.md": "# 坏的\n", "app.py": "print('bad')\n"})
-        rc, o = _wf(env, proj, "apply", str(bad))
-        _ok("校验失败时不改动仓库（先校验后复制）", rc != 0 and (proj / "app.py").read_text() == "print('v0.2')\n", o)
+        rc, o = _wf(env, proj, "force", "APPLY", "--reason", "selftest：项目格式负例")
+        _ok("项目格式负例先固定 APPLY 状态", rc == 0, o)
+        bad_id = _reviewed_request(env, proj, bad)
+        rc, o = _wf(env, proj, "apply", str(bad), "--review-id", bad_id)
+        _ok("真实审查后项目格式校验失败不改动仓库（先校验后复制）",
+            rc != 0 and "PROJECT.md 校验未通过" in o and (proj / "app.py").exists()
+            and (proj / "app.py").read_text() == "print('v0.2')\n", o)
         slip = tmp / "slip.zip"
         with zipfile.ZipFile(slip, "w") as zf:
             zf.writestr("../evil.txt", "x")
-        rc, o = _wf(env, proj, "apply", str(slip))
-        _ok("拒绝越界路径的 zip", rc != 0 and not (tmp / "evil.txt").exists(), o)
+        requests = Path(env["WF_LOCAL_DIR"]) / "reviews" / "requests"
+        before_requests = set(requests.glob("*.json"))
+        rc, o = _wf(env, proj, "review", "prepare", str(slip), "--kind", "project", "--author", "selftest", "--json")
+        _ok("prepare 真实拒绝越界路径 zip、不生成请求", rc != 0 and "越界或不规范的路径" in o
+            and set(requests.glob("*.json")) == before_requests
+            and not (tmp / "evil.txt").exists(), o)
         z3 = tmp / "demo-v0.3.zip"
         _make_zip(z3, "demo", {"PROJECT.md": _project_md("v0.3"), "CHANGELOG.md": "# CHANGELOG\n\n## v0.3 — t\n- x\n",
                                "app.py": "print('v0.3')\n", "new3.txt": "n", "run.sh": "echo run\n",
@@ -201,14 +254,23 @@ def _run_checks() -> int:
         (proj / "old.txt").write_text("again")
         subprocess.run(["git", "add", "-A"], cwd=proj)
         subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "restore old.txt"], cwd=proj)
-        rc, o = _wf({**env, "WF_TEST_FAIL_DELETE": "1"}, proj, "apply", str(z3))
+        rc, o = _wf(env, proj, "force", "APPLY", "--reason", "selftest：删除失败注入")
+        _ok("删除失败注入前固定 APPLY 状态", rc == 0, o)
+        rid3 = _reviewed_request(env, proj, z3)
+        rc, o = _wf({**env, "WF_TEST_FAIL_DELETE": "1"}, proj, "apply", str(z3), "--review-id", rid3)
         st_porcelain = subprocess.run(["git", "status", "--porcelain"], cwd=proj, capture_output=True, text=True).stdout
         clean = all(l[3:].startswith("workflow/") for l in st_porcelain.splitlines())
-        _ok("删除阶段失败：自动恢复工作区（F15）", rc != 0 and "已自动恢复" in o and clean
-            and (proj / "app.py").read_text() == "print('v0.2')\n" and not (proj / "new3.txt").exists()
+        _ok("删除阶段失败：核验恢复安装前基线（F15）", rc != 0 and "已核验恢复安装前基线" in o and clean
+            and (proj / "app.py").exists() and (proj / "app.py").read_text() == "print('v0.2')\n"
+            and not (proj / "new3.txt").exists()
             and (proj / "old.txt").exists(), o + st_porcelain)
-        rc, o = _wf(env, proj, "apply", str(z3))
-        _ok("恢复后直接重试成功", rc == 0 and (proj / "app.py").read_text() == "print('v0.3')\n"
+        # A failed CLI call writes failure state; retry is a fresh reviewed request.
+        rc, o = _wf(env, proj, "force", "APPLY", "--reason", "selftest：核验恢复后重试")
+        _ok("恢复后先固定重试状态再冻结新请求", rc == 0, o)
+        retry_id = _reviewed_request(env, proj, z3)
+        rc, o = _wf(env, proj, "apply", str(z3), "--review-id", retry_id)
+        _ok("恢复后使用新请求重试成功", rc == 0 and retry_id != rid3
+            and (proj / "app.py").read_text() == "print('v0.3')\n"
             and not (proj / "old.txt").exists(), o)
         rc, o = _wf({**env, "PATH": "/usr/bin:/bin"}, proj, "exec", "--", "wf version")
         _ok("wf exec 内可以直接调用 wf（不依赖 shell 配置文件）", rc == 0 and "collab-wf" in o, o)
@@ -371,6 +433,8 @@ def _run_checks() -> int:
         copy = tmp / "collab-wf"
         shutil.copytree(WF_HOME, copy, ignore=shutil.ignore_patterns(".git", "local", "__pycache__"))
         cwf = copy / "wf.py"
+        rc, o = _wf(env, tmp, "self-manifest", wf=cwf)
+        _ok("工具副本安装前清单与实际字节一致", rc == 0, o)
         rc, o = _wf(env, tmp, "self-init", wf=cwf)
         _ok("工具副本初始化版本库", rc == 0, o)
         cur = (copy / "VERSION").read_text().strip()
@@ -383,15 +447,25 @@ def _run_checks() -> int:
                 files[str(p.relative_to(copy))] = p.read_bytes()
         files["VERSION"] = (nxt + "\n").encode()
         files["NEWFILE.txt"] = b"new"
+        # MANIFEST is reviewed package content; the installer must never repair it.
+        files["MANIFEST.json"] = json.dumps({
+            "version": nxt,
+            "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()
+                      if name != "MANIFEST.json"},
+        }).encode()
         _make_zip(up, "collab-wf", files)
-        rc, o = _wf(env, tmp, "self-update", str(up), "--skip-test", wf=cwf)
+        update_id = _reviewed_request(env, tmp, up, kind="tool", wf=cwf)
+        rc, o = _wf(env, tmp, "self-update", str(up), "--skip-test", "--review-id", update_id, wf=cwf)
         _ok(f"工具升级 {cur} → {nxt}", rc == 0 and (copy / "VERSION").read_text().strip() == nxt, o)
         man = json.loads((copy / "MANIFEST.json").read_text())
         rc_sc, o_sc = _wf(env, tmp, "self-check", wf=cwf)
-        _ok("升级后 MANIFEST 随安装的版本自动重算，self-check 通过（③-1）",
-            man.get("version") == nxt and "NEWFILE.txt" in man.get("files", {}) and rc_sc == 0, o_sc + str(man.get("version")))
-        rc, o = _wf(env, tmp, "self-update", str(up), "--skip-test", wf=cwf)
-        _ok("拒绝重复安装同一版本", rc != 0, o)
+        _ok("包内预生成的 MANIFEST 原样安装，self-check 通过（③-1）",
+            (copy / "MANIFEST.json").read_bytes() == files["MANIFEST.json"]
+            and man.get("version") == nxt and "NEWFILE.txt" in man.get("files", {}) and rc_sc == 0,
+            o_sc + str(man.get("version")))
+        same_id = _reviewed_request(env, tmp, up, kind="tool", wf=cwf)
+        rc, o = _wf(env, tmp, "self-update", str(up), "--skip-test", "--review-id", same_id, wf=cwf)
+        _ok("真实审查后仍拒绝重复安装同一版本", rc != 0 and "不高于" in o, o)
         rc, o = _wf(env, tmp, "self-rollback", cur, wf=cwf)
         _ok(f"工具回滚到 {cur}（移除新增文件）", rc == 0 and (copy / "VERSION").read_text().strip() == cur
             and not (copy / "NEWFILE.txt").exists(), o)
@@ -407,6 +481,9 @@ def _run_checks() -> int:
         except Exception as e:  # 自检本身出错也要计为失败
             import traceback
             _ok("驱动器自检运行", False, traceback.format_exc()[-1500:])
+    except Exception:
+        import traceback
+        _ok("端到端夹具完成运行", False, traceback.format_exc())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     n_ok = sum(1 for r in RESULTS if r[0])
