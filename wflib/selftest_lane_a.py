@@ -130,6 +130,22 @@ def _ctx(inst, pol):
     return driver.Ctx(inst, pol, time.time() + 60)
 
 
+@contextmanager
+def _permission_fixture(inst, pol):
+    """为直接调用 review/execute 的旧夹具建立一次真实批准策略和严格可读 registry。"""
+    from . import core, policy
+    inst.wf.mkdir(parents=True, exist_ok=True)
+    (inst.wf / "policy.json").write_text(json.dumps(pol, ensure_ascii=False), encoding="utf-8")
+    policy.approve(inst, "policy", "lane-a permission fixture")
+    previous = core.REGISTRY
+    core.REGISTRY = inst.wf / "test-registry.json"
+    core.REGISTRY.write_text(json.dumps({"projects": []}), encoding="utf-8")
+    try:
+        yield
+    finally:
+        core.REGISTRY = previous
+
+
 def _adapter_log(td, rows, end_newline=True, name="bridge.log.jsonl") -> Path:
     p = Path(td) / name
     text = "\n".join(r if isinstance(r, str) else json.dumps(r, ensure_ascii=False) for r in rows)
@@ -1989,7 +2005,9 @@ def _p_cred_pos():
         a = _inst(td, "a2-cred-p", {"state": "REVIEW", "turn": 2})
         a.turn_dir().mkdir(parents=True, exist_ok=True)
         (a.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["cat .env"], "directives": {}}), encoding="utf-8")
-        r = driver.h_review(_ctx(a, {"allow": [r"^cat \.env$"]}))   # 白名单放行也不行：底线“密钥”要用户批准
+        pol = {"allow": [r"^cat \.env$"]}
+        with _permission_fixture(a, pol):
+            r = driver.h_review(_ctx(a, pol))   # 白名单放行也不行：底线“密钥”要用户批准
         st = _disk(a)
         code = _find_code(asks.pending(a)) or next((x.get("code") for x in asks.pending(a) if x.get("code")), None)
         rc_a, oa = _wf_cli(a.root, "approve", "--code", code or "X-0000", "--by", "executor", "--reason", "执行端代批")
@@ -2006,7 +2024,9 @@ def _p_cred_neg():
         a = _inst(td, "a2-cred-n", {"state": "REVIEW", "turn": 2})
         a.turn_dir().mkdir(parents=True, exist_ok=True)
         (a.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["echo hi"], "directives": {}}), encoding="utf-8")
-        r = driver.h_review(_ctx(a, {"allow": [r"^echo hi$"]}))
+        pol = {"allow": [r"^echo hi$"]}
+        with _permission_fixture(a, pol):
+            r = driver.h_review(_ctx(a, pol))
         st = _disk(a)
         rv = json.loads((a.turn_dir() / "review.json").read_text(encoding="utf-8"))
     ok = st["state"] not in ("AWAITING_USER", "BLOCKED") and rv.get("accepted") is True
@@ -2020,7 +2040,9 @@ def _p_wrong_pos():
         b = _inst(td, "a2-stale", {"state": "EXECUTE", "turn": 4, "exec_binding": {"turn": 4, "tool": "0.0.0", "fp": None}})
         b.turn_dir().mkdir(parents=True, exist_ok=True)
         (b.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["echo two"], "directives": {}}), encoding="utf-8")
-        r = driver.h_execute(driver.Ctx(b, {"allow": [r"^echo two$"]}, time.time() + 120))
+        pol = {"allow": [r"^echo two$"]}
+        with _permission_fixture(b, pol):
+            r = driver.h_execute(driver.Ctx(b, pol, time.time() + 120))
         n = len(ops.list_execs(b))
         p1, p2 = _same_name_pair(td, "a2-twin")
         g1 = arbiter.acquire(p1, 1, 3600)
@@ -2112,6 +2134,154 @@ def _t_a2b_provider_contract(_ok):
             and r["ok"] and len(r["cases"]) == 2 and {c["polarity"] for c in r["cases"]} == {"pos", "neg"}
             and all(c["ran"] is True and c["ok"] is True and c["detail"] for c in r["cases"]),
             json.dumps(r, ensure_ascii=False, default=str)[:2200])
+
+
+@contextmanager
+def _permission_case(td, name, command="echo hi", pol=None, state="EXECUTE", accepted=False):
+    from . import driver
+    inst = _inst(td, name, {"state": state, "turn": 1, "exec_next": 0,
+                            "turn_flags": {"review_accepted": accepted}})
+    inst.turn_dir().mkdir(parents=True, exist_ok=True)
+    (inst.turn_dir() / "intake.json").write_text(
+        json.dumps({"commands": [command], "directives": {}}), encoding="utf-8")
+    pol = pol if pol is not None else {"allow": [r"^echo hi$"]}
+    with _permission_fixture(inst, pol):
+        yield inst, driver.Ctx(inst, pol, time.time() + 60)
+
+
+def _t_permission_consumption(_ok):
+    """B1b P1：真实 handler 消费批准字节/注册表；只用临时项目，不调用 transport。"""
+    from unittest.mock import patch
+    from . import core, driver, ops, policy
+    with tempfile.TemporaryDirectory() as td:
+        with _permission_case(td, "p1-normal", state="REVIEW") as (a, ctx):
+            review = driver.h_review(ctx)
+            rec = json.loads((a.turn_dir() / "review.json").read_text(encoding="utf-8"))
+            execute = driver.h_execute(ctx)   # 真正执行无副作用的 echo，证明正例不是全拦截。
+            _ok("B1b P1 合法空 registry + 当前批准策略：评审与真实 echo 执行通过",
+                review[0] == execute[0] == "progress" and rec["accepted"] and rec["rows"][0]["auto"]
+                and a.state["exec_next"] == 1 and len(ops.list_execs(a)) == 1,
+                str([review, execute, rec]))
+
+        for command, allowed in (("rm -rf build", True), ("rm -rf ../p1-other", False)):
+            name = "p1-clean" if allowed else "p1-cross"
+            with _permission_case(td, name, command, {"allow": [".*"], "clean_dirs": ["build"]},
+                                  state="REVIEW") as (a, ctx):
+                (a.root / "build").mkdir()
+                other = Path(td) / "p1-other"
+                other.mkdir(exist_ok=True)
+                # 同名不同根不能按名字去重；目标注册项也可以是尚未接入的普通目录。
+                core.REGISTRY.write_text(json.dumps({"projects": [
+                    {"name": a.name, "root": str(a.root)}, {"name": a.name, "root": str(other)}]}), encoding="utf-8")
+                r = driver.h_review(ctx)
+                rec = json.loads((a.turn_dir() / "review.json").read_text(encoding="utf-8"))
+                cl = rec["rows"][0]
+                a.state["state"] = "EXECUTE"
+                a.save()
+                with patch.object(ops, "run_exec", return_value=0) as run:
+                    ex = driver.h_execute(ctx)
+                _ok("B1b P1 review/execute root+others：" + ("合法 clean_dirs 放行" if allowed else "同名另一项目强门禁拒绝"),
+                    (cl["auto"] and rec["accepted"] and r[0] == ex[0] == "progress" and run.call_count == 1)
+                    if allowed else (not cl["auto"] and not rec["accepted"] and r[0] == ex[0] == "user"
+                                     and run.call_count == 0 and any(x["rule"] == "OTHER_PROJECT" for x in cl["strong"])),
+                    str([r, ex, cl]))
+
+        bad_registry = ["{broken", "[]", "{}", '{"projects": {}}', '{"projects": [null]}',
+                        '{"projects": [{"name": "x", "root": "relative"}]}',
+                        '{"projects": [{"name": "", "root": "/tmp/x"}]}', None]
+        for state in ("REVIEW", "EXECUTE"):
+            for i, text in enumerate(bad_registry):
+                with _permission_case(td, "p1-reg-%s-%d" % (state, i), state=state, accepted=True) as (a, ctx):
+                    if text is None:
+                        core.REGISTRY.unlink()
+                    else:
+                        core.REGISTRY.write_text(text, encoding="utf-8")
+                    with patch.object(ops, "run_exec", return_value=0) as run:
+                        r = driver.h_review(ctx) if state == "REVIEW" else driver.h_execute(ctx)
+                    _ok("B1b P1 %s 坏/缺 registry %d：不跳过坏行，不退回空表" % (state, i),
+                        r[0] == "user" and a.state["state"] == "AWAITING_USER" and run.call_count == 0
+                        and "注册表" in a.state.get("needs_text", "") and a.state.get("exec_next", 0) == 0,
+                        str(r))
+        with _permission_case(td, "p1-reg-io") as (a, ctx):
+            original = Path.read_text
+            def denied(path, *args, **kwargs):
+                if path == core.REGISTRY:
+                    raise PermissionError("test unreadable registry")
+                return original(path, *args, **kwargs)
+            with patch.object(Path, "read_text", denied), patch.object(ops, "run_exec", return_value=0) as run:
+                r = driver.h_execute(ctx)
+            _ok("B1b P1 registry 真实读取异常按未知归属阻断", r[0] == "user" and run.call_count == 0
+                and "注册表" in r[1], str(r))
+
+        malformed = [[], {"allow": ".*"}, {"allow": ["["]}, {"stop": [None]},
+                     {"pipe_filters": "cat"}, {"clean_dirs": {}}, {"auto_self_update": "true"}]
+        for i, pol in enumerate(malformed):
+            with _permission_case(td, "p1-pol-bad-%d" % i, pol=pol) as (a, ctx):
+                with patch.object(ops, "run_exec", return_value=0) as run:
+                    r = driver.h_execute(ctx)
+                _ok("B1b P1 已批准但配置坏 %d 仍失败关闭" % i, r[0] == "user" and run.call_count == 0
+                    and "白名单" in r[1], str(r))
+
+        for mutation in ("unapproved", "revoked", "approved_narrower", "symlink"):
+            command = "cp source target/file" if mutation == "symlink" else "echo hi"
+            with _permission_case(td, "p1-fresh-" + mutation, command, {"allow": [".*"]}, state="REVIEW") as (a, ctx):
+                if mutation == "symlink":
+                    (a.root / "inside").mkdir()
+                    (a.root / "target").symlink_to(a.root / "inside", target_is_directory=True)
+                review = driver.h_review(ctx)
+                original_save = a.save
+                fired = []
+                def save():
+                    original_save()
+                    if a.state.get("exec_inflight") and not fired:
+                        fired.append(True)
+                        if mutation == "symlink":
+                            other = Path(td) / "outside"
+                            other.mkdir(exist_ok=True)
+                            (a.root / "target").unlink()
+                            (a.root / "target").symlink_to(other, target_is_directory=True)
+                        elif mutation == "revoked":
+                            policy.approvals_path(a).write_text("{}", encoding="utf-8")
+                        else:
+                            (a.wf / "policy.json").write_text(json.dumps({"allow": ["^false$"]}), encoding="utf-8")
+                            if mutation == "approved_narrower":
+                                policy.approve(a, "policy", "test deliberate narrowing")
+                with patch.object(a, "save", save), patch.object(ops, "run_exec", return_value=0) as run:
+                    r = driver.h_execute(ctx)
+                _ok("B1b P1 review 后最终 save 期间变化 %s：紧前复核拒绝，不留假 inflight/不推进" % mutation,
+                    review[0] == "progress" and fired == [True] and r[0] == "user" and run.call_count == 0
+                    and a.state["exec_next"] == 0 and not a.state.get("exec_inflight")
+                    and a.state["state"] == "AWAITING_USER", str([review, r, a.state.get("exec_inflight")]))
+
+        for command, skip in (("wf pause", True), ("wf pause; cat .env", False), ("sudo echo hi", False)):
+            with _permission_case(td, "p1-manual-%d" % len(command), command, {"allow": [".*"]}) as (a, ctx):
+                with patch.object(ops, "run_exec", return_value=0) as run:
+                    r = driver.h_execute(ctx)
+                _ok("B1b P1 manual 不能遮住底线/strong：" + command,
+                    run.call_count == 0 and (r[0] == "progress" and a.state["exec_next"] == 1 if skip
+                                            else r[0] == "user" and a.state["exec_next"] == 0), str(r))
+
+        with _permission_case(td, "p1-review-accepted", "sudo echo hi", {"allow": [".*"]},
+                              state="REVIEW", accepted=True) as (a, ctx):
+            r = driver.h_review(ctx)
+            _ok("B1b P1 review_accepted 快捷路径不能绕过当前强门禁", r[0] == "user"
+                and a.state["state"] == "AWAITING_USER" and "强门禁" in r[1], str(r))
+
+        for command, allowed in (("echo hi", True), ("rm -rf ../other", False)):
+            with _permission_case(td, "p1-health-%s" % allowed, command, {"allow": [".*"]}, state="IDLE") as (a, ctx):
+                a.cfg["processes"] = [{"name": "service", "pidfile": "service.pid", "match": "service", "start": command}]
+                did, launched = [], []
+                original_run = subprocess.run
+                def subprocess_run(args, *args2, **kw):
+                    if args[:2] == ["bash", "-c"]:
+                        launched.append(args)
+                        return subprocess.CompletedProcess(args, 0, "ok", "")
+                    return original_run(args, *args2, **kw)
+                with patch.object(driver, "pid_alive", return_value=False), patch.object(subprocess, "run", subprocess_run):
+                    driver._health(ctx, did)
+                _ok("B1b P1 health 当前 root/策略：" + ("合法启动可达" if allowed else "跨根强门禁不启动"),
+                    (len(launched) == 1 and a.state["state"] == "IDLE") if allowed else
+                    (not launched and a.state["state"] == "AWAITING_USER"), str(did))
 
 
 # ---- 不变量 ----
@@ -2741,6 +2911,7 @@ TESTS = [
     ("B2-A2a r2 坏恢复记录", _t_a2r2_corrupt),
     ("B2-A2a GPT 意图身份校验", _t_a2gpt_intent_identity),
     ("B2-A2b 提供方契约", _t_a2b_provider_contract),
+    ("B2-A-IC-B1b P1 权限消费", _t_permission_consumption),
 ]
 
 

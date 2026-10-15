@@ -115,6 +115,13 @@ def run(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
         and "rm -rf build" in o and "不在已批准的命令白名单" in o, o)
     rc, o = _wf(env, p, "explain")
     _ok("explain 回答卡在哪、为什么、需要谁做什么", "现在：" in o and "需要：执行端" in o, o)   # 1.6.5：与 inbox 路由一致（白名单外命令先交执行端）
+    # IC-B1b-P1：批准评审不能绕过当前命令权限。先明确批准项目内清理，再继续原额度场景。
+    pp = p / "workflow" / "policy.json"
+    approved = json.loads(pp.read_text())
+    approved["allow"].append(r"^rm -rf build$")
+    approved["clean_dirs"] = ["build"]
+    pp.write_text(json.dumps(approved))
+    _user(_wf, env, p, "policy", "policy", "approve")
     (fake / "next_send_code").write_text("3")
     (fake / "replies" / "3.md").write_text(_reply(["cat done.txt"], ["done.txt 内容"],
         "发布：auto-v0.3.zip\n之后：回报\n验收 1：c1 exit=0 包含 \"ok\""), encoding="utf-8")

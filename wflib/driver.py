@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -20,7 +22,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
-from . import anomaly, fidelity, goals, machine, ops, page, policy, recovery, release, roles
+from . import anomaly, core, fidelity, goals, machine, ops, page, policy, recovery, release, roles
 from .core import (LOCAL, Instance, WfError, append_jsonl, git, now, now_iso, parse_iso, pid_alive, read_json,
                    read_jsonl, secs_since, write_json)
 from .roles import decide
@@ -40,6 +42,80 @@ class Ctx:
 
     def time_left(self):
         return self.deadline - time.time()
+
+
+class _PermissionError(WfError):
+    """当前批准策略或项目归属无法核对；不能由项目 anomaly 放行。"""
+
+
+def _permission_context(ctx):
+    inst = ctx.inst
+    try:
+        raw = (inst.wf / "policy.json").read_bytes()
+        pol = json.loads(raw)
+        if not isinstance(pol, dict):
+            raise ValueError("policy 必须是对象")
+        ps = policy.status(inst, "policy")
+        if not ps["approved"] or ps["current"] != ps["approved_sha"] \
+                or ps["current"] != hashlib.sha256(raw).hexdigest():
+            raise ValueError("policy 当前字节没有有效批准")
+        # classify 的宽松迭代不能把错类型配置（例如 allow 字符串）当成白名单。
+        for key in ("allow", "pipe_filters", "diff_stop", "clean_dirs"):
+            if key in pol and (not isinstance(pol[key], list)
+                               or any(not isinstance(x, str) for x in pol[key])):
+                raise ValueError(f"policy.{key} 必须是字符串列表")
+        stops = pol.get("stop", [])
+        if not isinstance(stops, list) or any(
+                not isinstance(s, dict) or not isinstance(s.get("pattern"), str)
+                or not isinstance(s.get("category", "项目规定"), str) for s in stops):
+            raise ValueError("policy.stop 必须是含 pattern 的对象列表")
+        for pattern in pol.get("allow", []) + pol.get("diff_stop", []) + [s["pattern"] for s in stops]:
+            re.compile(pattern)
+        for key in ("auto_apply", "auto_self_update"):
+            if key in pol and not isinstance(pol[key], bool):
+                raise ValueError(f"policy.{key} 必须是布尔值")
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, re.error) as e:
+        raise _PermissionError(f"当前白名单无法核对（{type(e).__name__}），请检查配置及批准记录") from e
+    try:
+        if inst.root.resolve(strict=True) != inst.root or not inst.root.is_dir():
+            raise ValueError("当前项目根已改变")
+        # core.read_json/load_registry 会把坏 JSON 与缺文件吞成空表，权限边界不能用它。
+        registry = json.loads(core.REGISTRY.read_text(encoding="utf-8"))
+        if not isinstance(registry, dict) or not isinstance(registry.get("projects"), list):
+            raise ValueError("registry 必须显式声明 projects 列表")
+        others = []
+        for row in registry["projects"]:
+            if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"].strip() \
+                    or not isinstance(row.get("root"), str) or "\0" in row["root"] \
+                    or not Path(row["root"]).is_absolute():
+                raise ValueError("registry 项目行无效")
+            others.append({"name": row["name"], "root": str(Path(row["root"]).resolve())})
+    except (OSError, ValueError, TypeError, RuntimeError) as e:
+        raise _PermissionError(f"注册表或项目根无法核对（{type(e).__name__}），请检查项目登记") from e
+    ctx.pol = pol
+    return pol, others
+
+
+def _classify_current(ctx, command):
+    pol, others = _permission_context(ctx)
+    try:
+        return policy.classify(command, pol, root=ctx.inst.root, others=others)
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError, re.error) as e:
+        raise _PermissionError(f"当前命令权限无法核对（{type(e).__name__}），请检查命令与配置") from e
+
+
+def _manual_only(cl):
+    return cl.get("manual") and not cl.get("strong") and cl.get("categories") == ["手动步骤"]
+
+
+def _permission_stop(ctx, why):
+    inst = ctx.inst
+    text = f"自动执行权限复核未通过：{why}"
+    machine.go(inst, "AWAITING_USER", by="driver", reason=text)
+    inst.state["needs_text"] = text
+    ops.add_note(inst, "deviation", text, by="driver")
+    inst.save()
+    return "user", text
 
 
 # ---------------- 入口 ----------------
@@ -338,7 +414,14 @@ def _health(ctx: Ctx, did: list):
         r = anomaly.match(inst, {"source": "health", "kind": "process_down"})
         limit = r.get("max", 2)
         start = proc.get("start")
-        c = policy.classify(start, ctx.pol) if start else {"auto": False, "reasons": ["没有声明 start 命令"]}
+        try:
+            c = _classify_current(ctx, start) if start else {"auto": False, "reasons": ["没有声明 start 命令"]}
+        except _PermissionError as e:
+            did.append(f"[健康] {_permission_stop(ctx, str(e))[1]}")
+            return
+        if start and not c["auto"]:
+            did.append(f"[健康] {_permission_stop(ctx, '；'.join(c['reasons']))[1]}")
+            return
         if hk[key] > limit or not c["auto"]:
             why = f"{proc['name']}不在运行，" + ("今天已自动拉起 %d 次仍失败" % limit if hk[key] > limit else "；".join(c["reasons"]))
             did.append(f"[健康] {why}")
@@ -346,6 +429,14 @@ def _health(ctx: Ctx, did: list):
             return
         d = inst.evidence / "health"
         d.mkdir(parents=True, exist_ok=True)
+        try:
+            c = _classify_current(ctx, start)
+        except _PermissionError as e:
+            did.append(f"[健康] {_permission_stop(ctx, str(e))[1]}")
+            return
+        if not c["auto"]:
+            did.append(f"[健康] {_permission_stop(ctx, '；'.join(c['reasons']))[1]}")
+            return
         r2 = subprocess.run(["bash", "-c", start], cwd=str(inst.root), capture_output=True, text=True,
                             timeout=120, env=_exec_env(inst))
         (d / f"{time.strftime('%Y%m%d-%H%M%S')}-{proc['name']}.txt").write_text(
@@ -1346,13 +1437,27 @@ def h_review(ctx):
     it = read_json(inst.turn_dir() / "intake.json", {}) or {}
     d = it.get("directives") or {}
     flags = st.setdefault("turn_flags", {})
+    try:
+        permission = _permission_context(ctx)
+        pol, others = permission
+        # 保留评审源代码的直接 classify 调用；fresh policy/registry 已在同一边界严格取得。
+        try:
+            rows = [policy.classify(c, pol, root=inst.root, others=others) for c in it.get("commands", [])]
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, RuntimeError, re.error) as e:
+            raise _PermissionError(f"当前命令权限无法核对（{type(e).__name__}），请检查命令与配置") from e
+        if _permission_context(ctx) != permission:
+            raise _PermissionError("评审期间白名单或项目登记发生变化，请重新评审")
+    except _PermissionError as e:
+        return _permission_stop(ctx, str(e))
     if flags.get("review_accepted"):
+        refused = [cl for cl in rows if not cl["auto"] and not _manual_only(cl)]
+        if refused:
+            return _permission_stop(ctx, "；".join(reason for cl in refused for reason in cl["reasons"]))
         return _after_review(ctx, it, d)
     findings = []
-    for i, c in enumerate(it.get("commands", []), 1):
-        cl = policy.classify(c, ctx.pol)
+    for i, cl in enumerate(rows, 1):
         if not cl["auto"]:
-            findings.append(f"命令 {i}「{c}」：" + "；".join(cl["reasons"]))
+            findings.append(f"命令 {i}「{cl['cmd']}」：" + "；".join(cl["reasons"]))
     rel = d.get("release")
     if rel:
         cand = [p for p in st.get("delivered", []) if Path(p).name == Path(rel).name]
@@ -1380,7 +1485,12 @@ def h_review(ctx):
         st["release_path"] = cand[0]
     blocking = _blocking_decisions(it.get("user_decisions", []))
     findings += [f"Claude 标注的前置决定：{x}" for x in blocking]
-    review_rec = {"rows": [policy.classify(c, ctx.pol) for c in it.get("commands", [])], "findings": findings,
+    try:
+        if _permission_context(ctx) != permission:
+            raise _PermissionError("评审期间白名单或项目登记发生变化，请重新评审")
+    except _PermissionError as e:
+        return _permission_stop(ctx, str(e))
+    review_rec = {"rows": rows, "findings": findings,
                   "auto": not findings, "ts": now_iso()}
     write_json(inst.turn_dir() / "review.json", {**review_rec, "need_user": len(findings),
                                                    "caution": 0, "accepted": not findings})
@@ -1646,7 +1756,6 @@ def h_execute(ctx):
         st = inst.state
     i = st.get("exec_next", 0)
     failed = False
-    timeout = d.get("timeout") or ctx.pol.get("command_timeout_s", 900)
     while i < len(cmds):
         if ctx.time_left() <= 0:
             return "progress", f"已执行到第 {i} 条，本次时间用完，下次继续"
@@ -1663,7 +1772,13 @@ def h_execute(ctx):
             machine.go(inst, "VERIFY", by="driver", reason="计划已过时，停止执行（W77）")
             return "progress", f"计划已过时（{stale}），第 {i + 1} 条起不再执行"
         st = inst.state
-        if policy.classify(cmds[i], ctx.pol).get("manual"):
+        try:
+            cl = _classify_current(ctx, cmds[i])
+        except _PermissionError as e:
+            return _permission_stop(ctx, str(e))
+        if not cl["auto"] and not _manual_only(cl):
+            return _permission_stop(ctx, "；".join(cl["reasons"]))
+        if _manual_only(cl):
             ops.add_note(inst, "info", f"第 {i + 1} 条「{cmds[i]}」是手动步骤，驱动器未执行（F21）", by="driver")
             decide(inst, "exec", f"跳过第 {i + 1} 条：{cmds[i]}", "会改变工作流状态的 wf 命令只能在驱动器之外手动执行", "", "已跳过")
             i += 1
@@ -1677,6 +1792,14 @@ def h_execute(ctx):
             inst.state.pop("exec_inflight", None)
             inst.save()
             return "user", f"已暂停：第 {i + 1} 条命令启动前停下，恢复后从这里继续（{inst.state['paused'].get('note') or ''}）"
+        try:
+            cl = _classify_current(ctx, cmds[i])
+            if not cl["auto"]:
+                raise _PermissionError("；".join(cl["reasons"]))
+        except _PermissionError as e:
+            inst.state.pop("exec_inflight", None)   # 本次命令尚未启动，不能误记为中断或跳过
+            return _permission_stop(ctx, str(e))
+        timeout = d.get("timeout") or ctx.pol.get("command_timeout_s", 900)
         rc = ops.run_exec(inst, cmds[i], label=f"#{i + 1}", timeout=timeout, by="driver")
         st = inst.state
         st.pop("exec_inflight", None)
