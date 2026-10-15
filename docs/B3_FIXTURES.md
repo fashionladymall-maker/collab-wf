@@ -111,7 +111,7 @@ TEMP、TMP 和 `tempfile.tempdir` 缓存），结束后恢复。原因：在 mac
 | S04a-quota-blocked-valid-episode | 行为 | BLOCKED，带合法的 quota 恢复期（轮次 49） | 恢复期合法 | `recovery._check` |
 | S04b-quota-blocked-corrupt-episode | 行为 | deadline 超出 8 天窗口 | 恢复期被拒 | `recovery._check` |
 | S05-dirty-variants | 行为 | 修改、删除、未跟踪、密钥形态、受保护、被忽略 | 只列出非受保护的改动；密钥形态被标出 | `release._dirty`、`sync._scan_text` |
-| S06-legacy-live-collection-v2 | 布局 | live-collection/2 记录与 B1 两键绑定 | 必须重新采集、不得授予 | 无（下一卡 FX-S06） |
+| S06-legacy-live-collection-v2 | 布局（默认 S 层） | live-collection/2 记录与 B1 两键绑定的文件形态 | 必须重新采集、不得授予 | S 层仍只是布局；行为覆盖见 FX-S06（`build_live_v2`，B 层，`wflib/selftest_b3_s06.py`） |
 | S07a–e-install-tx-* | 行为（锁扫描） | prepared-only、failed、partial、身份不符、hash 篡改；结构夹具，不带 baseline | 锁扫描依次拒绝、放行、拒绝、拒绝、拒绝 | `release._InstallLock._check_incomplete`、`_read_record` |
 | S08-rollback-target-missing | 行为 | 有 v0.1 标签，安装库为空（0700） | `rollback_target_unverified`，HEAD 不变 | `release.rollback` |
 | S09a-events-truncated | 行为 | 最后一条事件被截断 | corrupt | `live._strict_log` |
@@ -197,19 +197,70 @@ python3 -m wflib.selftest_b3_fixtures
 
 ## 下一张小卡
 
-### FX-S06：旧版实景记录的行为夹具（C 线；前置：PR33 中 G1 的改动合入）
+### FX-S06：旧版实景记录的行为夹具（已实现：B3-MAIN-FX-S06-20261016-2）
 
-**范围：** 只把 S06 从"布局"升级为"行为"，不扩展到别的场景。
+**范围：** 只把 S06 从"布局"补上"行为"，默认的 S 层 S06 仍是布局，不被说成已执行行为覆盖。实现 parent 为
+`13b63ca69b9cb39cbc9634cac4cdaab5fdb0d111`（tree `5bdd77ceee44b7fd85451f8997c7f7bed0b60ed6`），不改 goals、live、
+selftest_c5_trust、C5_HISTORY 或任何消费者 API。
 
-**需要的接口：**
-1. 生成侧：新增 `b3_fixtures.build_live_v2(root, *, legacy_tool_root)`。由调用方提供一份已解出的 b523be4 工具树，生成器在隔离子进程中用这份旧代码执行 `goals.run_checks`，产出真实的 live-collection/2 记录和 B1 两键记录。生成器自己不拉取代码，不访问网络。
-2. 消费侧：C 线提供一个只读、稳定的入口，例如 `goals.live_record_status(inst, goal_id) -> {valid, state, layer, why}`。在入口提供之前，测试只能调用私有的 `_live_binding_valid`，因此需要像 FX-R 一样钉住它的签名。
-3. 读取前先调用 `verify(root)`，确认夹具没有被改动。
+**语义裁决（2026-10-16）：** 原文"/2 与 B1 都 unsupported"澄清为：两种历史记录都不可授权、层级不超过 mechanical_pass、
+verified 计数为 0、必须重新采集；精确保留当前实际状态 **/2 = changed、B1 = unsupported**。依据：
 
-**验收标准：**
-- /2 记录与 B1 记录的层级都不超过 mechanical_pass，状态为 unsupported，永远不会出现 verified；
-- 在同一夹具内对 /3 重新采集，结果必须受 G1 的生产信任登记约束：合成来源不会被授予；
-- 篡改负例被拒绝。
+- 当前消费者 `_live_binding_valid` 把 live-collection/2 与 /3 都列为严格 schema；只有没有 schema 的记录在第一道检查即判
+  unsupported（"缺少完整严格输入闭包，必须重新采集"）。b523 原产的 /2 记录带完整输入闭包，因此被复核，复核发现窗口输入
+  与记录不同，判 changed。这是准确事实，不是授权漏洞。
+- /2 走非 modern 分支：`granted` 必须为 False、两处 authorization 必须为 unavailable，否则 corrupt，因此不可能被授予。
+- changed 是结构性的：当前采集器重新发现的描述比 b523 多出 `trust_inputs`，`sources`（11→88）、`directories`（1→18）、
+  `git`（11→13）、`review_inputs`（2→6）与 `complete` 都不同。不重新采集，b523 的 /2 永远不会回到 stable。
+- 改判 /2 为 unsupported 需要改 C 线的 goals.py，且没有安全收益，本卡不做；如需改，应由主代理另派 C owner 任务。
+
+**生成侧：**
+- `build_live_v2(root, *, legacy_tool_root)`：调用方提供已准备好的 b523be4 普通完整 Git checkout；生成器不 fetch、不联网。
+  先核对旧树（绝对规范路径、非 shallow、HEAD/tree、无已跟踪/未跟踪/忽略文件、`wflib/goals.py`/`live.py` 的 SHA256），
+  再核对 `S06_INTERFACES` 中 22 个静态指纹（6 个产品接口 + 所复用的 C/B scaffold 入口；签名含行尾 LF，定义为
+  `ast.get_source_segment`），任一不符在任何写入或子进程之前拒绝，不静默刷新。
+- 一个当前代码的隔离子进程用 C 的 marked scaffold（`MarkedSyntheticTests`：两次真实受保护安装、显式 synthetic 的
+  runner/verifier）建项目，并在另一个只导入旧源码的解释器中对**同一项目**真实执行旧 `goals.run_checks`，再让旧消费者
+  （旧 `progress`）读一次。结果、summary、binding、evidence hash、granted 都由旧 producer 原样写出，没有模板或回填。
+- B1 走内部 `_build_live_b1(root, *, legacy_b1_root)`，改用 6b21d10 源码；不新增公开 API。
+- 隔离：HOME、TMPDIR、LOCAL、scaffold 的临时目录都在夹具根内；`GIT_CONFIG_NOSYSTEM=1`、全局 Git 配置为空、
+  `GIT_OPTIONAL_LOCKS=0`（旧 producer 对旧树的 git status 不刷新其 index）、`WF_NOTIFY=0`、不写 pyc；PATH 上的
+  python3 就是 `sys.executable`；每个子进程独立会话，超时与结束后杀整个进程组。这是进程级隔离，不是 OS 沙箱。
+- 夹具标记为 B 层：`synthetic=true`、`not_production_evidence=true`、`authorization=none`、`byte_reproducible=false`，
+  带真实时钟、nonce、根路径与文件身份；manifest 记录文件字节、mode、目录与 Git HEAD，供 `verify(root)` 使用。
+
+**消费侧：** 没有稳定的 `goals.live_record_status`，不擅自新增。读取通过内部 `_s06_consume`：默认先 `verify(root)`，
+失败即拒绝读取；在一个新的隔离进程里按 `S06_CONTEXT.json` 重建 scaffold 的进程上下文（LOCAL 来自 WF_LOCAL_DIR，
+`core.WF_HOME`、`goals._TOOL_ROOT`、`review._tool_home` 指向 scaffold 工具，actor 为 driver；对应的 setUp 已在
+指纹内），同时读公开的 `progress` 与已钉住的 `_live_binding_valid`，并核对读取前后字节不变。每次读取都是新进程，没有缓存。
+
+**验收矩阵（真实运行，`wflib/selftest_b3_s06.py`）：**
+
+| 记录 | 来源 | 当前消费者 | 层级 | 授权 | verified 计数 |
+|---|---|---|---|---|---|
+| /2 | b523 原产；旧消费者 stable valid | changed（window_inputs） | mechanical_pass | unavailable | 0 |
+| B1 | 6b21 原产；外层两键、verified 无 schema | unsupported | mechanical_pass | unavailable | 0 |
+| /3 | 同一项目当前重采；passed_strict、history complete+synthetic | stable valid | mechanical_pass | unavailable（`production_trust_transport_synthetic`） | 0 |
+
+| 篡改 | 拒绝来自 |
+|---|---|
+| /2 live 证据字节 | `verify` 指出该文件；绕过 verify 时窗口输入复核判 changed |
+| /2 自报 granted | `verify` 指出 goals_state；绕过 verify 时绑定检查判 corrupt |
+| /3 证据字节 | 证据完整性判 corrupt |
+| /3 自报 granted | 重新评价判 corrupt |
+| /3 改内容并重算自洽 hash | 冻结采集比对判 corrupt |
+
+恢复原字节与 mode 后在新进程重读：/2 仍是 changed，/3 回到 stable。重采会改写已存结果，因此之后 `verify(root)` 如实报告
+差异。另有前置拒绝：shallow、dirty、未跟踪文件、错误 commit、相对路径、不存在的路径和接口漂移都在任何子进程之前拒绝，
+夹具根不被创建。
+
+**运行方式：** 调用方先准备两份完整 checkout（例如 `git init` 后 `git fetch --no-tags <repo> <commit>` 再
+`checkout --detach FETCH_HEAD`），然后
+`B3_S06_LEGACY_V2=<b523 checkout> B3_S06_LEGACY_B1=<6b21 checkout> python3 -m unittest -v wflib.selftest_b3_s06`。
+缺少任一材料时明确报错，不跳过、不算通过。本测试不登记进总聚合。
+
+**不覆盖：** 生产证据与授权；macOS 运行（待协调端在目标机执行）；夹具字节可复现；C/B scaffold 中未列入指纹的更深层
+辅助代码（其漂移会让行为断言失败，而不是静默通过）。合成 L0/L1 证据，不替代 L4。
 
 ### FX-TX：完整安装事务链的行为夹具（B 线主导、C 线协助；前置：C-TX1 合入）
 

@@ -31,9 +31,11 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
 
 SCHEMA = "b3-fixture/2"                     # /2: manifest records directories and their modes
@@ -827,6 +829,405 @@ def verify(root) -> dict:
         if found:
             problems[sd.name] = found
     return problems
+
+
+# ---------------------------------------------------------------- FX-S06: legacy live records, real producers
+#
+# Tier B ("behaviour"). Stored results come from the real historical goals.run_checks, run in an isolated
+# interpreter that imports only the historical source tree the caller supplies; the inputs (project, two
+# real protected installs, marked synthetic runner/verifier) come from C's marked scaffold in another
+# isolated interpreter. Nothing here fetches code or uses the network. Real clock, nonces, roots and file
+# identities: synthetic, not production evidence, authorization none, not byte reproducible.
+#
+# Ruling (2026-10-16, FX-S06): the current consumer reads a b523-produced live-collection/2 record as
+# "changed" (re-discovered window inputs differ from the recorded descriptor) and a 6b21-produced B1 record
+# as "unsupported" (no strict schema). Both are kept exactly; the hard requirements are: never granted,
+# layer at most mechanical_pass, verified count 0, recollection required.
+
+S06_V2_ID = "S06-legacy-live-v2-behaviour"
+S06_B1_ID = "S06-legacy-b1-behaviour"
+S06_CONTEXT = "S06_CONTEXT.json"
+S06_PRODUCER = "S06_PRODUCER.json"
+S06_BUILD_TIMEOUT_S = 300
+S06_CONSUMER_TIMEOUT_S = 180
+LEGACY_PRODUCERS = {
+    "live-collection/2": {"scenario": S06_V2_ID, "commit": "b523be470cd3252cd72210bf04cad8b76f62aa15",
+                          "tree": "0d4ce5ad6c7f0e0c63b0c8aa7202fd2fc16ae753",
+                          "files": {"wflib/goals.py": "722d67f9af5f0262c8f3ddddfe5f7d7b3eafcdfb00f56fe1accadfa25a2e86f8",
+                                    "wflib/live.py": "cfd771d069e540a8685599b18d6d6dd5c1571d7a1055394b9318edcaa225ced6"}},
+    "B1": {"scenario": S06_B1_ID, "commit": "6b21d10ca0e6ede8566707150bd5e8793cd84df2",
+           "tree": "ef232ff6affcb65260c32c6f4f994997f82c8efa",
+           "files": {"wflib/goals.py": "8ab96b1698d0b3619726d2ddd3c1fcc6f838807842406d5f0e465533d5323343",
+                     "wflib/live.py": "15c1f6b388768bc5ee5506a7e5d734717a41cc14f5d152938c49fcf42e5ffea9"}},
+}
+# "<file>::<qualified name>": (sha256 of the definition line incl. its LF, sha256 of ast.get_source_segment).
+# Six product interfaces plus the C/B scaffold entry points this fixture reuses read-only. Drift fails
+# closed and requires review; never refresh these silently.
+S06_INTERFACES = {
+    "wflib/goals.py::run_checks": ("b7e42e5afde14b4afd61335d26045b8cd4c4f4f12079192043e6c76a8ab98960",
+                                     "6872bbe563ea27d23506cc3b36de0b9a8fec782d1a1ab383b93f18721dd381fe"),
+    "wflib/goals.py::progress": ("932bc58ed0a51d23723357cb77873073eb75f02db51dfacfb87002ab2d3d0a9a",
+                                   "4847704e9ffb123e2d40af5a1cb5bad39f62fb94f63b80a2313f73934a4bc9f8"),
+    "wflib/goals.py::_live_binding_valid": ("7c4b8274845819c5cbf963feec8d054a0a3017c7514bbc50ba7dd9202f49a2c5",
+                                              "6ddfa762f6680aba7d56eabe0044f417141c22019a3f9a6a477971a25b8703e1"),
+    "wflib/live.py::_capture_inputs": ("04b9148e0b43532757f82f9f8d3550bc044af262e05929e8fd8c94e079347026",
+                                         "54d7ba2345a61a41e7f3b657ad36ab6d16c36fdefe3368800f9616edc6bf91e7"),
+    "wflib/live.py::_evaluate_snapshot": ("9d88f1efd949621e61b6857b5b026b0eda0cc1049d44aa0cbb4a81bac7f75bf6",
+                                            "7b2ed444bece40ebc83a68043bbcf82b7948edb62ebc95c2857041447ef44e11"),
+    "wflib/live.py::_revalidate_inputs": ("1da1c5b92dc7f755d34f5510d3823c836be52410fb2e70fe552a24fe3f4764da",
+                                            "41df4840441206ac0b92bde65f10ea4a41c10b0182e1dd7637577d35847f8031"),
+    "wflib/selftest_c5_trust.py::GOAL": ("3976a675693a8cffedbc2dbb39f0b29b79ed61d6bf83b0a9bbe89deaf4650a8d",
+                                           "38b2dff20e44552002ee227b8c333054d21c34cc94f876cb00985e8980b08598"),
+    "wflib/selftest_c5_trust.py::_Fixture.setUp": ("5633cdc4c4390f410989220889cd1c01cdbc2bc61552dadcf21a018475914fe5",
+                                                     "b5d9d324a6ac2c5b63ffad23b1257c07e7cdd53dbd7f2a0d12707cc576d4b6eb"),
+    "wflib/selftest_c5_trust.py::_Fixture.registration": ("9c0d7ef7f7bb0655e2c14ac3cbd6c7a84372b7f0fcfa8b5856cd077aa096eefd",
+                                                            "c13b579b4298011651bc1488b99587e45af47653009078a5e11d8002e4624537"),
+    "wflib/selftest_c5_trust.py::_Fixture.write_registry": ("03cb655dac1dab9900b528c4f8bcce8428dd184dfe7586f06515211da0adede6",
+                                                              "787c0bffe8ec3ced3ef15eec5344204d5f42ab3af989b92c9b1094026a75f6a3"),
+    "wflib/selftest_c5_trust.py::_Fixture.evaluate": ("dab5298e412ae387ec4b57c96935da75dc2a169147ba9ca1a99d32306e409d25",
+                                                        "5dc6a72b4cea6501dcb362396a1bd689a728b00e75447fdff980ba45de838829"),
+    "wflib/selftest_c5_trust.py::_Fixture.run_goal": ("9aafdf5290ca49588f0aacef91988080066f83d8661274452cf9119f8ee06e38",
+                                                        "0a36c1fce8cfe2a88fcfbf0f03a9314b184d39feb4e17c8854f346295196bc4e"),
+    "wflib/selftest_c5_trust.py::_Fixture.stored": ("3ea2c928b7e63fad88ea0d907637a2e23ee7c7c7716ebfedfe4ff1e740d7048a",
+                                                      "1c1cc1747c983e118bf551bc9988ca367549dab84abd235bbda92f39d896b784"),
+    "wflib/selftest_c5_trust.py::_Fixture.item": ("7d1dce53ec35eb91f0312820038222498b2096540e81bbeccee5e6aa0203d959",
+                                                    "80e65e1c2c89444bd15956e6387150da2f56cac685eb74593977b479b2d9ce25"),
+    "wflib/selftest_c5_trust.py::MarkedSyntheticTests": ("7eb45b6d553e1c90a996a00e6939a8db51929e8a4cc4589a3c13f32d99cb8a72",
+                                                           "12869212694a21fb24e536cf730ed9f6d49a4048876fc3dc606ef8a804e2e93a"),
+    "wflib/selftest_c5_integration.py::C5IntegrationTests.setUp": ("5633cdc4c4390f410989220889cd1c01cdbc2bc61552dadcf21a018475914fe5",
+                                                                     "3450270cf7ffa7e4ba2f1a4ea00e67a073c9754b379083decb2f49365ecf043f"),
+    "wflib/selftest_c5_integration.py::C5IntegrationTests.fixture": ("998368862be2d20fc4549bdf7d2790d5655d5ae4c455b975361651858936c516",
+                                                                       "846d21f65f7ea940e0f910a5e54a511b89315c9bc5ee19e63f0b104d36825ee7"),
+    "wflib/selftest_install_history.py::HistoryTests.setUp": ("5633cdc4c4390f410989220889cd1c01cdbc2bc61552dadcf21a018475914fe5",
+                                                                "2e19223649b0b828d87b5f82253c4d4e789aa936c0bd57d80a4d7a3c01befadb"),
+    "wflib/selftest_install_history.py::HistoryTests.chain": ("e773a8a46ce3473b00d1eff288f186592fe18cb1bf0ead5bc8e12ad6bc29b8e1",
+                                                                "44ec42476156201e2061db93c03fc46a68e3645ce7a079d45a5b4886e749fb24"),
+    "wflib/selftest_install_commit.py::InstallCommitTests.setUp": ("5633cdc4c4390f410989220889cd1c01cdbc2bc61552dadcf21a018475914fe5",
+                                                                     "f0c1433c25e6bb68f314308550647ca79d275c30cd09f67da271183715b3d697"),
+    "wflib/selftest_install_commit.py::InstallCommitTests.project": ("570d29532b431628f1c3ee2884fed9f2db70ea8f2fb39f6e30a0475220371050",
+                                                                       "aed4360db6973ccdbf78dc8f3677ff9cb486d40e7cc05333953c123eb098f39f"),
+    "wflib/selftest_install_commit.py::InstallCommitTests.approved": ("6a87ea5f31e939a72341448c6cc29db0bac3c12753c007bf21794b8af494370b",
+                                                                        "be58d5dfbecfbe84966a9b1c59667b831835208b421ba452aeeba991bb7aaa82"),
+}
+# Process context that C5IntegrationTests.setUp / InstallCommitTests.setUp establish and that a later
+# consumer process re-establishes (both setUps are pinned above): LOCAL, REGISTRY, anomaly/live LOCAL come
+# from WF_LOCAL_DIR; WF_HOME, goals._TOOL_ROOT and review._tool_home point at the scaffold tool; actor driver.
+S06_CONTEXT_PATCHES = ("core.WF_HOME", "goals._TOOL_ROOT", "review._tool_home", "core.ACTOR.actor")
+
+
+def _pin_of(src: str, qual: str):
+    import ast
+    tree = ast.parse(src)
+    lines = src.splitlines(keepends=True)
+    body, node = tree.body, None
+    for part in qual.split("."):
+        node = next((n for n in body if (isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == part)
+                     or (isinstance(n, ast.Assign) and any(getattr(t, "id", None) == part for t in n.targets))), None)
+        if node is None:
+            return None
+        body = getattr(node, "body", [])
+    sha = lambda s: hashlib.sha256(s.encode("utf-8")).hexdigest()
+    return (sha(lines[node.lineno - 1]), sha(ast.get_source_segment(src, node)))
+
+
+def _s06_interface_problems(tool_root=None, sources=None) -> list:
+    """Static fingerprint of every interface the S06 fixture produces against or reads through."""
+    base = Path(tool_root) if tool_root else _TOOL_ROOT
+    problems, cache = [], dict(sources or {})
+    for key, want in S06_INTERFACES.items():
+        path, qual = key.split("::")
+        if path not in cache:
+            try:
+                cache[path] = (base / path).read_text(encoding="utf-8")
+            except OSError as e:
+                problems.append(f"{key}: unreadable ({e.__class__.__name__})")
+                continue
+        got = _pin_of(cache[path], qual)
+        if got is None:
+            problems.append(f"{key}: missing")
+        elif tuple(got) != tuple(want):
+            problems.append(f"{key}: " + ("signature" if got[0] != want[0] else "definition") + " changed")
+    return problems
+
+
+def _legacy_tree_problems(path, pin) -> list:
+    """The caller-prepared historical tree: an ordinary full Git checkout of exactly the pinned commit."""
+    p = Path(path)
+    if not p.is_absolute() or str(Path(os.path.realpath(str(p)))) != str(p):
+        return ["legacy tool root must be an absolute, fully resolved path"]
+    if not (p / ".git").is_dir() or os.path.islink(str(p / ".git")):
+        return ["legacy tool root must be an ordinary Git checkout with a .git directory"]
+    if p == _TOOL_ROOT or _TOOL_ROOT in p.parents or p in _TOOL_ROOT.parents:
+        return ["legacy tool root overlaps the current tool checkout"]
+    found = []
+    try:
+        if _git(p, p, "rev-parse", "--is-shallow-repository") != "false":
+            found.append("legacy checkout is shallow (old _git_inputs refuses shallow repositories)")
+        if _git(p, p, "rev-parse", "HEAD") != pin["commit"]:
+            found.append("legacy HEAD is not " + pin["commit"])
+        if _git(p, p, "rev-parse", "HEAD^{tree}") != pin["tree"]:
+            found.append("legacy tree is not " + pin["tree"])
+        if _git(p, p, "status", "--porcelain", "--untracked-files=all", "--ignored"):
+            found.append("legacy checkout is not clean (tracked, untracked or ignored files)")
+    except (RuntimeError, OSError) as e:
+        return [f"legacy checkout unreadable by git: {e}"]
+    for rel, want in pin["files"].items():
+        f = p / rel
+        if not f.is_file() or hashlib.sha256(f.read_bytes()).hexdigest() != want:
+            found.append(f"{rel} does not match its pinned sha256")
+    return found
+
+
+def _run_child(argv, *, cwd, env, timeout) -> dict:
+    """Own session; on timeout and after exit the whole process group is killed."""
+    t0 = time.time()
+    p = subprocess.Popen([str(a) for a in argv], cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        rc = None
+        os.killpg(p.pid, signal.SIGKILL)
+        out, err = p.communicate()
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    return {"argv": [str(a) for a in argv[:2]] + ["<source>"] + [str(a) for a in argv[3:]] if len(argv) > 2 and argv[1] == "-c"
+            else [str(a) for a in argv], "cwd": str(cwd), "rc": rc, "timed_out": rc is None,
+            "seconds": round(time.time() - t0, 2), "stdout": out.decode("utf-8", "replace"),
+            "stderr": err.decode("utf-8", "replace")}
+
+
+def _s06_env(sd: Path, bindir: Path, *, local: str, tool_path: bool) -> dict:
+    env = {"PATH": os.pathsep.join([str(bindir), "/usr/bin", "/bin"]), "HOME": str(sd / "home"),
+           "TMPDIR": str(sd / "tmp"), "WF_LOCAL_DIR": local, "WF_NOTIFY": "0", "PYTHONDONTWRITEBYTECODE": "1",
+           "LC_ALL": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}   # the old producer's git status never refreshes the legacy index
+    if tool_path:
+        env["PYTHONPATH"] = str(_TOOL_ROOT)
+    return env
+
+
+# Historical producer: imports only the caller's legacy tree, runs its real run_checks, then lets the
+# historical consumer (its own progress) read the result once. Inputs are not modified by this program.
+_S06_LEGACY_PRODUCER = r"""import json, sys
+from pathlib import Path
+LEGACY, PROJECT = sys.argv[1], sys.argv[2]
+sys.path.insert(0, LEGACY)
+import wflib
+if Path(wflib.__file__).resolve().parent != Path(LEGACY) / "wflib":
+    raise SystemExit("legacy import resolved elsewhere: " + str(wflib.__file__))
+from wflib import core, goals
+inst = core.Instance(Path(PROJECT))
+goals.run_checks(inst, timeout=15, by="test")
+records = core.read_json(inst.wf / "goals_state.json")
+old = goals.progress(core.Instance(inst.root))
+print(json.dumps({"wflib": str(Path(wflib.__file__).resolve().parent), "records": records,
+                  "old_items": old["items"], "old_counts": old.get("counts")}, ensure_ascii=False))
+"""
+
+# Scaffold builder (current code): C's marked synthetic scaffold, then the historical producer in its own
+# interpreter on that same project. os._exit keeps the scaffold: TemporaryDirectory finalizers must not run.
+_S06_BUILD_CHILD = r"""import json, os, subprocess, sys, time
+from pathlib import Path
+SD, LEGACY, PRODUCER = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+from wflib import core, goals, policy
+from wflib.selftest_c5_trust import GOAL, MarkedSyntheticTests
+t = MarkedSyntheticTests("test_marked_fixture_cannot_be_registered_into_production")
+t.setUp()
+inst = t.fixture()
+t.write_registry(t.registration())
+core.write_json(inst.wf / "goals.json", {"goals": [GOAL]})
+policy.approve(inst, "goals", "B3 FX-S06 synthetic fixture", by="test")
+env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+env["WF_LOCAL_DIR"] = str(core.LOCAL)
+t0 = time.time()
+r = subprocess.run([sys.executable, "-c", PRODUCER, LEGACY, str(inst.root)], cwd=str(inst.root), env=env,
+                   capture_output=True, timeout=240, start_new_session=True)
+out = {"context": {"base": str(t.base), "project": str(inst.root), "local": str(core.LOCAL), "tool": str(t.env.tool),
+                   "registry": str(t.registry), "goal_id": GOAL["id"], "patches": ["core.WF_HOME", "goals._TOOL_ROOT",
+                   "review._tool_home", "core.ACTOR.actor"]},
+       "producer": {"argv": [sys.executable, "-c", "<_S06_LEGACY_PRODUCER>", LEGACY, str(inst.root)],
+                    "cwd": str(inst.root), "env_keys": sorted(env), "rc": r.returncode,
+                    "seconds": round(time.time() - t0, 2), "stderr_tail": r.stderr.decode("utf-8", "replace")[-1500:]}}
+if r.returncode == 0:
+    out["producer"]["result"] = json.loads(r.stdout.decode("utf-8").strip().splitlines()[-1])
+sys.stdout.write(json.dumps(out, ensure_ascii=False) + "\n")
+sys.stdout.flush()
+os._exit(0 if r.returncode == 0 else 4)
+"""
+
+# Current consumer in a fresh process (no cache across calls): re-establishes exactly the pinned context.
+_S06_CONSUMER_CHILD = r"""import hashlib, json, os, sys
+from pathlib import Path
+ctx = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+action = sys.argv[2]
+from wflib import anomaly, core, goals, live, policy, review
+if str(core.LOCAL) != ctx["local"] or str(anomaly.LOCAL) != ctx["local"] or str(live.LOCAL) != ctx["local"]:
+    raise SystemExit("context LOCAL mismatch")
+tool = Path(ctx["tool"])
+core.WF_HOME = tool
+goals._TOOL_ROOT = tool
+review._tool_home = lambda: tool
+core.ACTOR["actor"] = "driver"
+root = Path(ctx["project"])
+
+def inventory():
+    out = {}
+    for d, dirs, files in os.walk(ctx["base"]):
+        dirs[:] = sorted(x for x in dirs if x != ".git")
+        for f in files:
+            p = Path(d) / f
+            out[str(p.relative_to(ctx["base"]))] = [hashlib.sha256(p.read_bytes()).hexdigest(), oct(p.stat().st_mode & 0o7777)]
+    return out
+
+def delta(old, new):
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return {"comparable": False}
+    keys = sorted(set(old) | set(new))
+    out = {"keys_only_recorded": sorted(set(old) - set(new)), "keys_only_current": sorted(set(new) - set(old)),
+           "changed_keys": [k for k in keys if k in old and k in new and old[k] != new[k]]}
+    out["changed_sizes"] = {k: [len(old[k]) if isinstance(old[k], (list, dict)) else None,
+                                len(new[k]) if isinstance(new[k], (list, dict)) else None] for k in out["changed_keys"]}
+    return out
+
+def read():
+    inst = core.Instance(root)
+    g = goals.load(inst)
+    st = policy.status(inst, "goals")
+    records = goals._result_state(inst)
+    x = next(x for x in g["goals"] if x["id"] == ctx["goal_id"])
+    r = records.get(x["id"]) or {}
+    direct = goals._live_binding_valid(inst, r, x, st, {})
+    p = goals.progress(core.Instance(root))
+    item = next(i for i in p["items"] if i["id"] == ctx["goal_id"])
+    v = r.get("verified") if isinstance(r.get("verified"), dict) else {}
+    b = v.get("binding") if isinstance(v.get("binding"), dict) else {}
+    c = v.get("collection") if isinstance(v.get("collection"), dict) else {}
+    out = {"record": {"outer_binding_keys": sorted(r.get("binding") or {}), "outer_schema": (r.get("binding") or {}).get("schema"),
+                      "verified_binding_keys": sorted(b), "verified_schema": b.get("schema"),
+                      "collection_state": c.get("state"), "granted": v.get("granted")},
+           "direct": direct, "item": {k: item.get(k) for k in ("ok", "layer", "layer_why", "collection")},
+           "counts": p.get("counts"), "verified_count": (p.get("counts") or {}).get("verified")}
+    desc = c.get("window_inputs")
+    if b.get("schema") == "live-collection/2" and isinstance(desc, dict):
+        try:
+            snap = live._capture_inputs(core.Instance(root), rounds=desc["parameters"]["rounds"],
+                                        budget_s=desc["parameters"]["budget_s"], output_contract=desc["output_contract"])
+            out["descriptor_delta"] = delta(desc, snap.descriptor)
+        except Exception as e:   # recorded, not hidden
+            out["descriptor_delta"] = {"capture_error": type(e).__name__ + ": " + str(e)[:300]}
+    return out
+
+if action == "read":
+    before = inventory()
+    out = read()
+    out["consumer_bytes_unchanged"] = inventory() == before
+elif action == "recollect":   # C's run_goal, on the same project
+    from wflib.selftest_c5_trust import GOAL
+    inst = core.Instance(root)
+    core.write_json(inst.wf / "goals.json", {"goals": [GOAL]})
+    policy.approve(inst, "goals", "B3 FX-S06 recollection on the same synthetic project", by="test")
+    goals.run_checks(inst, by="test")
+    out = read()
+    ev = live._evaluate_snapshot(live._capture_inputs(core.Instance(root), rounds=1))
+    out["evaluation"] = {"passed_strict": ev["report"]["summary"]["passed_strict"],
+                         "history": {k: ev["history_authorization"].get(k) for k in ("complete", "synthetic", "why")},
+                         "production_trust": {k: ev["production_trust"].get(k) for k in ("granted", "why")},
+                         "authorization": ev["authorization"], "reason": ev.get("reason")}
+else:
+    raise SystemExit("unknown action " + action)
+print(json.dumps(out, ensure_ascii=False))
+"""
+
+
+def _build_s06(root, *, legacy_root, producer: str) -> dict:
+    pin = LEGACY_PRODUCERS[producer]
+    found = _legacy_tree_problems(legacy_root, pin)
+    if found:
+        raise FixtureRefused("legacy producer tree refused: " + "; ".join(found))
+    drift = _s06_interface_problems()
+    if drift:
+        raise FixtureRefused("S06 interface drift: " + "; ".join(drift)
+                             + ". Re-review the producer/consumer contract, then update S06_INTERFACES.")
+    legacy = Path(legacy_root)
+    root = _guard_root(root)
+    if legacy == root or legacy in root.parents or root in legacy.parents:
+        raise FixtureRefused("fixture root and legacy tool root must not contain each other")
+    w = _Writer(root)
+    w.write(MARKER, MARKER_TEXT)
+    bindir = w.mkdir("runtime-bin")
+    os.symlink(sys.executable, str(bindir / "python3"))   # python3 on PATH is this interpreter (outside scenarios)
+    sid = pin["scenario"]
+    sd = w.mkdir(sid)
+    for d in ("home", "tmp", "unused-local"):
+        w.mkdir(f"{sid}/{d}")
+    w.write(f"{sid}/{MARKER}", MARKER_TEXT)
+    env = _s06_env(sd, bindir, local=str(sd / "unused-local"), tool_path=True)
+    run = _run_child([sys.executable, "-c", _S06_BUILD_CHILD, str(sd), str(legacy), _S06_LEGACY_PRODUCER],
+                     cwd=sd, env=env, timeout=S06_BUILD_TIMEOUT_S)
+    if run["rc"] != 0:
+        raise RuntimeError(f"S06 {producer} build failed rc={run['rc']}: {run['stderr'][-1500:]} {run['stdout'][-500:]}")
+    built = json.loads(run["stdout"].strip().splitlines()[-1])
+    after = _legacy_tree_problems(legacy_root, pin)
+    if after:
+        raise RuntimeError("legacy tree changed during production: " + "; ".join(after))
+    provenance = {"producer": producer, "pin": pin, "interpreter": {"executable": sys.executable,
+                  "version": sys.version.split()[0]}, "build_child": {k: run[k] for k in ("argv", "cwd", "rc", "seconds")},
+                  "build_env": env, "producer_run": {k: v for k, v in built["producer"].items() if k != "result"}}
+    w.write(f"{sid}/{S06_CONTEXT}", _doc(built["context"]))
+    w.write(f"{sid}/{S06_PRODUCER}", _doc({"provenance": provenance, "result": built["producer"]["result"]}))
+    doc = {"schema": SCHEMA, "synthetic": True, "not_production_evidence": True, "authorization": "none",
+           "generator": GENERATOR, "clock": "real clock (tier B)", "scenario": sid, "tier": "B",
+           "models": "S06 legacy live record from the real historical producer " + pin["commit"][:7],
+           "intended": "never granted; at most mechanical_pass; recollection required",
+           "validated_by": "behaviour: real historical goals.run_checks, current goals.progress/_live_binding_valid",
+           "byte_reproducible": False, "provenance": provenance, "interfaces": S06_INTERFACES,
+           **_manifest(root, sd)}
+    raw = _doc(doc)
+    _Writer(sd).write("FIXTURE.json", raw)
+    index = {"schema": INDEX_SCHEMA, "synthetic": True, "not_production_evidence": True, "authorization": "none",
+             "generator": GENERATOR, "clock": "real clock (tier B)", "root_placeholder": "<ROOT>",
+             "scenarios": {sid: {"fixture_sha256": hashlib.sha256(raw).hexdigest(), "byte_reproducible": False}}}
+    w.write(INDEX, _doc(index))
+    result = built["producer"]["result"]
+    return {"root": str(root), "scenario": sid, "context": built["context"], "provenance": provenance,
+            "record": result["records"].get(built["context"]["goal_id"]), "old_items": result["old_items"]}
+
+
+def build_live_v2(root, *, legacy_tool_root) -> dict:
+    """Real live-collection/2 record from b523be4's goals.run_checks on a marked synthetic project.
+
+    The caller supplies an ordinary full Git checkout of exactly b523be4 (fetched beforehand); this
+    function never fetches. The result is synthetic, never production evidence and never authorizes."""
+    return _build_s06(root, legacy_root=legacy_tool_root, producer="live-collection/2")
+
+
+def _build_live_b1(root, *, legacy_b1_root) -> dict:
+    """Internal (test) producer: the real B1 record (two outer keys, verified without schema) from 6b21d10."""
+    return _build_s06(root, legacy_root=legacy_b1_root, producer="B1")
+
+
+def _s06_consume(root, scenario, action, *, require_verify=True) -> dict:
+    """Current consumer in a fresh isolated process. Reads only after verify(root) succeeds, unless a
+    controlled counterexample explicitly bypasses verify."""
+    root = Path(root)
+    if require_verify:
+        problems = verify(root)
+        if problems:
+            raise FixtureRefused(f"verify(root) failed; refusing to read: {problems}")
+    sd = root / scenario
+    ctx = json.loads((sd / S06_CONTEXT).read_text(encoding="utf-8"))
+    env = _s06_env(sd, root / "runtime-bin", local=ctx["local"], tool_path=True)
+    run = _run_child([sys.executable, "-c", _S06_CONSUMER_CHILD, str(sd / S06_CONTEXT), action],
+                     cwd=sd, env=env, timeout=S06_CONSUMER_TIMEOUT_S)
+    if run["rc"] != 0:
+        raise RuntimeError(f"S06 consumer {action} failed rc={run['rc']}: {run['stderr'][-1500:]}")
+    out = json.loads(run["stdout"].strip().splitlines()[-1])
+    out["process"] = {k: run[k] for k in ("argv", "cwd", "rc", "seconds")}
+    return out
 
 
 # ---------------------------------------------------------------- entry point
