@@ -140,13 +140,28 @@ def child_env(base: dict, local_dir: str) -> dict:
 
 def _run_install_regressions():
     """Register existing unittest cases in the isolated selftest result stream."""
+    from .selftest_install_commit import InstallCommitTests
+    from .selftest_install_history import HistoryTests
+    _register_unittests(InstallCommitTests, HistoryTests)
+
+
+def _run_gate_provider_tests():
+    """Register each gate-provider unittest method once. At depth 1 none is registered: they run the real
+    provider, which must not run nested; nothing is reported as passed for them in that case."""
+    from .selftest_v18 import probe_depth
+    if probe_depth() != 0:
+        return
+    from .selftest_gate_provider import GateProviderTests
+    _register_unittests(GateProviderTests)
+
+
+def _register_unittests(*classes):
+    """One _ok per test method; errors, failures, skips, expected failures and unexpected successes all fail."""
     import io
     import unittest
     from contextlib import redirect_stdout, redirect_stderr
-    from .selftest_install_commit import InstallCommitTests
-    from .selftest_install_history import HistoryTests
 
-    cases = [test for cls in (InstallCommitTests, HistoryTests)
+    cases = [test for cls in classes
              for test in unittest.defaultTestLoader.loadTestsFromTestCase(cls)]
     result = unittest.TestResult()
     output = io.StringIO()
@@ -167,6 +182,12 @@ def _run_install_regressions():
 
 
 def run() -> int:
+    from .selftest_v18 import ProbeDepthError, probe_depth
+    try:   # before CHILD_FLAG: being inside the isolation child is never a way around the depth bound
+        probe_depth()
+    except ProbeDepthError as e:
+        print(f"自检未运行：{e}", flush=True)
+        return ProbeDepthError.exit_code
     if os.environ.get(CHILD_FLAG) != "1":
         tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-env-"))
         try:
@@ -202,6 +223,7 @@ def _run_checks() -> int:
     from .selftest_review import run_review
     run_review(_ok)
     _run_install_regressions()
+    _run_gate_provider_tests()
     tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-"))
     env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local"), "WF_NOTIFY": "0"}   # 子进程里本来就是 0，这里照旧写明
     env.pop("VIRTUAL_ENV", None)

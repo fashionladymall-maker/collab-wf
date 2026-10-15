@@ -2,8 +2,12 @@
 回复完整性。同一组函数也是 wf self-check --probes 的行为探针：在临时 local/ 里对已安装的代码跑一遍，不碰本机状态。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1476,9 +1480,374 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
          ("读取故障时段", _t_read_error_window), ("完整性判据边界", _t_completion_boundaries)]
 
 
+# ---------------------------------------------------------------- C-B3-GATE-PROVIDER (B3-07): real default gates
+# Probe nesting is bounded by WF_PROBE_DEPTH ("0" outer, "1" nested). This limits recursion only; it is not
+# identity, permission or platform provenance. WF_PROBE_CHILD / WF_SELFTEST_CHILD only mean "already inside
+# the isolation child" and never stand in for the depth.
+
+PROBE_DEPTH_ENV = "WF_PROBE_DEPTH"
+GATE_GROUP = "真实默认门禁"
+BASELINE_GROUP = "门禁基线"          # reserved for the future strict 21-category aggregate; not registered here
+NESTED_EXCLUDED = frozenset({GATE_GROUP, BASELINE_GROUP})
+GATE_CATEGORY = "1-init-gates-real"
+GATE_CASES = (("G0-default-gates", "pos"), ("G1-manifest-drift", "neg"), ("G2-NO_REF-consumer", "neg"))
+PROVIDER_BUDGET_S = 420              # whole provider; it runs inside the 600 s probe child
+STEP_TIMEOUT_S = 180                 # one setup command, one gate, one driver call
+_DRIVER_SRC = r'''import json, sys, time
+from pathlib import Path
+from wflib.core import Instance
+from wflib.driver import Ctx, _run_gates
+p = Path(sys.argv[1])
+pol = json.loads((p / "workflow/policy.json").read_text())
+print(json.dumps(_run_gates(
+    Ctx(Instance(p), pol, time.time() + 900),
+    pol["gates"], sys.argv[2]), ensure_ascii=False))
+'''
+
+
+# The real NO_REF consumer, run in the case's own tool copy: driver.h_wait_reply -> anomaly.rules.
+_CONSUMER_SRC = r'''import json, sys, tempfile, time
+from wflib import anomaly, driver
+from wflib.selftest_v18 import _inst
+with tempfile.TemporaryDirectory() as td:
+    a = _inst(td, "gate-no-ref-consumer", {"state": "WAIT_REPLY", "turn": 4, "sent_at": "2026-10-12T00:00:00+00:00"})
+    r = driver.h_wait_reply(driver.Ctx(a, {}, time.time() + 60))
+    rule = [x for x in anomaly.rules(a) if x.get("id") == "NO_REF"]
+    print(json.dumps({"returned": r[0], "state": a.state.get("state"), "await_rule": a.state.get("await_rule"),
+                      "rule_action": rule[0].get("action") if rule else None}, ensure_ascii=False))
+'''
+
+
+class ProbeDepthError(Exception):
+    exit_code = 3
+
+
+def probe_depth(env=None) -> int:
+    """Only the canonical strings "0" and "1" are accepted; checked before any spawn, copy, MANIFEST or init."""
+    raw = (os.environ if env is None else env).get(PROBE_DEPTH_ENV, "0")
+    if raw not in ("0", "1"):
+        raise ProbeDepthError(f"{PROBE_DEPTH_ENV}={raw!r} 不被接受：只允许 \"0\" 或 \"1\"（嵌套最多一层），未运行任何检查")
+    return int(raw)
+
+
+def active_groups(depth: int) -> list:
+    """One selector for probes_main and run_v18: depth 1 excludes the gate groups by explicit identity."""
+    groups = list(TESTS) + [(GATE_GROUP, _t_real_default_gates)]
+    return [g for g in groups if depth == 0 or g[0] not in NESTED_EXCLUDED]
+
+
+def _bounded(argv, *, cwd, env, timeout, log_dir=None, tag=None) -> dict:
+    """Run argv in its own session; on timeout, and after it exits, the whole process group is killed."""
+    if timeout <= 0:
+        raise TimeoutError("provider budget exhausted before " + str(tag))
+    t0 = time.time()
+    p = subprocess.Popen([str(a) for a in argv], cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        rc = None
+        os.killpg(p.pid, signal.SIGKILL)
+        out, err = p.communicate()
+    try:   # nothing started by this step may outlive it (no recursive background task)
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    res = {"tag": tag, "argv": [str(a) for a in argv], "cwd": str(cwd), "rc": rc, "timed_out": rc is None,
+           "seconds": round(time.time() - t0, 2), "stdout": out.decode("utf-8", "replace"),
+           "stderr": err.decode("utf-8", "replace")}
+    if log_dir is not None:
+        for kind in ("stdout", "stderr"):
+            data = res[kind].encode("utf-8")
+            (log_dir / f"{tag}.{kind}").write_bytes(data)
+            res[kind + "_sha256"] = hashlib.sha256(data).hexdigest()
+    return res
+
+
+def _copy_tool(src: Path, dst: Path) -> int:
+    """Fresh normalised tool copy: regular files and modes only; no .git, top-level local/, caches or symlinks."""
+    src = Path(os.path.realpath(src))
+    n = 0
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+        here = Path(dirpath)
+        rel = here.relative_to(src)
+        keep = []
+        for d in sorted(dirnames):
+            if os.path.islink(here / d):
+                raise RuntimeError(f"symlink in tool source refused: {rel / d}")
+            if d in (".git", "__pycache__") or (rel == Path(".") and d == "local"):
+                continue
+            keep.append(d)
+        dirnames[:] = keep
+        target = dst / rel
+        target.mkdir(parents=True, exist_ok=True)
+        os.chmod(target, stat.S_IMODE(os.lstat(here).st_mode))
+        for f in sorted(filenames):
+            st = os.lstat(here / f)
+            if f == ".git" or f.endswith(".pyc"):
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise RuntimeError(f"non-regular file in tool source refused: {rel / f}")
+            shutil.copyfile(here / f, target / f)
+            os.chmod(target / f, stat.S_IMODE(st.st_mode))
+            n += 1
+    return n
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    a, b = Path(os.path.realpath(a)), Path(os.path.realpath(b))
+    return a == b or a in b.parents or b in a.parents
+
+
+def _mutate_no_ref(path: Path) -> dict:
+    """Change only rules[id=NO_REF].action from await_user to block, byte-minimal, and prove nothing else changed."""
+    raw = path.read_text(encoding="utf-8")
+    start = raw.index('"id": "NO_REF"')
+    end = raw.find('"id": "', start + 1)
+    end = len(raw) if end < 0 else end
+    old = '"action": "await_user"'
+    if raw.count(old, start, end) != 1:
+        raise RuntimeError("NO_REF rule does not carry exactly one action await_user")
+    pos = raw.index(old, start, end)
+    new = raw[:pos] + '"action": "block"' + raw[pos + len(old):]
+    before, after = json.loads(raw), json.loads(new)
+    for rule in before["rules"]:
+        if rule.get("id") == "NO_REF":
+            rule["action"] = "block"
+    if before != after:
+        raise RuntimeError("anomalies.json mutation touched more than rules[id=NO_REF].action")
+    path.write_text(new, encoding="utf-8")
+    return {"file": "anomalies.json", "rule": "NO_REF", "field": "action", "old": "await_user", "new": "block",
+            "sha256_before": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "sha256_after": hashlib.sha256(new.encode("utf-8")).hexdigest()}
+
+
+def _self_check_sections(text: str) -> dict:
+    out, cur = {}, None
+    titles = {"多出": "extra", "缺失": "missing", "内容被改动": "changed"}
+    for line in text.splitlines():
+        key = next((v for k, v in titles.items() if line.startswith(k) and line.endswith("：")), None)
+        if key:
+            cur = out.setdefault(key, [])
+        elif line.startswith("  ") and cur is not None:
+            cur.append(line.strip())
+        else:
+            cur = None
+    return out
+
+
+def _probe_lines(text: str) -> dict:
+    lines = [ln for ln in text.splitlines() if ln.startswith("探针 ")]
+    return {"groups": len(lines), "failed": [ln for ln in lines if "：未通过" in ln],
+            "gate_group_present": any(ln.startswith(f"探针 {GATE_GROUP}：") for ln in lines),
+            "total": next((ln for ln in text.splitlines() if ln.startswith("探针结果：")), None)}
+
+
+def _gate_case(case_id: str, work: Path, deadline: float) -> tuple:
+    """One independent case: fresh tool copy, project, HOME, LOCAL, TMP and logs; returns (ran, ok, detail)."""
+    from .admin import INIT_GATES
+    base = work / case_id
+    build, rundir, project, home, local, tmp, logs, pybin = (base / n for n in (
+        "build", "run", "project", "home", "local", "tmp", "logs", "pybin"))
+    for d in (rundir, project, home, local, tmp, logs, pybin):
+        d.mkdir(parents=True)
+    if _overlaps(base, WF_HOME):
+        raise RuntimeError("case directory overlaps the tool source")
+    detail = {"case": case_id, "files_copied": _copy_tool(WF_HOME, build), "steps": [], "checks": {}}
+    (pybin / "python3").symlink_to(sys.executable)
+    (home / ".gitconfig").write_text("[user]\n\tname = gate-provider\n\temail = gate-provider@fixture.invalid\n")
+    py = sys.executable
+    env = {"PATH": os.pathsep.join([str(build / "bin"), str(pybin), "/usr/bin", "/bin"]), "HOME": str(home),
+           "WF_LOCAL_DIR": str(local), "TMPDIR": str(tmp), "WF_NOTIFY": "0", "LC_ALL": "C.UTF-8",
+           "PYTHONDONTWRITEBYTECODE": "1", "GIT_CONFIG_NOSYSTEM": "1", PROBE_DEPTH_ENV: "0"}
+    nested = dict(env, **{PROBE_DEPTH_ENV: "1"})
+    detail["env"] = env   # temp paths only; gates and the driver call use the same env with depth "1"
+    checks = detail["checks"]
+
+    def step(tag, argv, cwd, e):
+        r = _bounded(argv, cwd=cwd, env=e, timeout=min(STEP_TIMEOUT_S, deadline - time.time()), log_dir=logs, tag=tag)
+        detail["steps"].append({k: r[k] for k in ("tag", "argv", "cwd", "rc", "timed_out", "seconds",
+                                                  "stdout_sha256", "stderr_sha256")})
+        return r
+    if case_id.startswith("G2"):
+        detail["mutation"] = _mutate_no_ref(build / "anomalies.json")
+    r = step("self-manifest", [py, build / "wf.py", "self-manifest"], build, env)
+    checks["self_manifest_rc0"] = r["rc"] == 0
+    if case_id.startswith("G1"):   # after the manifest, never rebuilt
+        readme = build / "README.md"
+        before = hashlib.sha256(readme.read_bytes()).hexdigest()
+        with open(readme, "ab") as fh:
+            fh.write(b"\n<!-- G1 synthetic manifest-drift fixture: appended after self-manifest -->\n")
+        detail["mutation"] = {"file": "README.md", "appended_after_manifest": True, "sha256_before": before,
+                              "sha256_after": hashlib.sha256(readme.read_bytes()).hexdigest()}
+    r = step("init", [py, build / "wf.py", "init", "--name", case_id, "--root", project], rundir, env)
+    checks["init_rc0"] = r["rc"] == 0
+    wfd = project / "workflow"
+    policy = json.loads((wfd / "policy.json").read_text(encoding="utf-8"))
+    checks["policy_gates_are_init_gates"] = [(g.get("name"), g.get("cmd"), g.get("pass")) for g in policy["gates"]] \
+        == [(n, c, {"exit": 0}) for n, c in INIT_GATES]
+    checks["policy_allow_empty_auto_off"] = policy.get("allow") == [] and all(
+        policy.get(k) is False for k in ("auto_apply", "auto_self_update", "auto_new_conversation"))
+    checks["no_approvals"] = not (wfd / "approvals.json").exists()
+
+    def gate_events():
+        p = wfd / "events.jsonl"
+        rows = [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()] if p.exists() else []
+        return [e for e in rows if e.get("type") == "gate"]
+    checks["init_made_no_gate_event_or_log"] = not gate_events() and not list(wfd.rglob("gate-*.txt"))
+    goals_state = wfd / "goals_state.json"
+    goals_before = goals_state.read_bytes() if goals_state.exists() else None
+    gates = [step(f"gate{i}", ["bash", "-c", g["cmd"]], project, nested) for i, g in enumerate(policy["gates"], 1)]
+    d = step("driver", [py, "-c", _DRIVER_SRC, project, case_id], build, nested)
+    consumer = None
+    if not case_id.startswith("G1"):
+        c = step("no_ref_consumer", [py, "-c", _CONSUMER_SRC], build, nested)
+        try:
+            consumer = json.loads(c["stdout"].strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            consumer = {"error": c["stderr"][-400:]}
+        detail["no_ref_consumer"] = consumer
+    ran = all(s["rc"] is not None for s in detail["steps"])
+    rcs = [g["rc"] for g in gates]
+    try:
+        api = json.loads(d["stdout"].strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        api = None
+    oks = [api.get(g["name"]) for g in policy["gates"]] if isinstance(api, dict) else None
+    expect = {"G0": ([0, 0], [True, True]), "G1": ([1, 0], [False, True]), "G2": ([0, 1], [True, False])}[case_id[:2]]
+    detail.update(gate_rc=rcs, driver_ok=oks, expected={"gate_rc": expect[0], "driver_ok": expect[1]})
+    checks["gate_rc_as_expected"] = rcs == expect[0]
+    checks["driver_ok_as_expected"] = oks == expect[1]
+    state = json.loads((wfd / "state.json").read_text(encoding="utf-8"))
+    tdir = wfd / "evidence" / f"turn-{int(state.get('turn', 0)):03d}"
+    files = [tdir / f"gate-{case_id}-{i}.txt" for i in (1, 2)]
+    heads = [f.read_text(encoding="utf-8").splitlines()[:2] if f.exists() else None for f in files]
+    checks["driver_evidence_files"] = heads == [[f"$ {g['cmd']}", f"exit={c}"] for g, c in zip(policy["gates"], expect[0])]
+    evs = [e for e in gate_events() if e.get("label") == case_id]
+    checks["driver_gate_events"] = [(e.get("gate"), e.get("ok")) for e in evs] == \
+        [(g["name"], ok) for g, ok in zip(policy["gates"], expect[1])]
+    checks["no_goal_state_written"] = (goals_state.read_bytes() if goals_state.exists() else None) == goals_before
+    detail["evidence"] = {"turn_dir": str(tdir.relative_to(project)), "files": [f.name for f in files],
+                          "gate_events": len(evs)}
+    sec = _self_check_sections(gates[0]["stdout"])
+    probe = _probe_lines(gates[1]["stdout"])
+    detail["gate1_manifest_sections"], detail["gate2_probe"] = sec, probe
+    nested_ok = probe["total"] is not None and not probe["gate_group_present"] and probe["groups"] == len(TESTS)
+    if case_id.startswith("G0"):
+        checks["gate1_manifest_clean"] = sec == {}
+        checks["gate2_nested_all_pass"] = nested_ok and not probe["failed"] and \
+            probe["total"] == f"探针结果：{len(TESTS)} / {len(TESTS)} 通过"
+        checks["no_ref_consumer_awaits_user"] = consumer == {"returned": "user", "state": "AWAITING_USER",
+                                                             "await_rule": "NO_REF", "rule_action": "await_user"}
+    elif case_id.startswith("G1"):
+        checks["gate1_only_readme_changed"] = sec == {"changed": ["README.md"]}
+        checks["gate2_nested_all_pass"] = nested_ok and not probe["failed"]
+    else:
+        checks["gate1_manifest_clean"] = sec == {}
+        line = probe["failed"][0] if len(probe["failed"]) == 1 else ""
+        checks["gate2_fails_only_in_NO_REF_group"] = nested_ok and line.startswith("探针 NO_REF：未通过") \
+            and not any(x in line for x in ("ImportError", "ModuleNotFoundError", "Timeout", "超时")) \
+            and probe["total"] == f"探针结果：{len(TESTS) - 1} / {len(TESTS)} 通过"
+        # Causation through the real consumer in this copy: the mutated rule now blocks instead of awaiting.
+        checks["no_ref_consumer_now_blocks"] = isinstance(consumer, dict) and consumer.get("state") == "BLOCKED" \
+            and consumer.get("rule_action") == "block"
+    detail["failed_checks"] = sorted(k for k, v in checks.items() if not v)
+    return ran, ran and all(checks.values()), detail
+
+
+def real_default_gates_provider() -> dict:
+    """c1-provider/1 for 1-init-gates-real: G0 pos, G1/G2 neg, each from real gate execution in a fresh copy."""
+    res = {"schema": "c1-provider/1", "category": GATE_CATEGORY, "provider": "C", "cases": [], "error": None}
+    try:
+        depth = probe_depth()
+    except ProbeDepthError as e:
+        res["error"] = str(e)
+        return res
+    if depth != 0:   # checked before any copy or spawn; never treated as "not run = passed"
+        res["error"] = f"{PROBE_DEPTH_ENV}={depth}: the real gate provider runs only at depth 0, not nested"
+        return res
+    deadline = time.time() + PROVIDER_BUDGET_S
+    work = Path(tempfile.mkdtemp(prefix="wf-gate-provider-")).resolve()
+    try:
+        if _overlaps(work, WF_HOME):
+            raise RuntimeError("provider work directory overlaps the tool source")
+        for case_id, polarity in GATE_CASES:
+            case = {"name": case_id, "polarity": polarity, "ran": False, "ok": False, "detail": ""}
+            try:
+                ran, ok, detail = _gate_case(case_id, work, deadline)
+                case.update(ran=bool(ran), ok=bool(ok), detail=json.dumps(detail, ensure_ascii=False))
+            except Exception as e:   # noqa: BLE001 - a broken case is reported, never counted as run
+                case["detail"] = f"{type(e).__name__}: {e}"
+            res["cases"].append(case)
+        keep = os.environ.get("WF_GATE_EVIDENCE_DIR")
+        if keep:   # optional evidence export for review; must be absolute, outside the tool and new
+            kp = Path(keep)
+            if not kp.is_absolute() or _overlaps(kp, WF_HOME) or kp.exists():
+                raise RuntimeError("WF_GATE_EVIDENCE_DIR must be a new absolute path outside the tool")
+            kp.mkdir(parents=True)
+            for case_id, _ in GATE_CASES:
+                if (work / case_id / "logs").is_dir():
+                    shutil.copytree(work / case_id / "logs", kp / case_id)
+            (kp / "provider.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:   # noqa: BLE001
+        res["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return res
+
+
+C1_PROVIDERS = {GATE_CATEGORY: real_default_gates_provider}
+
+
+def provider_problems(res, category=GATE_CATEGORY) -> list:
+    """Fail closed: schema/category/provider, error, both polarities, all expected cases, true bools only."""
+    if not isinstance(res, dict):
+        return ["provider result is not an object"]
+    p = []
+    for key, want in (("schema", "c1-provider/1"), ("category", category), ("provider", "C")):
+        if res.get(key) != want:
+            p.append(f"{key} {res.get(key)!r} != {want!r}")
+    if res.get("error") is not None:
+        p.append(f"error: {str(res.get('error'))[:300]}")
+    cases = res.get("cases")
+    if not isinstance(cases, list) or not cases:
+        return p + ["no cases"]
+    seen = {}
+    for c in cases:
+        if not isinstance(c, dict) or not isinstance(c.get("name"), str) or c.get("polarity") not in ("pos", "neg"):
+            p.append(f"malformed case {str(c)[:120]}")
+            continue
+        seen[c["name"]] = c["polarity"]
+        for key in ("ran", "ok"):
+            if type(c.get(key)) is not bool:
+                p.append(f"{c['name']} {key} is not a bool")
+            elif c[key] is not True:
+                p.append(f"{c['name']} {key}=False")
+    if set(seen.values()) != {"pos", "neg"}:
+        p.append("both polarities required")
+    if category == GATE_CATEGORY and seen != dict(GATE_CASES):
+        p.append(f"cases {sorted(seen)} != {[n for n, _ in GATE_CASES]}")
+    return p
+
+
+def _t_real_default_gates(_ok):
+    res = C1_PROVIDERS[GATE_CATEGORY]()
+    problems = provider_problems(res)
+    summary = "；".join(f"{c.get('name')} {c.get('polarity')} ran={c.get('ran')} ok={c.get('ok')}"
+                       for c in (res.get("cases") or []) if isinstance(c, dict)) or "no cases"
+    _ok(f"{GATE_GROUP}：{summary}", not problems,
+        json.dumps({"problems": problems, "error": res.get("error") if isinstance(res, dict) else None}, ensure_ascii=False))
+
+
 def run_v18(_ok) -> None:
     print("  —— 1.8.2 新增检查 ——", flush=True)
-    for name, fn in TESTS:
+    try:
+        depth = probe_depth()
+    except ProbeDepthError as e:
+        _ok(f"1.8.2 检查未运行：{e}", False, str(e))
+        return
+    for name, fn in active_groups(depth):
         try:
             fn(_ok)
         except Exception as e:   # 一组检查出错只记这一组失败，不中断整个自检
@@ -1486,7 +1855,14 @@ def run_v18(_ok) -> None:
 
 
 def probes_main() -> int:
-    """wf self-check --probes：在临时 local/ 里（子进程）跑上面的检查，逐项输出“探针 名称：通过/未通过”。只读：不碰本机状态。"""
+    """wf self-check --probes：在临时 local/ 里（子进程）跑上面的检查，逐项输出“探针 名称：通过/未通过”。只读：不碰本机状态。
+
+    WF_PROBE_DEPTH is validated first (exit 3), before WF_PROBE_CHILD is consulted or anything is spawned."""
+    try:
+        depth = probe_depth()
+    except ProbeDepthError as e:
+        print(f"探针未运行：{e}", flush=True)
+        return ProbeDepthError.exit_code
     if os.environ.get("WF_PROBE_CHILD") != "1":
         with tempfile.TemporaryDirectory(prefix="wf-probes-") as td:
             env = {**os.environ, "WF_LOCAL_DIR": str(Path(td) / "local"), "WF_PROBE_CHILD": "1", "WF_NOTIFY": "0"}
@@ -1497,9 +1873,11 @@ def probes_main() -> int:
             if r.returncode != 0 and r.stderr:
                 sys.stdout.write(r.stderr[-1500:])
             return r.returncode
+    groups = active_groups(depth)
     print(f"collab-wf {(WF_HOME / 'VERSION').read_text().strip()} 行为探针（临时 local/，不碰本机状态）")
+    print(f"探针深度：{depth}；本次组数：{len(groups)}")
     passed = 0
-    for name, fn in TESTS:
+    for name, fn in groups:
         res = []
 
         def _ok(n, cond, detail=""):
@@ -1514,5 +1892,7 @@ def probes_main() -> int:
         passed += 1 if good else 0
         why = err or "；".join(str(x[2])[:200] for x in res if not x[0])
         print(f"探针 {name}：{'通过' if good else '未通过'}" + ("" if good else f"（{why[:400]}）"), flush=True)
-    print(f"探针结果：{passed} / {len(TESTS)} 通过")
-    return 0 if passed == len(TESTS) else 1
+        if name == GATE_GROUP and res:
+            print(f"  {GATE_GROUP} 实际结果：{res[0][1].split('：', 1)[-1]}", flush=True)
+    print(f"探针结果：{passed} / {len(groups)} 通过")
+    return 0 if passed == len(groups) else 1
