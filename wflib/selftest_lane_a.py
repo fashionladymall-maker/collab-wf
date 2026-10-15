@@ -126,7 +126,24 @@ POLL_NONE = {"code": 0, "raw": "", "data": {"status": "none"}}
 
 
 def _ctx(inst, pol):
-    from . import driver
+    from . import core, driver, policy
+    # 旧直调夹具以前只给内存策略；P2 真正消费批准文件。每项目只初始化一次，负例破坏后不修复。
+    marker = inst.wf / ".test-policy-initialized"
+    if not marker.exists():
+        if _guard():
+            raise RuntimeError(_guard())
+        if not (inst.wf / "policy.json").exists():
+            (inst.wf / "policy.json").write_text(json.dumps(pol), encoding="utf-8")
+            policy.approve(inst, "policy", "lane-a direct-handler fixture")
+        marker.touch()
+    registry_key = str(core.REGISTRY)
+    seen = getattr(_ctx, "_registries", set())
+    if registry_key not in seen:
+        if not core.REGISTRY.exists():
+            core.REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+            core.REGISTRY.write_text('{"projects": []}', encoding="utf-8")
+        seen.add(registry_key)
+        _ctx._registries = seen
     return driver.Ctx(inst, pol, time.time() + 60)
 
 
@@ -557,6 +574,7 @@ def _t_crash_points(_ok):
         for point in ("71", "72", "73"):
             _fresh_shared()
             a = _sendable(td, f"la-cp{point}", 3)
+            _ctx(a, pol)   # 子进程断点前先完成真实批准夹具，不让初始化写入成为假断点
             sent = Path(td) / f"sent-{point}.txt"
             rc = subprocess.run([sys.executable, "-c", _CRASH, str(WF_HOME), str(a.root), point, str(sent)],
                                 env=dict(os.environ), cwd=str(WF_HOME), capture_output=True, timeout=120).returncode
@@ -620,8 +638,10 @@ def _t_unknown_no_adopt(_ok):
     with tempfile.TemporaryDirectory() as td:
         _fresh_shared()
         a = _sendable(td, "la-un", 4)
+        message = driver._prepare_send(_ctx(a, pol), a.state["outgoing"])
         g = arbiter.acquire(a, 1)
-        a.state["send_intent"] = {"turn": 4, "status": "pending", "ts": g["granted_at"], "file": a.state["outgoing"]["file"]}
+        a.state["send_intent"] = {"turn": 4, "status": "pending", "ts": g["granted_at"],
+                                  "file": a.state["outgoing"]["file"], "message": message}
         a.save()
         fake = _Fake(poll=[POLL_NONE, POLL_NONE, POLL_NONE], send=[SENT_OK])
         rs = []
@@ -662,6 +682,10 @@ def _t_no_borrow(_ok):
             else:
                 arbiter.mark_sending(a, g1["lease_id"], 2)                       # 这个租约下可能已经外发
                 live, mine = g1["lease_id"], None
+            message = driver._prepare_send(_ctx(a, pol), a.state["outgoing"])
+            a.state["send_intent"] = {"turn": 2, "status": "accepted", "ts": g1["granted_at"],
+                                      "file": a.state["outgoing"]["file"], "message": message}
+            a.save()
             fake = _Fake(send=[SENT_OK], poll=[{"code": 0, "raw": "", "data": {"status": "done", "ref": "R9"}},
                                                {"code": 0, "raw": "", "data": {"status": "done", "reply_file": str(reply),
                                                                                 "files": []}}])
@@ -791,6 +815,7 @@ def _t_save_window(_ok):
     with tempfile.TemporaryDirectory() as td:
         _fresh_shared()
         a = _sendable(td, "la-sw", 1)
+        ctx = _ctx(a, pol)
         fake = _Fake(send=[SENT_OK])
 
         def boom():
@@ -798,7 +823,7 @@ def _t_save_window(_ok):
         a.save = boom
         try:
             with _patched(fake):
-                driver.h_send(_ctx(a, pol))
+                driver.h_send(ctx)
         except OSError as e:
             err = str(e)
         finally:
@@ -1069,9 +1094,11 @@ def _t_a1_send_identity(_ok):
     with tempfile.TemporaryDirectory() as td:
         _fresh_shared()
         a = _sendable(td, "la-a1d", 6)
+        message = driver._prepare_send(_ctx(a, {"shared_max_inflight": 1, "send_unknown_wait": True}), a.state["outgoing"])
         g = arbiter.acquire(a, 1)
         a.state.update(send_slot={"lease_id": g["lease_id"], "turn": 6, "attempt": g["attempt"], "granted_at": g["granted_at"]},
-                       send_intent={"turn": 6, "status": "pending", "ts": g["granted_at"], "file": a.state["outgoing"]["file"]},
+                       send_intent={"turn": 6, "status": "pending", "ts": g["granted_at"],
+                                    "file": a.state["outgoing"]["file"], "message": message},
                        send_ref="R5")
         a.save()
         mk = arbiter.mark_sending(a, g["lease_id"], 6)
@@ -1450,11 +1477,13 @@ def _clock(offset_s):
 
 def _unknown_pending(td, name, turn):
     """一条结果不明、待确认的发送意图：授予、保存、外发前标记都已完成，持有带 token 的槽；适配器从未被调用。"""
-    from . import arbiter
+    from . import arbiter, driver
     a = _sendable(td, name, turn)
+    message = driver._prepare_send(_ctx(a, {"shared_max_inflight": 1, "send_unknown_wait": True}), a.state["outgoing"])
     g = arbiter.acquire(a, 1, 3600)
     a.state.update(send_slot={"lease_id": g["lease_id"], "turn": turn, "attempt": g["attempt"], "granted_at": g["granted_at"]},
-                   send_intent={"turn": turn, "status": "pending", "ts": _iso(0), "file": a.state["outgoing"]["file"]},
+                   send_intent={"turn": turn, "status": "pending", "ts": _iso(0),
+                                "file": a.state["outgoing"]["file"], "message": message},
                    send_ref="R-prev")
     a.save()
     arbiter.mark_sending(a, g["lease_id"], turn)
@@ -2284,6 +2313,103 @@ def _t_permission_consumption(_ok):
                     (not launched and a.state["state"] == "AWAITING_USER"), str(did))
 
 
+def _t_p2_message_binding(_ok):
+    from unittest.mock import patch
+    from . import driver, ops
+    from .core import now_iso
+    with tempfile.TemporaryDirectory() as td:
+        a = _sendable(td, "p2-normal", 1)
+        pol = {"shared_max_inflight": 0}
+        ctx = _ctx(a, pol)
+        fake = _Fake(send=SENT_OK)
+        with _patched(fake):
+            r = driver.h_send(ctx)
+        calls = [x for x in fake.calls if x == "send"]
+        _ok("B1b P2 正常发送只调用一次且适配器读取绑定快照",
+            r[0] == "progress" and calls == ["send"] and a.state["state"] == "WAIT_REPLY"
+            and a.state.get("send_intent") is None and a.state.get("last_sent", {}).get("file", "").endswith(".md"),
+            str([r, fake.calls, a.state.get("last_sent")]))
+
+        for label, mutate in (
+            ("secret", lambda f: f.write_text("API_KEY=abcdefghijklmnop\n", encoding="utf-8")),
+            ("outside", lambda f: None),
+        ):
+            b = _sendable(td, "p2-" + label, 1)
+            if label == "outside":
+                out = Path(td) / "outside.md"
+                out.write_text("version v0.1\n档位：high\n", encoding="utf-8")
+                b.state["outgoing"]["file"] = str(out)
+                b.save()
+            else:
+                mutate(Path(b.state["outgoing"]["file"]))
+            f = _Fake(send=SENT_OK)
+            with _patched(f):
+                rb = driver.h_send(_ctx(b, pol))
+            _ok("B1b P2 新发送前拒绝" + label + "正文且零 send",
+                rb[0] == "user" and f.calls.count("send") == 0 and b.state["state"] == "BLOCKED",
+                str([rb, f.calls]))
+
+        for label, reason in (("compose-secret", None), ("resend-secret", "resend")):
+            e = _sendable(td, "p2-" + label, 1)
+            e.state["state"] = "COMPOSE"
+            if reason:
+                e.state["compose_reason"] = reason
+            Path(e.state["outgoing"]["file"]).write_text(
+                "【回报 · 第 1 轮 · v0.1】档位：high\nAPI_KEY=abcdefghijklmnop\n", encoding="utf-8")
+            e.save()
+            ef = _Fake(send=SENT_OK)
+            with _patched(ef):
+                retn = driver.h_compose(_ctx(e, pol))
+                if reason and retn[0] == "progress":
+                    retn = driver.h_send(_ctx(e, pol))
+            _ok("B1b P2 " + label + " 统一密钥硬停",
+                retn[0] == "user" and ef.calls.count("send") == 0 and e.state["state"] in ("BLOCKED", "SEND"),
+                str([retn, ef.calls]))
+
+        c = _sendable(td, "p2-unknown", 1)
+        cctx = _ctx(c, {"shared_max_inflight": 0, "send_unknown_wait": True})
+        msg = driver._prepare_send(cctx, c.state["outgoing"])
+        c.state["send_intent"] = {"turn": 1, "status": "pending", "ts": now_iso(),
+                                  "file": c.state["outgoing"]["file"], "message": msg}
+        c.state["outgoing"]["file"] = str(Path(td) / "new-secret.md")
+        Path(c.state["outgoing"]["file"]).write_text("API_KEY=abcdefghijklmnop\n", encoding="utf-8")
+        c.save()
+        pf = _Fake(poll=POLL_NONE)
+        with _patched(pf, {"poll_since": True}):
+            rc = driver.h_send(_ctx(c, {"shared_max_inflight": 0, "send_unknown_wait": True}))
+        _ok("B1b P2 未知发送优先旧绑定，不把当前新秘密草稿用于 poll_since",
+            rc[0] == "wait" and pf.calls.count("send") == 0,
+            str([rc, pf.calls]))
+
+        race = _sendable(td, "p2-race", 1)
+        original_save = race.save
+        changed = []
+        def mutate_after_intent():
+            original_save()
+            if race.state.get("send_intent") and not changed:
+                changed.append(True)
+                Path(race.state["outgoing"]["file"]).write_text(
+                    "API_KEY=abcdefghijklmnop\n", encoding="utf-8")
+        race.save = mutate_after_intent
+        rf = _Fake(send=SENT_OK)
+        with _patched(rf):
+            rr = driver.h_send(_ctx(race, {"shared_max_inflight": 0}))
+        del race.save
+        _ok("B1b P2 保存后正文替换：最终绑定复核拒绝且零 send",
+            rr[0] == "user" and changed and rf.calls.count("send") == 0,
+            str([rr, rf.calls]))
+
+        d = _sendable(td, "p2-legacy", 1)
+        d.state["send_intent"] = {"turn": 1, "status": "pending", "ts": now_iso(), "file": d.state["outgoing"]["file"]}
+        d.save()
+        lf = _Fake(poll=POLL_NONE)
+        with _patched(lf, {"poll_since": True}):
+            rd = driver.h_send(_ctx(d, {"shared_max_inflight": 0, "send_unknown_wait": True}))
+        _ok("B1b P2 legacy 无 ref/绑定硬停且不回退 outgoing",
+            rd[0] == "user" and lf.calls.count("poll") == 0 and d.state["state"] == "BLOCKED",
+            str([rd, lf.calls]))
+
+
 # ---- 不变量 ----
 
 def _t_a2_recovery_unit(_ok):
@@ -2912,6 +3038,7 @@ TESTS = [
     ("B2-A2a GPT 意图身份校验", _t_a2gpt_intent_identity),
     ("B2-A2b 提供方契约", _t_a2b_provider_contract),
     ("B2-A-IC-B1b P1 权限消费", _t_permission_consumption),
+    ("B2-A-IC-B1b P2 正文绑定", _t_p2_message_binding),
 ]
 
 
