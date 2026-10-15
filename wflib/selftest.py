@@ -138,6 +138,28 @@ def child_env(base: dict, local_dir: str) -> dict:
     return env
 
 
+def _run_install_regressions():
+    """Register existing unittest cases in the isolated selftest result stream."""
+    import io
+    import unittest
+    from contextlib import redirect_stdout, redirect_stderr
+    from .selftest_install_commit import InstallCommitTests
+    from .selftest_install_history import HistoryTests
+
+    cases = [test for cls in (InstallCommitTests, HistoryTests)
+             for test in unittest.defaultTestLoader.loadTestsFromTestCase(cls)]
+    result = unittest.TestResult()
+    output = io.StringIO()
+    with redirect_stdout(output), redirect_stderr(output):
+        unittest.TestSuite(cases).run(result)
+    problems = {test.id(): detail for test, detail in result.errors + result.failures
+                + result.skipped + result.expectedFailures}
+    problems.update((test.id(), "unexpected success") for test in result.unexpectedSuccesses)
+    for test in cases:
+        detail = problems.get(test.id(), "")
+        _ok(test.id(), test.id() not in problems, detail + output.getvalue()[-2000:] if detail else "")
+
+
 def run() -> int:
     if os.environ.get(CHILD_FLAG) != "1":
         tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-env-"))
@@ -170,6 +192,10 @@ def _run_checks() -> int:
     print("  —— B1-A 车道检查（发送槽精确持有者）——", flush=True)
     from .selftest_lane_a import run_lane_a
     run_lane_a(_ok)
+    print("  —— B2 独立审查与安装历史回归 ——", flush=True)
+    from .selftest_review import run_review
+    run_review(_ok)
+    _run_install_regressions()
     tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-"))
     env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local"), "WF_NOTIFY": "0"}   # 子进程里本来就是 0，这里照旧写明
     env.pop("VIRTUAL_ENV", None)
