@@ -350,17 +350,123 @@ def _compound_end(tokens, i):
     raise ValueError("unterminated compound command")
 
 
+def _scan_top(tokens):
+    """``(index, token, at_command)`` for tokens outside nested compounds and ``( )`` groups."""
+    out, k, n = [], 0, len(tokens)
+    while k < n:
+        token = tokens[k]
+        previous = tokens[k - 1] if k else None
+        at_command = k == 0 or previous[0] == "op" or (previous[0] == "word" and previous[1] in _COMMAND_PREFIXES)
+        if token[0] == "word" and at_command and token[1] in _COMPOUND_CLOSERS:
+            k = _compound_end(tokens, k) + 1
+            continue
+        if token == ("op", "("):
+            depth, k = 1, k + 1
+            while k < n and depth:
+                depth += 1 if tokens[k] == ("op", "(") else -1 if tokens[k] == ("op", ")") else 0
+                k += 1
+            if depth:
+                raise ValueError("unbalanced parenthesis")
+            continue
+        out.append((k, token, at_command))
+        k += 1
+    return out
+
+
+def _if_branches(tokens):
+    """Alternatives of ``if c0; then b0; [elif ci; then bi;]... [else be;]``: each runs c0..ci then bi."""
+    marks = [(k, t[1]) for k, t, at in _scan_top(tokens) if at and t[0] == "word" and t[1] in ("then", "elif", "else")]
+    words = [w for _, w in marks]
+    shape = ["then"] + ["elif", "then"] * ((len(words) - 1) // 2)
+    if words not in (shape, shape + ["else"]) or not words:
+        return None
+    conds, bodies, otherwise = [tokens[:marks[0][0]]], [], None
+    for i, (k, word) in enumerate(marks):
+        part = tokens[k + 1:marks[i + 1][0] if i + 1 < len(marks) else len(tokens)]
+        if word == "then":
+            bodies.append(part)
+        elif word == "elif":
+            conds.append(part)
+        else:
+            otherwise = part
+    branches = [conds[:i + 1] + [body] for i, body in enumerate(bodies)]
+    branches.append(conds + ([otherwise] if otherwise is not None else []))   # no branch taken / else
+    return branches
+
+
+def _is_word(token, text):
+    return token[0] == "word" and token[1] == text
+
+
+def _case_branches(tokens):
+    """Alternatives of ``case w in p) list ;; ... esac``: each clause list, plus no match. The lexer does not
+    keep quoting, so a ``*`` pattern cannot be told from a quoted ``'*'``: the no-match alternative is always
+    kept (may over-report, never hides). Fall-through (``;&``, ``;;&``) and substitutions in patterns are not
+    modelled (None: every inner item is then only possible)."""
+    n, k = len(tokens), 0
+    while k < n and not _is_word(tokens[k], "in"):
+        k += 1
+    if k == n:
+        return None
+    subject, k, clauses = tokens[:k], k + 1, []
+    while k < n:
+        while k < n and tokens[k] == ("op", "\n"):
+            k += 1
+        if k == n:
+            break
+        if tokens[k] == ("op", "("):
+            k += 1
+        while k < n and tokens[k] != ("op", ")"):
+            if not (tokens[k][0] == "word" and not tokens[k][2]) and tokens[k] != ("op", "|"):
+                return None
+            k += 1
+        if k == n:
+            return None
+        start, end = k + 1, None
+        for j, token, _ in _scan_top(tokens[start:]):
+            if token == ("op", ";;"):
+                end = start + j
+                break
+        end = n if end is None else end
+        if end + 1 < n and tokens[end + 1] == ("op", "&") \
+                or any(tokens[j] == ("op", ";") and tokens[j + 1] == ("op", "&") for j in range(start, end - 1)):
+            return None
+        clauses.append(tokens[start:end])
+        k = end + 1
+    return [[subject, clause] for clause in clauses] + [[subject]]
+
+
+def _compound_structure(kind, tokens):
+    """Branch/loop structure of a keyword compound (parsed items), or None when not recognised."""
+    if kind == "if":
+        branches = _if_branches(tokens)
+    elif kind == "case":
+        branches = _case_branches(tokens)
+    elif kind in ("for", "while", "until", "select"):
+        marks = [k for k, t, at in _scan_top(tokens) if at and _is_word(t, "do")]
+        if not marks:
+            return None
+        return {"loop": (_parse_items(tokens[:marks[0]])[0], _parse_items(tokens[marks[0] + 1:])[0])}
+    else:
+        return None
+    if branches is None:
+        return None
+    return {"branches": [[_parse_items(part)[0] for part in branch] for branch in branches]}
+
+
 _LEGACY_MAX_DEPTH = 6
 
 
 def _parse_items(tokens, i=0, nested=False):
     """Items of one shell list: ``("seg", argv, subs, isolated, conditional)``,
     ``("def", name, body_items, redirect_subs, subshell_body, isolated,
-    conditional)``, ``("group", items, redirect_subs, isolated, conditional)``
-    for compound commands (``{ }``, ``if``, ``case``, loops) and
+    conditional)``, ``("group", items, redirect_subs, kind, structure, isolated,
+    conditional)`` for compound commands (``{ }``, ``if``, ``case``, loops) and
     ``("sub", items)`` for ``( ... )``. ``isolated`` marks pipeline members and
     background jobs, which run in a subshell with everything inside them;
-    ``conditional`` marks items after ``&&``/``||`` and keyword compounds.
+    ``conditional`` marks items after ``&&``/``||``. ``structure`` holds the
+    branch alternatives (``if``/``case``) or header/body (loops) of a keyword
+    compound, or None.
     """
     import re
     items, seps, argv, subs = [], [], [], []
@@ -379,12 +485,11 @@ def _parse_items(tokens, i=0, nested=False):
             # Every pipeline member and background job runs in a subshell; the
             # flag applies to the whole item (segment, group or definition).
             isolated = seps[k] in ("|", "|&", "&") or (k > 0 and seps[k - 1] in ("|", "|&"))
-            conditional = (k > 0 and seps[k - 1] in ("&&", "||")) \
-                or (item[0] == "group" and item[3] != "{")
+            conditional = k > 0 and seps[k - 1] in ("&&", "||")
             if item[0] == "sub":
                 out.append(("sub", item[1]))
             elif item[0] == "group":
-                out.append(("group", item[1], item[2], isolated, conditional))
+                out.append(("group", item[1], item[2], item[3], item[4], isolated, conditional))
             else:
                 out.append(tuple(item) + (isolated, conditional))
         return out
@@ -423,7 +528,9 @@ def _parse_items(tokens, i=0, nested=False):
             opener = i
             end = _compound_end(tokens, opener)
             redirect, i = trailing_subs(end + 1)
-            items.append(["group", _parse_items(tokens[opener + 1:end])[0], redirect, tokens[opener][1]])
+            kind, inner = tokens[opener][1], tokens[opener + 1:end]
+            structure = None if kind == "{" else _compound_structure(kind, inner)
+            items.append(["group", _parse_items(inner)[0], redirect, kind, structure])
             seps.append(None)
             continue
         if _at_command(argv, subs):
@@ -488,6 +595,56 @@ def _run_maybe(env, run):
     return hits
 
 
+def _merge_outcomes(env, outcomes):
+    """Merge the function tables of alternative executions into ``env``: a name defined identically in every
+    alternative stays definite; otherwise every definition is a possibility, plus the external command when
+    some alternative leaves the name undefined (or itself only possibly defined)."""
+    for name in set().union(*outcomes):
+        entries = [o.get(name) for o in outcomes]
+        if entries[0] is not None and all(e == entries[0] for e in entries):
+            env[name] = entries[0]
+            continue
+        defs, external = [], False
+        for entry in entries:
+            if entry is None:
+                external = True
+                continue
+            defs += [d for d in entry["defs"] if d not in defs]
+            external = external or entry["external"]
+        env[name] = {"defs": defs, "external": external}
+
+
+_LOOP_PASSES = 6
+
+
+def _classify_structure(structure, depth, env):
+    """Hits of a keyword compound whose conditions are not evaluated. ``if``/``case`` branches are alternatives,
+    each run in order on its own copy; a loop is the union of 0, 1, 2, ... iterations up to a fixpoint (so a
+    definition made in one iteration reaches calls in the next). The outcomes are merged into ``env``."""
+    hits, outcomes = [], []
+    if "branches" in structure:
+        for branch in structure["branches"]:
+            trial = _env_copy(env)
+            for items in branch:
+                hits.extend(_classify_items(items, depth, trial))
+            outcomes.append(trial)
+    else:
+        header, body = structure["loop"]
+        trial = _env_copy(env)
+        hits.extend(_classify_items(header, depth, trial))
+        outcomes.append(_env_copy(trial))
+        for _ in range(_LOOP_PASSES):
+            hits.extend(_classify_items(body, depth, trial))
+            hits.extend(_classify_items(header, depth, trial))
+            if trial == outcomes[-1]:
+                break
+            outcomes.append(_env_copy(trial))
+        else:
+            hits.append(_unknown_legacy())   # no fixpoint within the bound: explicitly unknown
+    _merge_outcomes(env, outcomes)
+    return hits
+
+
 def _classify_items(items, depth, env):
     """Hits of the commands that actually (or possibly) run, in order.
 
@@ -496,9 +653,13 @@ def _classify_items(items, depth, env):
     an invoked ``{ }`` function, a brace group or eval) persists. Subshells
     (``( ... )``, ``name() ( ... )`` bodies, pipeline members, background
     jobs, command substitutions) work on a copy. Conditions are not evaluated:
-    items after ``&&``/``||`` and inside ``if``/``case``/loop compounds run on a
-    trial copy whose definitions are merged back as possibilities, so a
-    conditional definition can over-report but never hide a later command.
+    items after ``&&``/``||`` run on a trial copy whose definitions are merged
+    back as possibilities; ``if``/``case`` branches and loop iterations are
+    alternatives whose definitions form a set of possible definitions (see
+    ``_classify_structure``); a keyword compound whose shape is not recognised
+    treats each inner item as possible. A later call is the union of every
+    possible definition and the external command, so a conditional definition
+    can over-report but never hide a command.
     """
     hits = []
     for item in items:
@@ -513,9 +674,15 @@ def _classify_items(items, depth, env):
                 scope[name] = {"defs": [(body, redirect, subshell)], "external": False}
                 return []
             if item[0] == "group":
-                _, inner, redirect = item[:3]
+                _, inner, redirect, kind, structure = item[:5]
                 found = [_legacy_install(text, depth + 1, _env_copy(scope)) for text in redirect]
-                return found + _classify_items(inner, depth, scope)
+                if kind == "{":
+                    return found + _classify_items(inner, depth, scope)
+                if structure is not None:
+                    return found + _classify_structure(structure, depth, scope)
+                for one in inner:   # unrecognised keyword compound: every inner item is only possible
+                    found.extend(_run_maybe(scope, lambda trial, one=one: _classify_items([one], depth, trial)))
+                return found
             _, argv, subs = item[:3]
             found = [_legacy_install(text, depth + 1, _env_copy(scope)) for text in subs]
             return found + [_legacy_simple(argv, depth, scope)]

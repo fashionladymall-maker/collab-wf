@@ -123,6 +123,39 @@ SCOPE_TABLE = {
 }
 
 
+# C-SCOPE-FIX2: branches of if/elif/else and case, and loop iterations, are alternatives whose
+# definitions form a set of possible definitions; a later call is their union. Every row here must agree
+# exactly with real Bash (no over-report allowed in this table). The first three are the reviewed misses.
+BRANCH_MISSES = {
+ "if true; then f(){ wf apply then.zip; }; else f(){ :; }; fi; f": "project",
+ "if true; then f(){ wf apply a.zip; }; elif true; then f(){ wf apply b.zip; }; else f(){ :; }; fi; f": "project",
+ "case x in x) f(){ wf apply case.zip; };; y) f(){ :; };; esac; f": "project",
+}
+BRANCH_TABLE = list(BRANCH_MISSES) + [
+ "if false; then f(){ :; }; else f(){ wf apply else.zip; }; fi; f",
+ "if false; then f(){ :; }; elif true; then f(){ wf apply mid.zip; }; else f(){ :; }; fi; f",
+ "if true; then f(){ :; }; else f(){ :; }; fi; f",
+ "if true; then wf(){ :; }; else wf(){ :; }; fi; wf self-update shadowed.zip",
+ "f(){ wf apply keep.zip; }; if true; then f(){ wf apply then.zip; }; else f(){ wf apply else.zip; }; fi; f",
+ "if true; then if true; then f(){ wf apply nested.zip; }; else f(){ :; }; fi; fi; f",
+ "if true; then f(){ wf apply local.zip; }; f; else :; fi",
+ "case y in x) f(){ :; };; y) f(){ wf apply y.zip; };; esac; f",
+ "case x in\nx) f(){ wf self-update nl.zip; };;\ny) f(){ :; };;\nesac; f",
+ "case x in (x) f(){ wf apply paren.zip; };; esac; f",
+ "for i in 1 2; do f; f(){ wf apply loop2.zip; }; done",
+ "for i in 1; do f(){ wf apply loop.zip; }; done; f",
+ "while false; do f(){ :; }; done; wf self-update after.zip",
+ "if true; then f(){ wf apply p.zip; }; else f(){ :; }; fi | cat; f",
+ "(if true; then f(){ wf apply s.zip; }; else f(){ :; }; fi); f",
+ 'echo "$(if true; then f(){ :; }; fi)"; wf self-update sub.zip',
+ "if true; then f(){ wf apply b.zip; }; else f(){ :; }; fi & wait; f",
+ "if true; then f() ( wf apply sub.zip ); else f(){ :; }; fi; f",
+ "case $(wf apply subj.zip) in x) :;; esac",
+ "for i in $(wf self-update hdr.zip); do :; done",
+ "if true; then f(){ wf apply r.zip; } >/dev/null; else f(){ :; }; fi; f",
+]
+
+
 def bash_trace_kind(command):
     """Run ``command`` in real Bash with a stand-in wf that only records argv."""
     import subprocess
@@ -805,6 +838,26 @@ class LegacyEntryTests(_Fixture):
             "case a in a) wf() { :; };; esac; wf self-update x.zip",
             "f() { wf apply keep.zip; }; if true; then f() { :; }; fi; f"]))
         self.assertGreater(executed_rows, 20)
+
+    def test_branch_union_agrees_with_real_bash_argv_trace(self):
+        """C-SCOPE-FIX2: if/elif/else and case branches, loop iterations: union of possible definitions."""
+        import shutil
+        import subprocess
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        version = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
+                                 capture_output=True, text=True).stdout.strip()
+        if version != "5.2":
+            self.skipTest(f"branch oracle is pinned to real Bash 5.2, found {version}")
+        rows = []
+        for command in BRANCH_TABLE:
+            executed, classified, calls = bash_trace_kind(command)
+            rows.append((command, executed, classified))
+            self.assertEqual(classified, executed, (command, calls))
+        self.assertEqual({c: e for c, e, _ in rows if c in BRANCH_MISSES}, BRANCH_MISSES)
+        self.assertEqual(len(rows), len(BRANCH_TABLE))
+        self.assertGreaterEqual(sum(e is not None for _, e, _ in rows), 18)
+        self.assertGreaterEqual(sum(e is None for _, e, _ in rows), 4)
 
     def test_pre_receipt_events_and_classifier(self):
         reader = SimpleNamespace(bytes=lambda path: None,

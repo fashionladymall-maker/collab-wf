@@ -376,7 +376,8 @@ pipeline member or background job covers everything inside it.
 | any pipeline member or background job, including a brace group or function call there | no (default Bash, `lastpipe` off) |
 | `time f` (unqualified keyword, optional `-p`) | as the scope of `f`'s body |
 | external `time` path, `command`, `env`, `exec` and other wrappers | they bypass shell functions; `command f`/`env f` never call the function |
-| right side of `&&`/`\|\|`, inside `if`/`case`/loops | possibly: the condition is not evaluated, so a later call is the union of every possible definition and the external command (may over-report, never hides) |
+| right side of `&&`/`\|\|` | possibly: the condition is not evaluated, so a later call is the union of every possible definition and the external command (may over-report, never hides) |
+| `if`/`elif`/`else` branches, `case` clauses, `for`/`while`/`until`/`select` iterations | each branch (plus "no branch taken" without `else`, "no match" for `case`) and each iteration count 0, 1, 2, ... up to a fixpoint is an alternative run in order on its own copy; a later call is the union of the definitions of all alternatives, plus the external command where an alternative leaves the name undefined (may over-report, never hides). A `*` pattern is not taken as catch-all (the lexer does not keep quoting); `;&`/`;;&` fall-through and substitutions in patterns fall back to treating every inner item as possible; no loop fixpoint within six passes is explicitly unknown |
 | uncalled body, definition-trailing redirection | not run; evaluated on each invocation |
 
 `command -v`/`-V` (also combined, e.g. `-pv`) only query and do not execute.
@@ -384,13 +385,17 @@ Nesting beyond six levels (deep recursion) is explicitly unknown. The
 selftests compare these rows, each with definition and shadow/redefinition
 contrasts, and the earlier 31-case matrix with real Bash, using a stand-in
 `wf` that only records its arguments; only the conditional row may
-over-report (four recorded cases). A command
+over-report (four recorded cases). A separate branch table (if/elif/else,
+case, loop-carried definitions, isolation) must agree with real Bash 5.2
+exactly. The classifier still reports a single entry: the first parsed install
+among the possible hits, which with several possible kinds may differ from the
+first command Bash ran (the kind Bash ran is always among the hits). A command
 that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
 unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
 diagnostic only; no installation reference is derived from a basename or
 command string. Conditions are not evaluated: commands in `if`/`case`/loop
 branches and after `&&`/`||` are counted as if they run, and definitions there
-are only possible (conservative). Scripts, aliases, variables, `lastpipe`,
+form a set of possible definitions (conservative). Scripts, aliases, variables, `lastpipe`,
 functions defined outside the command (for example in a sourced file) and
 other indirection are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
 report path reads the parsed first package operand and reports
