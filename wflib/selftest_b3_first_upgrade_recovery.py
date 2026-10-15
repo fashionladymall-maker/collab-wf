@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -86,7 +87,10 @@ def _tree_bytes(path: Path) -> dict:
     if path.exists():
         for p in sorted(path.rglob("*")):
             if p.is_file() and not p.is_symlink():
-                out[str(p.relative_to(path))] = hashlib.sha256(p.read_bytes()).hexdigest()
+                try:
+                    out[str(p.relative_to(path))] = hashlib.sha256(p.read_bytes()).hexdigest()
+                except PermissionError:   # the observer must not fail on an unreadable (chmod 000) file
+                    out[str(p.relative_to(path))] = "unreadable:" + oct(p.lstat().st_mode & 0o777)
     return out
 
 
@@ -675,6 +679,124 @@ class FirstUpgradeRecoveryTests(unittest.TestCase):
         self.assertEqual((rc, out["result"]), (0, "restored"), r.stdout[-1500:])
         self.assertEqual((self.git("rev-parse", "HEAD^{tree}"), oct(version.stat().st_mode & 0o777)), (OLD_TREE, "0o644"))
         self.assertEqual(self.wf("self-check", check=False).returncode, 0)
+
+    # ---------------- B3-MAIN-UPGRADE-FIX3-20261016-1 ----------------
+
+    @contextmanager
+    def env_set(self, **kw):
+        saved = dict(self.env)
+        self.env.update(kw)
+        try:
+            yield
+        finally:
+            self.env.clear()
+            self.env.update(saved)
+
+    def zero_write_refusals(self, sha, target, want):
+        """plan and apply both refuse with `want`; code, modes, HEAD, journal and protected state unchanged."""
+        before = self.everything()
+        got = (self.refused("plan", sha)[0], self.refused("apply", sha, target)[0])
+        self.assertEqual((got, self.everything()), ((want, want), before))
+
+    def refused_freeze(self, snap, want):
+        snap.parent.mkdir(parents=True, exist_ok=True)
+        before = self.everything()
+        rc, out, _ = self.tool("freeze", "--install-root", str(self.root), "--snapshot-dir", str(snap))
+        self.assertEqual((rc, out["code"], snap.exists(), self.everything()), (2, want, False, before), str(snap))
+
+    def test_runtime_state_overlapping_install_code_is_refused_before_any_write(self):
+        conflict = "protected_state_overlaps_install_code"
+        alias = self.base / "local-alias-into-code"
+        alias.symlink_to(self.root / "wflib", target_is_directory=True)
+        bad = {"code dir": self.root / "docs", "install root": self.root, "contains install root": self.root.parent,
+               "alias whose target is code": alias}
+        for name, value in bad.items():
+            with self.env_set(WF_LOCAL_DIR=str(value)):
+                self.refused_freeze(self.base / "snaps" / name.replace(" ", "-"), conflict)
+        sha = self.freeze()
+        self.upgrade()
+        upgraded = self.git("rev-parse", "HEAD")
+        target = self.plan(sha)["target_id"]
+        for name, value in bad.items():
+            with self.env_set(WF_LOCAL_DIR=str(value)):
+                self.zero_write_refusals(sha, target, conflict)
+        # A registered project whose workflow's canonical target is installed code (real old `wf init`).
+        self.wf("init", "--name", "p3", "--root", str(self.base / "p3"))
+        wfdir, kept = self.base / "p3" / "workflow", self.base / "p3-workflow-real"
+        wfdir.rename(kept)
+        wfdir.symlink_to(self.root / "docs", target_is_directory=True)
+        self.zero_write_refusals(sha, target, conflict)
+        wfdir.unlink()
+        kept.rename(wfdir)
+        self.assertEqual(self.git("rev-parse", "HEAD"), upgraded)
+        # Second layer: the real derived write set against a runtime root placed on code.
+        runner, p = _runner(), self.plan(sha)
+        with self.assertRaises(runner.Refused) as ctx:
+            runner._check_write_set(self.root, [("wf_local", self.root / "docs")],
+                                    {"writes": p["writes"], "deletes": p["deletes"]}, sha, p["head"]["tree"])
+        self.assertEqual(ctx.exception.code, "restore_writes_protected_state")
+        with self.env_set(WF_LOCAL_DIR=str(self.root / "local")):   # the excluded install local stays usable
+            self.assertEqual(self.plan(sha)["conclusions"]["code_recovery"], "restorable")
+        rc, out, r = self.apply(sha, target)   # normal external WF_LOCAL: real recovery still succeeds
+        self.assertEqual((rc, out["result"], self.git("rev-parse", "HEAD^{tree}")), (0, "restored", OLD_TREE), r.stdout[-800:])
+        self.assertEqual(self.wf("self-check", check=False).returncode, 0)
+
+    def test_registry_protocol_is_validated_with_zero_writes(self):
+        reg = self.local / "registry.json"
+        good = reg.read_bytes()
+        self.assertTrue(all(isinstance(r.get("root"), str) and os.path.isabs(r["root"])
+                            for r in json.loads(good)["projects"]))   # what the real old `wf init` wrote
+        cases = {"empty_object": b"{}", "relative_root": b'{"projects":[{"root":"relative-project"}]}',
+                 "empty_root": b'{"projects":[{"root":""}]}', "missing_root": b'{"projects":[{"name":"x"}]}',
+                 "numeric_root": b'{"projects":[{"root":5}]}', "null_projects": b'{"projects":null}',
+                 "projects_object": b'{"projects":{}}', "top_array": b"[]", "malformed": b"{not json"}
+
+        def each(check):
+            for name, raw in cases.items():
+                reg.write_bytes(raw)
+                check(name)
+            reg.write_bytes(b"{}")
+            reg.chmod(0o000)
+            check("unreadable_mode_000")
+            reg.chmod(0o600)
+            reg.unlink()
+            (self.base / "registry-elsewhere.json").write_bytes(good)
+            reg.symlink_to(self.base / "registry-elsewhere.json")
+            check("symlink")
+            reg.unlink()
+            reg.write_bytes(good)
+        want = lambda name: "registry_not_regular" if name == "symlink" else "registry_unreadable"
+        each(lambda name: self.refused_freeze(self.base / "snaps" / name, want(name)))
+        sha = self.freeze()
+        self.upgrade()
+        target = self.plan(sha)["target_id"]
+        each(lambda name: self.zero_write_refusals(sha, target, want(name)))
+        self.assertEqual(reg.read_bytes(), good)
+        rc, out, _ = self.apply(sha, target)
+        self.assertEqual((rc, out["result"]), (0, "restored"))
+
+    def test_lexical_aliases_inside_snapshot_are_refused(self):
+        sha = self.freeze()
+        self.upgrade()
+        target = self.plan(sha)["target_id"]
+        alias = self.snap / "wf-local-alias"   # lexically inside the snapshot, canonically the real external LOCAL
+        alias.symlink_to(self.local, target_is_directory=True)
+        with self.env_set(WF_LOCAL_DIR=str(alias)):
+            self.zero_write_refusals(sha, target, "snapshot_overlaps_protected_state")
+        alias.unlink()
+        reg = self.local / "registry.json"
+        good = reg.read_bytes()
+        proj_alias = self.snap / "project-alias"   # registered root lexically inside the snapshot
+        proj_alias.symlink_to(self.base / "p1", target_is_directory=True)
+        doc = json.loads(good)
+        doc["projects"].append({"name": "p-alias", "root": str(proj_alias)})
+        reg.write_text(json.dumps(doc))
+        self.zero_write_refusals(sha, target, "snapshot_overlaps_protected_state")
+        reg.write_bytes(good)
+        proj_alias.unlink()
+        self.assertFalse((self.snap / "journal").exists())
+        rc, out, _ = self.apply(sha, target)
+        self.assertEqual((rc, out["result"], self.git("rev-parse", "HEAD^{tree}")), (0, "restored", OLD_TREE))
 
 
 if __name__ == "__main__":

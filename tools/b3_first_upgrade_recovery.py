@@ -165,47 +165,102 @@ def _identity(root: Path) -> dict:
     return {"dev": st.st_dev, "ino": st.st_ino}
 
 
-def _state_roots(root: Path) -> list:
-    """Runtime state the runner must never write; recorded only to report changes."""
-    roots = [("install_local", root / "local")]
-    local = os.environ.get("WF_LOCAL_DIR")
-    local = Path(os.path.realpath(local)) if local else root / "local"
-    if local != root / "local":
-        roots.append(("wf_local", local))
+def _forms(p) -> set:
+    """Lexical (as configured, normalised) and canonical forms; both take part in every boundary check."""
+    lexical = os.path.normpath(os.path.abspath(str(p)))
+    return {Path(lexical), Path(os.path.realpath(lexical))}
+
+
+def _registry_projects(local: Path) -> list:
+    """Registered project roots exactly as recorded; the registry protocol is {"projects": [{"root": abs}, ...]}.
+
+    Counterexamples (2026-10-16): {} was read as zero projects, and relative or empty roots were resolved
+    against the process cwd. projects is required, every root must be a non-empty absolute path; other
+    fields (name, added) stay free for compatibility with registries written by core.register.
+    """
     reg = local / "registry.json"
-    if os.path.lexists(reg):   # an unreadable registry would silently drop project protection: refuse
-        if not stat.S_ISREG(os.lstat(reg).st_mode):
-            raise Refused("registry_not_regular", str(reg))
-        try:
-            doc = json.loads(reg.read_bytes())
-            rows = doc.get("projects", []) if isinstance(doc, dict) else None
-            if not isinstance(rows, list):
-                raise ValueError("projects must be a list")
-            projects = [Path(os.path.realpath(row["root"])) for row in rows]
-        except (ValueError, KeyError, TypeError, UnicodeError, OSError) as e:
-            raise Refused("registry_unreadable", f"{reg}: {e}"[:200]) from None
-        for proj in projects:
-            if _overlap(proj, root):
-                raise Refused("project_overlaps_install_root", str(proj))
-            roots.append(("project_workflow", proj / "workflow"))
+    if not os.path.lexists(reg):
+        return []
+    if not stat.S_ISREG(os.lstat(reg).st_mode):
+        raise Refused("registry_not_regular", str(reg))
+    try:
+        doc = json.loads(reg.read_bytes())
+    except (ValueError, UnicodeError, OSError) as e:
+        raise Refused("registry_unreadable", f"{reg}: {e}"[:200]) from None
+    if not isinstance(doc, dict) or not isinstance(doc.get("projects"), list):
+        raise Refused("registry_unreadable", f"{reg}: top level must be an object with a projects list")
+    out = []
+    for i, row in enumerate(doc["projects"]):
+        value = row.get("root") if isinstance(row, dict) else None
+        if not isinstance(value, str) or not value or "\0" in value or not os.path.isabs(value):
+            raise Refused("registry_unreadable", f"{reg}: projects[{i}].root must be a non-empty absolute path")
+        out.append(Path(os.path.normpath(value)))
+    return out
+
+
+def _state_roots(root: Path) -> list:
+    """Runtime state the runner must never write, kept in lexical form (canonical forms derive from it)."""
+    roots = [("install_local", root / "local")]
+    raw = os.environ.get("WF_LOCAL_DIR")
+    if raw is None:
+        local = root / "local"
+    else:
+        if not raw or not os.path.isabs(raw):   # core would resolve it against the cwd
+            raise Refused("wf_local_not_absolute", repr(raw))
+        local = Path(os.path.normpath(raw))
+        if _forms(local) != _forms(root / "local"):
+            roots.append(("wf_local", local))
+    for proj in _registry_projects(local):
+        if any(_overlap(a, b) for a in _forms(proj) for b in _forms(root)):
+            raise Refused("project_overlaps_install_root", str(proj))
+        roots.append(("project_workflow", proj / "workflow"))
     return roots
 
 
-def _check_snapshot_boundary(snap: Path, root: Path):
-    """The snapshot (manifest, blobs, journal) must neither lie in nor contain any protected root.
+def _check_runtime_layout(root: Path, runtime: list):
+    """No runtime state root may overlap installed code; only the lexical root/local/ is excluded from code.
 
-    Counterexamples (2026-10-16): a snapshot inside a synthetic WF_LOCAL_DIR was frozen (69 files), and a
-    legitimately frozen snapshot moved into WF_LOCAL_DIR received journal/apply+completed while the plan
-    claimed never_written_by_runner. Checked before any creation, cleanup, code or journal write, against
-    canonical and lexical forms of every protected root.
+    Counterexample (2026-10-16): WF_LOCAL_DIR = <install root>/docs; plan and apply succeeded, five docs
+    files were rewritten or deleted, and the plan still reported never_written_by_runner. Inside, equal and
+    containing positions are refused, in lexical and canonical form, before anything is created or written.
+    A conflicting layout is refused, never repaired: no state is moved or deleted.
     """
-    protected = [("install_root", root)] + _state_roots(root)
-    forms = {Path(os.path.realpath(snap)), Path(os.path.abspath(snap))}
-    for kind, prot in protected:
-        for pf in {Path(os.path.realpath(prot)), Path(os.path.abspath(prot))}:
-            for sf in forms:
+    excluded = Path(os.path.normpath(str(root / "local")))
+    code = _forms(root)
+    for kind, prot in runtime:
+        for f in _forms(prot):
+            if f == excluded or excluded in f.parents:
+                continue
+            for r in code:
+                if _overlap(f, r):
+                    raise Refused("protected_state_overlaps_install_code", f"{kind} {f} / install root {r}")
+
+
+def _check_snapshot_boundary(snap: Path, root: Path, runtime: list):
+    """The snapshot (manifest, blobs, journal) must neither lie in nor contain the install root or any runtime root.
+
+    Counterexamples (2026-10-16): a snapshot inside WF_LOCAL_DIR was frozen; a frozen snapshot moved into it
+    received journal records; and WF_LOCAL_DIR configured as a symlink *inside* the snapshot passed because
+    only canonical forms were compared. Lexical and canonical forms of both sides are compared.
+    """
+    for kind, prot in [("install_root", root)] + runtime:
+        for pf in _forms(prot):
+            for sf in _forms(snap):
                 if _overlap(sf, pf):
                     raise Refused("snapshot_overlaps_protected_state", f"{kind} {pf} / snapshot {sf}")
+
+
+def _check_write_set(root: Path, runtime: list, derived: dict, snapshot_sha256: str, base_tree: str):
+    """Every path the restore may create, replace, delete or clean must lie outside every runtime root."""
+    rels = {w["path"] for w in derived["writes"]} | {d["path"] for d in derived["deletes"]}
+    rels |= {_temp_rel(snapshot_sha256, base_tree, w["path"]) for w in derived["writes"]}
+    rels |= {"/".join(w["path"].split("/")[:i]) for w in derived["writes"] for i in range(1, w["path"].count("/") + 1)}
+    prot = [(kind, f) for kind, p in runtime for f in _forms(p)]
+    for rel in sorted(rels):
+        for t in _forms(root / rel):
+            for kind, f in prot:
+                if t == f or f in t.parents:
+                    raise Refused("restore_writes_protected_state", f"{rel} -> {kind} {f}")
 
 
 def _inventory(path: Path) -> dict:
@@ -267,7 +322,9 @@ def freeze(install_root, snapshot_dir, *, review_id=None, package=None) -> dict:
     snap = parent / snap.name
     if _overlap(snap, root):
         raise Refused("snapshot_overlaps_install_root", f"{snap} / {root}")
-    _check_snapshot_boundary(snap, root)
+    runtime = _state_roots(root)
+    _check_runtime_layout(root, runtime)
+    _check_snapshot_boundary(snap, root, runtime)
     if os.path.lexists(snap):
         raise Refused("snapshot_dir_exists", str(snap))
     _repo(root)
@@ -634,13 +691,16 @@ def plan(install_root, snapshot_dir, snapshot_sha256) -> dict:
         raise Refused("install_root_identity_mismatch", str(root))
     if _overlap(snap["_dir"], root):
         raise Refused("snapshot_overlaps_install_root", str(snap["_dir"]))
-    _check_snapshot_boundary(snap["_dir"], root)   # plan precedes every apply step, including journal writes
+    runtime = _state_roots(root)   # plan precedes every apply step, including journal writes
+    _check_runtime_layout(root, runtime)
+    _check_snapshot_boundary(snap["_dir"], root, runtime)
     _repo(root)
     journal = _journal_read(snap["_dir"])
     head = _head(root)
     base = _tree_listing(root, head["tree"])
     base_sha = _blob_sha256(root, [b for _m, b in base.values()])
     derived = _derive_plan(snap, base, base_sha)
+    _check_write_set(root, runtime, derived, snapshot_sha256, head["tree"])
     frozen = {r["path"]: (r["sha256"], r["mode"]) for r in snap["files"]}
     inv = _code_inventory(root)
     temps = []
