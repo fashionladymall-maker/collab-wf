@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -74,15 +75,20 @@ def _git(root: Path, *args, check=True, inp=None) -> str:
 
 
 def _directory(path, what) -> Path:
-    """Absolute, alias-free (no symlink component), existing real directory."""
-    p = Path(path)
-    if not p.is_absolute():
-        raise Refused(f"{what}_not_absolute", str(p))
-    norm = os.path.normpath(str(p))
-    if os.path.realpath(norm) != norm:
-        raise Refused(f"{what}_path_alias", f"{norm} -> {os.path.realpath(norm)}")
+    """Absolute, alias-free (no symlink component), existing real directory.
+
+    The path is judged exactly as given: realpath of the raw string (a symlink component followed by '..'
+    resolves as the operating system resolves it) must equal its lexical normalisation. Counterexample
+    (2026-10-16): '<hop>/..' with hop -> <install>/wflib was normalised to the hop's parent first.
+    """
+    raw = os.fspath(path)
+    if not os.path.isabs(raw):
+        raise Refused(f"{what}_not_absolute", raw)
+    norm, real = os.path.normpath(raw), os.path.realpath(raw)
+    if real != norm:
+        raise Refused(f"{what}_path_alias", f"{raw} -> {real}")
     try:
-        st = os.lstat(norm)
+        st = os.lstat(raw)
     except FileNotFoundError:
         raise Refused(f"{what}_missing", norm) from None
     if not stat.S_ISDIR(st.st_mode):
@@ -166,9 +172,18 @@ def _identity(root: Path) -> dict:
 
 
 def _forms(p) -> set:
-    """Lexical (as configured, normalised) and canonical forms; both take part in every boundary check."""
-    lexical = os.path.normpath(os.path.abspath(str(p)))
-    return {Path(lexical), Path(os.path.realpath(lexical))}
+    """Lexical and canonical forms of a configured absolute path; both take part in every boundary check.
+
+    The canonical form is realpath of the path exactly as configured, so a symlink component followed by
+    '..' resolves the way the operating system and core resolve it. The lexical form is a separate
+    normalisation of the same raw string and is never fed back into realpath. Counterexample (2026-10-16):
+    WF_LOCAL_DIR '<local-hop>/../docs' with local-hop -> <install>/wflib was normalised to '<base>/docs'
+    before realpath, while core used <install>/docs; plan/apply rewrote five docs files.
+    """
+    raw = os.fspath(p)
+    if not os.path.isabs(raw):
+        raise Refused("path_not_absolute", raw)
+    return {Path(os.path.normpath(raw)), Path(os.path.realpath(raw))}
 
 
 def _registry_projects(local: Path) -> list:
@@ -194,7 +209,7 @@ def _registry_projects(local: Path) -> list:
         value = row.get("root") if isinstance(row, dict) else None
         if not isinstance(value, str) or not value or "\0" in value or not os.path.isabs(value):
             raise Refused("registry_unreadable", f"{reg}: projects[{i}].root must be a non-empty absolute path")
-        out.append(Path(os.path.normpath(value)))
+        out.append(Path(value))   # kept as recorded: core resolves it with OS semantics (symlink, then '..')
     return out
 
 
@@ -207,7 +222,7 @@ def _state_roots(root: Path) -> list:
     else:
         if not raw or not os.path.isabs(raw):   # core would resolve it against the cwd
             raise Refused("wf_local_not_absolute", repr(raw))
-        local = Path(os.path.normpath(raw))
+        local = Path(raw)   # kept as configured: core reads LOCAL through the raw path (symlink, then '..')
         if _forms(local) != _forms(root / "local"):
             roots.append(("wf_local", local))
     for proj in _registry_projects(local):
@@ -315,9 +330,12 @@ def _qualified_old_source(root: Path, files: dict, rows: list) -> dict:
 
 def freeze(install_root, snapshot_dir, *, review_id=None, package=None) -> dict:
     root = _directory(install_root, "install_root")
-    snap = Path(os.path.normpath(str(snapshot_dir)))
-    if not snap.is_absolute():
-        raise Refused("snapshot_not_absolute", str(snap))
+    raw = os.fspath(snapshot_dir)
+    if not os.path.isabs(raw):
+        raise Refused("snapshot_not_absolute", raw)
+    snap = Path(os.path.normpath(raw))
+    if os.path.realpath(raw) != str(snap):   # judged as given: a symlink component before '..' is an alias
+        raise Refused("snapshot_path_alias", f"{raw} -> {os.path.realpath(raw)}")
     parent = _directory(snap.parent, "snapshot_parent")
     snap = parent / snap.name
     if _overlap(snap, root):
@@ -520,6 +538,62 @@ def _code_inventory(root: Path) -> dict:
             else:
                 code[rel] = (st, fp)
     return {"code": code, "cache": sorted(cache), "non_regular": sorted(odd)}
+
+
+def _bytecode_context() -> dict:
+    """The interpreter and cache context a plan's restart conclusion is established for: this runner's own.
+
+    Bytecode caches are looked up where *this* interpreter, with *this* environment, would read them.
+    Another interpreter, cache tag, pycache_prefix or HOME (Apple's default prefix lives under HOME) is a
+    different context for which nothing is established.
+    """
+    return {"executable": sys.executable, "version": sys.version.split()[0],
+            "cache_tag": sys.implementation.cache_tag, "pycache_prefix": sys.pycache_prefix,
+            "HOME": os.environ.get("HOME"), "PYTHONPYCACHEPREFIX": os.environ.get("PYTHONPYCACHEPREFIX")}
+
+
+def _context_bytecode(root: Path, inv: dict) -> tuple:
+    """Existing caches this interpreter would read for installed sources, outside the install root.
+
+    Counterexample (2026-10-16, Apple Python 3.9.6 on m4): the default sys.pycache_prefix
+    ($HOME/Library/Caches/com.apple.python) holds caches outside the install root and without a
+    __pycache__ segment; an UNCHECKED_HASH cache there ran a marker on plain and -B imports while the
+    install-root scan found nothing and the plan said operator_may_restart_old_code. Only the exact
+    cache_from_source paths of installed sources (optimisation '', 1, 2) are inspected; nothing in HOME
+    or elsewhere is enumerated, and nothing is deleted. Caches inside the install root are covered by the
+    install-root scan. An entry that cannot be inspected leaves the context not established.
+    """
+    found, problems = [], []
+    if sys.implementation.cache_tag is None:
+        return found, problems
+    for rel in sorted(inv["code"]):
+        if not rel.endswith(".py"):
+            continue
+        for opt in ("", 1, 2):
+            try:
+                cache = Path(importlib.util.cache_from_source(str(root / rel), optimization=opt))
+            except (NotImplementedError, ValueError) as e:
+                problems.append(f"{rel}: {type(e).__name__}")
+                continue
+            if _overlap(cache, root) or root in cache.parents:
+                continue
+            try:
+                st = os.lstat(cache)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                problems.append(f"{cache}: {type(e).__name__}")
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                problems.append(f"{cache}: not a regular file")
+                continue
+            try:
+                digest = _sha256(cache.read_bytes())
+            except OSError as e:
+                problems.append(f"{cache}: {type(e).__name__}")
+                continue
+            found.append({"path": str(cache), "source": rel, "location": "pycache_prefix", "sha256": digest})
+    return found, problems
 
 
 def _disk_vs(inv: dict, expect: dict) -> list:
@@ -736,32 +810,42 @@ def plan(install_root, snapshot_dir, snapshot_sha256) -> dict:
     # with forged header fields) executes without reading the source, and -B/PYTHONDONTWRITEBYTECODE
     # still read existing caches. They are listed, kept and block "may restart"; code_recovery covers
     # source files only.
-    caches = [{"path": c, "sha256": _sha256((root / c).read_bytes())} for c in inv["cache"]]
+    caches = [{"path": c, "location": "install_root", "sha256": _sha256((root / c).read_bytes())}
+              for c in inv["cache"]]
+    context = _bytecode_context()
+    external, uninspectable = _context_bytecode(root, inv)
+    caches += external
     blockers = ([] if restored else ["code_recovery_not_already_restored"]) \
         + (["runtime_state_changed_since_freeze"] if state_diff else []) \
-        + ([f"unbound_bytecode_cache:{len(caches)}"] if caches else [])
+        + ([f"unbound_bytecode_cache:{len(caches)}"] if caches else []) \
+        + ([f"bytecode_cache_context_not_established:{len(uninspectable)}"] if uninspectable else [])
     return {
         "result": "plan", "snapshot_sha256": snapshot_sha256, "install_root": str(root), "head": head,
         "frozen": {"git": snap["git"], "version": snap["version"], "files": len(frozen)},
         "target_id": target_id, "plan_sha256": _plan_sha256(snapshot_sha256, target_id, head, derived),
         "writes": derived["writes"], "deletes": derived["deletes"],
         "inventory": {"code_files": len(inv["code"]), "bytecode_cache_unverified": caches,
+                      "bytecode_cache_uninspectable": uninspectable, "bytecode_context": context,
                       "registered_temps_found": temps},
         "journal": {k: bool(v) if k != "failed" else v for k, v in journal.items()},
         "conclusions": {
             "code_recovery": code,
             "state_preservation": {"status": "never_written_by_runner",
-                                   "roots": [{"kind": s["kind"], "root": s["root"], "files": len(s["files"])}
+                                   "roots": [{"kind": s["kind"], "root": s["root"],
+                                              "canonical": os.path.realpath(s["root"]), "files": len(s["files"])}
                                              for s in state_now]},
             "schema_compat": {"status": schema, "changed_since_freeze": state_diff},
             "restart": {"auto_start": False,
                         "status": "operator_may_restart_old_code" if not blockers else "not_established",
-                        "blockers": blockers,
+                        "blockers": blockers, "established_for": context,
                         "requires": ["code_recovery == already_restored (source files, bytes and exec bit)",
                                      "schema_compat == unchanged_since_freeze, or an explicit review of every "
                                      "changed runtime state file against the old code",
-                                     "no Python bytecode cache below the install root: caches are not bound to "
-                                     "the frozen source and are never deleted by the runner",
+                                     "no Python bytecode cache below the install root, nor at the cache paths "
+                                     "of installed sources in the established_for context (pycache_prefix): "
+                                     "caches are not bound to the frozen source and are never deleted by the runner",
+                                     "restart with the interpreter and environment in established_for only; "
+                                     "another interpreter, cache tag, pycache_prefix or HOME is not established",
                                      "no driver/board process from the newer code still running (not checked)"]},
         },
         "external_gate": snap.get("external_gate") or {"status": "none_recorded", "enforced_by_old_host": False},

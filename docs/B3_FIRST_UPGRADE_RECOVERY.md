@@ -90,7 +90,18 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 - WF_LOCAL_DIR，必须是非空的绝对路径，否则拒绝（`wf_local_not_absolute`），不借进程 cwd 推导；
 - registry 中每个已登记项目的 `workflow/`。
 
-每个运行状态根都按配置原样保留词法形式（normpath 与 abspath），比较时再生成规范形式（realpath）。两种形式都参与下面每一项检查，所以别名不会在比较之前被抹掉。
+每个运行状态根都按配置的原始绝对字符串保留，并从这个原始字符串分别得到两种形式：
+- **规范形式**：直接对原始字符串取 `realpath`。所以"软链接分量后面跟 `..`"按操作系统和 core 的实际语义解析：先解析软链接，再上溯。
+- **词法形式**：对同一个原始字符串单独做 `normpath`，并且永远不会再拿它去做 `realpath`。
+
+两种形式都参与下面每一项检查，所以别名不会在比较之前被抹掉。runner 读取 WF_LOCAL_DIR 下的 registry、清点运行状态时，用的也是原始路径，因此读到的是 core 实际使用的那个位置。安装根与快照路径同样按原始字符串判断：只要 `realpath(原始)` 与 `normpath(原始)` 不同，就按别名拒绝，对应 `install_root_path_alias`、`snapshot_dir_path_alias`，以及 freeze 的 `snapshot_path_alias`。
+
+**FIX4 之前的真实反例**：旧实现先 `normpath` 再 `realpath`，丢失了"软链接 + `..`"的实际语义。
+- **WF_LOCAL_DIR 为 `local-hop/../docs`，其中 local-hop 指向 `安装根/wflib`**：操作系统与 core 实际使用的是 `安装根/docs`，runner 却看到 `<base>/docs`。结果 freeze exit 0；升级后 plan、apply 都 exit 0 并报告 restored，实际改写或删除了代码文件，却仍报告 `never_written_by_runner`。
+- **已登记项目 root 为 `project-hop/../p1`**：操作系统解析出的项目的 `workflow` 指向 `安装根/docs`。结果同上。
+- **WF_LOCAL_DIR 为 `outside-local/hop/..`，其中 hop 指向 `快照/anchor`**：操作系统实际的 LOCAL 就是快照目录，runner 却看到 outside-local。结果 plan 和 apply 向快照（也就是实际的 LOCAL）写入了 `journal/apply.json` 和 `completed.json`。
+
+现在这三类都在 freeze、plan、apply 的前置阶段拒绝，并且零写入。
 
 在 freeze、plan、apply 中，以下检查都发生在任何 mkdir、清理、journal、代码写删、暂存和提交之前。apply 一开始就会先执行 plan。
 
@@ -114,21 +125,32 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 
 ## 字节码缓存（不认证）
 
-`__pycache__` 下的 `*.pyc` 无法与冻结源码绑定：
+字节码缓存无法与冻结源码绑定，无论它是在安装根下的 `__pycache__` 里，还是在解释器 `sys.pycache_prefix` 指向的外置目录里：
 - unchecked-hash 格式的 pyc（flags=1）在导入时根本不读源码；
 - timestamp 格式的 pyc 只比较头部记录的 mtime 和 size，这两个字段可以伪造；
 - checked-hash 格式只校验源码哈希，不校验其中的字节码是否就是这份源码编译出来的；
 - `-B` 和 `PYTHONDONTWRITEBYTECODE` 只是不再写新缓存，仍会读取已有缓存，不能当作修复。
 
 因此 runner 对缓存的处理是：
-- 不认证：`code_recovery` 只覆盖源码文件的集合、字节和可执行位；
-- 逐个报告：`inventory.bytecode_cache_unverified` 列出每个缓存文件的路径与 sha256；
-- 不删除：未知字节一律保留，由操作人决定；
-- 只要存在任何缓存，`restart` 结论就是 `not_established`，阻断项为 `unbound_bytecode_cache:N`。
+- 不认证：`code_recovery` 只覆盖源码文件的集合、字节和可执行位。
+- 两处查找：
+  - 安装根下的 `__pycache__`，不论缓存属于哪个解释器标签；
+  - **所绑定上下文**的外置缓存。上下文就是 runner 自己的解释器和环境，记录在 `inventory.bytecode_context` 与 `restart.established_for` 中，包括 executable、version、cache_tag、`sys.pycache_prefix`、HOME、PYTHONPYCACHEPREFIX。查找方式是：对每个已安装的 `.py` 源码，取该上下文中 `importlib.util.cache_from_source` 给出的确切路径（优化级别 ''、1、2），存在即列出。runner 不枚举整个 HOME 或系统。
+- 逐个报告：`inventory.bytecode_cache_unverified` 列出每个缓存的路径、sha256 和 `location`（`install_root` 或 `pycache_prefix`）。
+- 不删除：未知字节一律保留，由操作人决定。
+- 只要存在任何缓存，`restart` 结论就是 `not_established`，阻断项为 `unbound_bytecode_cache:N`。外置路径无法检查时（权限、非普通文件），阻断项为 `bytecode_cache_context_not_established:N`。
+- `operator_may_restart_old_code` 只对 `established_for` 中记录的那个上下文成立。换用其他解释器、缓存标签、pycache_prefix 或 HOME 重启，都没有建立任何结论；Apple 默认的 prefix 位于 HOME 之下，HOME 不同就是另一个上下文。
 
 真实反例：恢复完成后，放入用真实 `py_compile` 生成的 UNCHECKED_HASH 格式 driver 缓存，其中带有一个合成标记。
 此时源码与快照完全一致，旧 self-check 也返回 0，但新进程 import driver 会输出 `executed-unbound-bytecode`，
 加 `-B` 同样输出。现在 runner 报出这个缓存并阻断重启；只有在操作人删除缓存之后，标记才无法再执行，阻断项才会消失。
+
+**外置缓存的真实反例**（m4，Apple Python 3.9.6，uid 501）：
+- 默认 `sys.pycache_prefix` 是 `$HOME/Library/Caches/com.apple.python`，缓存路径在安装根之外，也不含 `__pycache__`。
+- 在该路径放入 UNCHECKED_HASH 格式的合成标记缓存后，普通 import 和 `-B` 都执行了标记。
+- FIX3 的 plan 和 apply 却报告 `bytecode_cache_unverified=[]`、`blockers=[]`、`operator_may_restart_old_code`。
+
+现在这个外置缓存会被列为 `location: pycache_prefix`，并阻断重启。
 
 ## 四项结论（互相独立）
 
@@ -137,13 +159,13 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 | `code_recovery` | `restorable` / `resume_interrupted_apply` / `already_restored`；其余情况都是拒绝 |
 | `state_preservation` | `never_written_by_runner`：runner 不写 `local/`、WF_LOCAL_DIR、已登记项目的 workflow；演练中逐字节核对恢复前后相同。这个结论以"保护状态边界"中的前置检查为前提：一旦运行状态根与安装代码冲突、恢复写集触及运行状态根，或快照与保护根交叠，plan 和 apply 都会在写入之前拒绝，根本不会给出这个结论 |
 | `schema_compat` | 比较冻结时与现在的运行状态清单。有新增或改动时为 `unverified`，并列出每个文件；不宣称旧代码能读新状态 |
-| `restart` | `auto_start=false`，runner 从不启动旧执行体。只有在 `blockers` 为空时才是 `operator_may_restart_old_code`，否则为 `not_established`。阻断项包括：代码未恢复、运行状态自冻结后有变化、安装根下存在任何未认证的字节码缓存（`unbound_bytecode_cache:N`） |
+| `restart` | `auto_start=false`，runner 从不启动旧执行体。只有在 `blockers` 为空时才是 `operator_may_restart_old_code`，否则为 `not_established`；这个结论只对 `established_for` 中记录的解释器与环境成立。阻断项包括：<br>• 代码未恢复；<br>• 运行状态自冻结后有变化；<br>• 安装根下或该上下文的外置缓存路径上存在任何未认证的字节码缓存（`unbound_bytecode_cache:N`）；<br>• 外置缓存路径无法检查（`bytecode_cache_context_not_established:N`） |
 
 演练中，旧安装器自己就会新建 `local/locks/self-update.lock`，所以 `schema_compat` 如实报 `unverified`。
 
 ## 拒绝条件（返回码 2，拒绝的那一步不写任何东西）
 
-- 路径不是绝对路径，或有别名、符号链接
+- 路径不是绝对路径，或有别名、符号链接（按原始字符串判断，包括"软链接分量 + `..`"：`install_root_path_alias`、`snapshot_dir_path_alias`、freeze 的 `snapshot_path_alias`）
 - 快照与安装根交叠，或快照目录已存在
 - 快照与任一保护根双向交叠（`snapshot_overlaps_protected_state`）
 - 运行状态根与安装代码冲突（`protected_state_overlaps_install_code`），或恢复写集触及运行状态根（`restore_writes_protected_state`）
@@ -194,7 +216,7 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   B3-MAIN-UPGRADE-FIX-20261016-1 返工时，`7b3b6cef…` 不在远端任何引用中，复跑使用
   `B3_CANDIDATE_TREE=3e72a969241e4b095be5058615538a5f494753af`（PR33/d01192d 的 tree，同样含 `wflib/install_history.py`，VERSION 1.9.7）。
   `--skip-test` 只跳过旧安装器“先跑候选版本自检”这一步。本卡不分配版本号。
-- `tests`：`python3 -m unittest -v wflib.selftest_b3_first_upgrade_recovery`，共 16 项：
+- `tests`：`python3 -m unittest -v wflib.selftest_b3_first_upgrade_recovery`，共 19 项：
   - 真实首次升级 → 新 self-rollback 失败 → 冻结树恢复，恢复后旧 self-check 通过；
   - 真实 SIGKILL 中断后续做（并发修改在全量验证阶段被拒，零写）；
   - 九类拒绝；
@@ -219,10 +241,29 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   - registry 协议：11 种坏形态（含 chmod 000 与符号链接）在 freeze、plan、apply 中都零写入拒绝；
     由真实旧版 `wf init` 写出的正常 registry 能照常恢复；
   - 词法别名：WF_LOCAL_DIR 或已登记项目 root 是快照内部的别名时，plan 与 apply 都拒绝，不写入 journal，
-    真实 LOCAL 也不被改动。
+    真实 LOCAL 也不被改动；
+  - 软链接 + `..`（FIX4）：
+    - WF_LOCAL_DIR 为 `local-hop/../docs`、已登记项目 root 为 `project-hop/../p1`（其 workflow 指向 docs），
+      在 freeze、plan、apply 中都以 `protected_state_overlaps_install_code` 零写入拒绝；
+    - WF_LOCAL_DIR 为 `outside/hop/..`（实际即快照）时，以 `snapshot_overlaps_protected_state` 零写入拒绝；
+    - 快照与安装根路径为"软链接 + `..`"时，按别名拒绝（`snapshot_path_alias`、`snapshot_dir_path_alias`、
+      `install_root_path_alias`）；
+    - 普通外部别名 LOCAL、无软链接的 `..`、registry 额外字段都照常恢复；
+  - 外置缓存（FIX4）：在 import 子进程的实际上下文中取 `sys.pycache_prefix` 与 `cache_from_source`。
+    - 解释器有原生 prefix（Apple）时直接使用；
+    - 没有原生 prefix 时（Linux），用 `PYTHONPYCACHEPREFIX=<HOME>/Library/Caches/com.apple.python` 模拟同一机制，
+      并在上下文中如实记录；
+    - 先做隔离对照：测试删除缓存和旧更新留下的锁，此时 `operator_may_restart_old_code`，`established_for` 为该上下文；
+    - 再放入 UNCHECKED_HASH 缓存：普通 import 与 `-B` 都执行标记；plan 与 apply 列出 `pycache_prefix` 缓存、
+      阻断重启、零写入并保留缓存；
+    - 换一个 HOME 与 prefix 就是另一个上下文，记录不同；
+    - 操作人删除缓存后阻断解除。
+  - 原有字节码测试改为在 import 子进程的实际上下文中计算缓存路径，并补建父目录链。
 - 未验证：
   - 正式发布包（尚未产生）；
   - 带 `--auto` 的旧审查路径；
   - 真实宿主上正在运行的新版看板或驱动器进程（runner 不检查进程）；
-  - macOS（m4）：本卡没有在 macOS 上运行任何测试。路径别名，例如 `/var` 与 `/private/var`，runner 一律拒绝，请传入规范路径；
+  - macOS（m4）：B3-UPGRADE-FIX4 只在 Linux 上实际运行过，以非 root 的 uid、setsid、Python 3.12 运行，`sys.pycache_prefix` 为 None。外置缓存部分在 Linux 上用 `PYTHONPYCACHEPREFIX` 模拟，模拟时在上下文中如实记录。
+    Apple Python 原生默认 prefix 下的完整模块和靶向例，都由协调端在 m4 上验收；本卡不声称已在 Mac 上运行，Mac F2-N6 的验收在那之前保持未关闭。
+    路径别名，例如 `/var` 与 `/private/var`，runner 一律拒绝，请传入规范路径；
   - 旧代码是否兼容新版写下的状态（只报告，不判定）。

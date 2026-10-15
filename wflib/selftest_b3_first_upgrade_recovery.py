@@ -11,7 +11,6 @@ install root and two projects; no credentials, no adapter, nothing is started.
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import os
 import py_compile
@@ -185,6 +184,28 @@ class FirstUpgradeRecoveryTests(unittest.TestCase):
     def apply(self, sha, target, script=None):
         return self.tool("apply", "--install-root", str(self.root), "--snapshot-dir", str(self.snap),
                          "--snapshot-sha256", sha, "--confirm-target", target, script=script)
+
+
+    # ---------------- bytecode cache context (B3-UPGRADE-FIX4 F2-N6) ----------------
+
+    def cache_context(self, src: Path) -> dict:
+        """sys.pycache_prefix and cache_from_source exactly as the import subprocess (self.env) sees them."""
+        r = subprocess.run([sys.executable, "-c", "import importlib.util, json, sys; print(json.dumps("
+                            "{'prefix': sys.pycache_prefix, 'cache': importlib.util.cache_from_source(sys.argv[1]), "
+                            "'executable': sys.executable, 'version': sys.version.split()[0]}))", str(src)],
+                           env=self.env, capture_output=True, text=True, check=True, timeout=60)
+        return json.loads(r.stdout)
+
+    def listed_key(self, cache: Path) -> str:
+        return str(cache.relative_to(self.root)) if self.root in cache.parents else str(cache)
+
+    def remove_caches(self, ctx: dict):
+        for d in sorted(self.root.rglob("__pycache__")):
+            shutil.rmtree(d)
+        if ctx["prefix"]:
+            tree = Path(ctx["prefix"]) / str(self.root).lstrip(os.sep)
+            if tree.exists():
+                shutil.rmtree(tree)
 
     # ---------------- drill ----------------
 
@@ -618,8 +639,9 @@ class FirstUpgradeRecoveryTests(unittest.TestCase):
         src = self.root / "wflib" / "driver.py"
         marked = self.base / "driver_with_synthetic_marker.py"
         marked.write_bytes(src.read_bytes() + b"\nB3_SYNTHETIC_UNBOUND_MARKER = print('" + mark.encode() + b"')\n")
-        cfile = Path(importlib.util.cache_from_source(str(src)))
-        cfile.parent.mkdir(exist_ok=True)
+        ctx = self.cache_context(src)   # where the import subprocess (self.env, its HOME) reads the cache
+        cfile = Path(ctx["cache"])
+        cfile.parent.mkdir(parents=True, exist_ok=True)
         py_compile.compile(str(marked), cfile=str(cfile), dfile=str(src), doraise=True,
                            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
         pyc = cfile.read_bytes()
@@ -638,13 +660,12 @@ class FirstUpgradeRecoveryTests(unittest.TestCase):
         rc, out, _ = self.apply(sha, p["target_id"])
         self.assertEqual((c["conclusions"]["code_recovery"], c["conclusions"]["restart"]["status"],
                           any(b.startswith("unbound_bytecode_cache:") for b in c["conclusions"]["restart"]["blockers"]),
-                          listed.get(str(cfile.relative_to(self.root))), rc, out["result"],
+                          listed.get(self.listed_key(cfile)), rc, out["result"],
                           out["conclusions"]["restart"]["status"], cfile.read_bytes() == pyc, self.everything() == before),
                          ("already_restored", "not_established", True, hashlib.sha256(pyc).hexdigest(), 0,
                           "already_restored", "not_established", True, True))
         self.assertEqual(self.wf("self-check", check=False).returncode, 0)   # the old self-check cannot see it
-        for d in sorted(self.root.rglob("__pycache__")):   # operator decision, never the runner
-            shutil.rmtree(d)
+        self.remove_caches(ctx)   # operator decision, never the runner
         self.assertFalse(imports("-B"))
         blockers = self.plan(sha)["conclusions"]["restart"]["blockers"]
         self.assertFalse(any(b.startswith("unbound_bytecode_cache") for b in blockers), blockers)
@@ -797,6 +818,162 @@ class FirstUpgradeRecoveryTests(unittest.TestCase):
         self.assertFalse((self.snap / "journal").exists())
         rc, out, _ = self.apply(sha, target)
         self.assertEqual((rc, out["result"], self.git("rev-parse", "HEAD^{tree}")), (0, "restored", OLD_TREE))
+
+    # ---------------- B3-UPGRADE-FIX4 (F2-N6): caches outside the install root ----------------
+
+    def test_external_pycache_prefix_cache_blocks_restart_in_its_context(self):
+        """Apple's default sys.pycache_prefix keeps caches outside the install root, without __pycache__.
+
+        With a native prefix (Apple Python: $HOME/Library/Caches/com.apple.python under the fixture HOME)
+        that prefix is used as is. An interpreter without one (Linux) gets the same mechanism through
+        PYTHONPYCACHEPREFIX at the same place; this is an emulation, recorded as such in the plan context.
+        """
+        mark = "executed-external-prefix-bytecode"
+        src = self.root / "wflib" / "driver.py"
+        native = self.cache_context(src)["prefix"]
+        if native is None:
+            self.env["PYTHONPYCACHEPREFIX"] = str(self.home / "Library" / "Caches" / "com.apple.python")
+        ctx = self.cache_context(src)
+        cfile = Path(ctx["cache"])
+        self.assertTrue(ctx["prefix"] and self.root not in cfile.parents and "__pycache__" not in cfile.parts, ctx)
+        sha = self.freeze()
+        self.upgrade()
+        target = self.plan(sha)["target_id"]
+        self.assertEqual(self.apply(sha, target)[1]["result"], "restored")
+        # Isolated control (test-only, not runner behaviour): remove every cache of this context and the
+        # lock the old self-update created after the freeze, so that nothing else blocks restart.
+        self.remove_caches(ctx)
+        changed = self.plan(sha)["conclusions"]["schema_compat"]["changed_since_freeze"]
+        self.assertEqual([(c["kind"], c["path"], c["change"]) for c in changed],
+                         [("install_local", "locks/self-update.lock", "created")])
+        (self.root / "local" / "locks" / "self-update.lock").unlink()
+        control = self.plan(sha)
+        restart = control["conclusions"]["restart"]
+        self.assertEqual((restart["status"], restart["blockers"], control["inventory"]["bytecode_cache_unverified"],
+                          restart["established_for"]["pycache_prefix"], restart["established_for"]["HOME"]),
+                         ("operator_may_restart_old_code", [], [], ctx["prefix"], str(self.home)))
+        # A real cache at the exact path this interpreter reads: unchecked hash, source equals the frozen one.
+        marked = self.base / "driver_with_external_marker.py"
+        marked.write_bytes(src.read_bytes() + b"\nB3_EXTERNAL_MARKER = print('" + mark.encode() + b"')\n")
+        cfile.parent.mkdir(parents=True, exist_ok=True)
+        py_compile.compile(str(marked), cfile=str(cfile), dfile=str(src), doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        pyc = cfile.read_bytes()
+        frozen = {r["path"]: r["sha256"] for r in json.loads((self.snap / "manifest.json").read_bytes())["files"]}
+        self.assertEqual((int.from_bytes(pyc[4:8], "little"), hashlib.sha256(src.read_bytes()).hexdigest()),
+                         (1, frozen["wflib/driver.py"]))
+
+        def imports(*flags):
+            r = subprocess.run([sys.executable, *flags, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import wflib.driver",
+                                str(self.root)], cwd=str(self.base), env=self.env, capture_output=True, text=True, timeout=120)
+            return mark in r.stdout
+        self.assertEqual((imports(), imports("-B")), (True, True))   # the cache is really read in this context
+        before = self.everything()
+        c = self.plan(sha)
+        listed = {x["path"]: (x["location"], x["sha256"]) for x in c["inventory"]["bytecode_cache_unverified"]}
+        rc, out, _ = self.apply(sha, target)
+        self.assertEqual((c["conclusions"]["code_recovery"], c["conclusions"]["restart"]["status"],
+                          any(b.startswith("unbound_bytecode_cache:") for b in c["conclusions"]["restart"]["blockers"]),
+                          listed.get(str(cfile)), rc, out["result"], out["conclusions"]["restart"]["status"],
+                          cfile.read_bytes() == pyc, self.everything() == before),
+                         ("already_restored", "not_established", True,
+                          ("pycache_prefix", hashlib.sha256(pyc).hexdigest()), 0, "already_restored", "not_established",
+                          True, True))
+        # The conclusion belongs to its context: a different HOME and prefix is another context, recorded as such.
+        other = {"HOME": str(self.base / "other-home"), "PYTHONPYCACHEPREFIX": str(self.base / "other-prefix")}
+        (self.base / "other-home").mkdir()
+        with self.env_set(**other):
+            o = self.plan(sha)
+        self.assertNotEqual(o["conclusions"]["restart"]["established_for"]["pycache_prefix"], ctx["prefix"])
+        self.assertNotIn(str(cfile), {x["path"] for x in o["inventory"]["bytecode_cache_unverified"]})
+        self.remove_caches(ctx)   # operator decision, never the runner
+        self.assertFalse(imports("-B"))
+        after = self.plan(sha)["conclusions"]["restart"]
+        self.assertEqual((after["status"], after["blockers"]), ("operator_may_restart_old_code", []))
+
+    # ---------------- B3-UPGRADE-FIX4 (F3-N1): a symlink component followed by '..' ----------------
+
+    def test_wf_local_and_project_root_symlink_dotdot_resolve_like_the_os(self):
+        conflict = "protected_state_overlaps_install_code"
+        hop = self.base / "local-hop"
+        hop.symlink_to(self.root / "wflib", target_is_directory=True)
+        wf_local = f"{hop}/../docs"   # the OS (and core) resolve this to <install>/docs
+        self.assertEqual(os.path.realpath(wf_local), str(self.root / "docs"))
+        inner = self.base / "elsewhere" / "inner"
+        inner.mkdir(parents=True)
+        (self.base / "elsewhere" / "p1").mkdir()
+        (self.base / "elsewhere" / "p1" / "workflow").symlink_to(self.root / "docs", target_is_directory=True)
+        (self.base / "project-hop").symlink_to(inner, target_is_directory=True)
+        proj = f"{self.base}/project-hop/../p1"   # OS: <base>/elsewhere/p1 whose workflow is <install>/docs
+        reg = self.local / "registry.json"
+        good = reg.read_bytes()
+        doc = json.loads(good)
+        doc["projects"].append({"name": "p-hop", "root": proj})
+        bad_registry = json.dumps(doc).encode()
+        with self.env_set(WF_LOCAL_DIR=wf_local):
+            self.refused_freeze(self.base / "snaps" / "wf-local-hop", conflict)
+        reg.write_bytes(bad_registry)
+        self.refused_freeze(self.base / "snaps" / "project-hop", conflict)
+        reg.write_bytes(good)
+        sha = self.freeze()
+        self.upgrade()
+        target = self.plan(sha)["target_id"]
+        with self.env_set(WF_LOCAL_DIR=wf_local):
+            self.zero_write_refusals(sha, target, conflict)
+        reg.write_bytes(bad_registry)
+        self.zero_write_refusals(sha, target, conflict)
+        reg.write_bytes(good)
+        # WF_LOCAL_DIR '<outside>/hop/..' with hop -> <snapshot>/anchor is the snapshot itself for the OS.
+        (self.snap / "anchor").mkdir()
+        outside = self.base / "outside-local"
+        outside.mkdir()
+        (outside / "hop").symlink_to(self.snap / "anchor", target_is_directory=True)
+        with self.env_set(WF_LOCAL_DIR=f"{outside}/hop/.."):
+            self.zero_write_refusals(sha, target, "snapshot_overlaps_protected_state")
+        (self.snap / "anchor").rmdir()
+        self.assertFalse((self.snap / "journal").exists())
+        # Compatibility: an ordinary external alias and a harmless '..' (no symlink) still recover.
+        alias = self.base / "local-alias"
+        alias.symlink_to(self.local, target_is_directory=True)
+        (self.base / "x").mkdir()
+        doc = json.loads(good)
+        doc["projects"].append({"name": "p1-again", "root": f"{self.base}/x/../p1", "extra": True})
+        reg.write_text(json.dumps(doc))
+        with self.env_set(WF_LOCAL_DIR=f"{self.base}/x/../local"):
+            self.assertEqual(self.plan(sha)["conclusions"]["code_recovery"], "restorable")
+        with self.env_set(WF_LOCAL_DIR=str(alias)):
+            plan = self.plan(sha)
+            rc, out, r = self.apply(sha, target)
+        roots = {(x["kind"], x["root"]): x["canonical"] for x in plan["conclusions"]["state_preservation"]["roots"]}
+        self.assertEqual(roots[("wf_local", str(alias))], str(self.local))
+        self.assertEqual((rc, out["result"], self.git("rev-parse", "HEAD^{tree}")), (0, "restored", OLD_TREE), r.stdout[-800:])
+
+    def test_snapshot_and_install_root_symlink_dotdot_are_aliases(self):
+        hop = self.base / "snap-hop"
+        hop.symlink_to(self.root / "wflib", target_is_directory=True)
+        before = self.everything()
+        rc, out, _ = self.tool("freeze", "--install-root", str(self.root), "--snapshot-dir", f"{hop}/../newsnap")
+        self.assertEqual((rc, out["code"], (self.root / "newsnap").exists(), (self.base / "newsnap").exists(),
+                          self.everything()), (2, "snapshot_path_alias", False, False, before))
+        ihop = self.base / "inst-hop"
+        ihop.symlink_to(self.root / "wflib", target_is_directory=True)
+        rc, out, _ = self.tool("freeze", "--install-root", f"{ihop}/..", "--snapshot-dir", str(self.snap))
+        self.assertEqual((rc, out["code"], self.snap.exists()), (2, "install_root_path_alias", False))
+        sha = self.freeze()
+        self.upgrade()
+        target = self.plan(sha)["target_id"]
+        shop = self.base / "snapdir-hop"
+        shop.symlink_to(self.snap / "blobs", target_is_directory=True)
+        for cmd in ("plan", "apply"):
+            args = [cmd, "--install-root", str(self.root), "--snapshot-dir", f"{shop}/..", "--snapshot-sha256", sha]
+            args += ["--confirm-target", target] if cmd == "apply" else []
+            before = self.everything()
+            rc, out, _ = self.tool(*args)
+            self.assertEqual((rc, out["code"], self.everything()), (2, "snapshot_dir_path_alias", before), cmd)
+            args = [cmd, "--install-root", f"{ihop}/..", "--snapshot-dir", str(self.snap), "--snapshot-sha256", sha]
+            args += ["--confirm-target", target] if cmd == "apply" else []
+            rc, out, _ = self.tool(*args)
+            self.assertEqual((rc, out["code"], self.everything()), (2, "install_root_path_alias", before), cmd)
 
 
 if __name__ == "__main__":
