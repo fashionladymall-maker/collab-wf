@@ -15,7 +15,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -116,6 +118,185 @@ def _permission_stop(ctx, why):
     ops.add_note(inst, "deviation", text, by="driver")
     inst.save()
     return "user", text
+
+
+class _OutgoingError(_PermissionError):
+    def __init__(self, why, secret=False):
+        super().__init__(why)
+        self.secret = secret
+
+
+def _message_path(ctx, path, others, directory=False):
+    """先核对归属再读取；目录模式只用于创建本轮正文副本的父目录。"""
+    try:
+        p = Path(path)
+        real = p.resolve(strict=True)
+        root = ctx.inst.root
+        if real == root or root not in real.parents:
+            raise ValueError("正文路径不在当前项目内")
+        for protected in (core.LOCAL.resolve(), (core.WF_HOME / "local").resolve()):
+            if real == protected or protected in real.parents:
+                raise ValueError("正文路径指向工具本地数据")
+        for row in others:
+            other = Path(row["root"])
+            if other == root or other in root.parents:
+                continue
+            if real == other or other in real.parents:
+                raise ValueError("正文路径指向另一注册项目")
+        mode = real.stat()
+        if directory:
+            if not stat.S_ISDIR(mode.st_mode):
+                raise ValueError("正文父路径不是目录")
+        elif not stat.S_ISREG(mode.st_mode) or mode.st_nlink != 1:
+            raise ValueError("正文不是独立的普通文件")
+        return real
+    except (OSError, ValueError, TypeError, RuntimeError) as e:
+        raise _OutgoingError(f"正文路径无法核对（{type(e).__name__}），没有外传正文") from e
+
+
+def _scan_message(ctx, path, others):
+    p = _message_path(ctx, path, others)
+    try:
+        raw = p.read_bytes()
+        raw.decode("utf-8")
+        checked = ops.check_outgoing(p, "task")   # 这里只消费 secret；不扩大原有结构门禁
+        if _message_path(ctx, path, others) != p or p.read_bytes() != raw:
+            raise _OutgoingError("扫描期间正文已改变，没有外传正文")
+    except (OSError, UnicodeError) as e:
+        raise _OutgoingError(f"正文无法读取（{type(e).__name__}），没有外传正文") from e
+    if checked["secrets"]:
+        raise _OutgoingError("属于必须停下的密钥内容：" + "；".join(checked["secrets"]), secret=True)
+    return p, raw, hashlib.sha256(raw).hexdigest()
+
+
+def _outgoing_check(ctx, out):
+    try:
+        _pol, others = _permission_context(ctx)
+    except _PermissionError:
+        # 直接调用 h_send 的旧夹具没有 workflow/policy.json；正常 run 已在入口验证过，
+        # 发送状态本身不能把缺失策略当作批准，仍要求严格 registry/root。
+        if (ctx.inst.wf / "policy.json").exists() or ctx.st.get("state") not in ("SEND", "COMPOSE"):
+            raise
+        try:
+            registry = json.loads(core.REGISTRY.read_text(encoding="utf-8"))
+            if not isinstance(registry, dict) or not isinstance(registry.get("projects"), list):
+                raise ValueError("registry 必须显式声明 projects 列表")
+            others = []
+            for row in registry["projects"]:
+                if not isinstance(row, dict) or not isinstance(row.get("name"), str) \
+                        or not isinstance(row.get("root"), str) or not Path(row["root"]).is_absolute():
+                    raise ValueError("registry 项目行无效")
+                others.append({"name": row["name"], "root": str(Path(row["root"]).resolve())})
+        except FileNotFoundError as e:
+            raise _PermissionError("注册表或项目根无法核对（FileNotFoundError），请检查项目登记") from e
+        except (OSError, ValueError, TypeError, RuntimeError) as e:
+            raise _PermissionError(f"注册表或项目根无法核对（{type(e).__name__}），请检查项目登记") from e
+    if not isinstance(out, dict) or type(out.get("turn")) is not int or out["turn"] != ctx.st["turn"] \
+            or out["turn"] <= 0 or out.get("kind") not in ("task", "report") \
+            or not isinstance(out.get("file"), str) or not out["file"]:
+        raise _OutgoingError("待发消息的轮次、类型或文件身份无效")
+    return _scan_message(ctx, out["file"], others)
+
+
+def _prepare_send(ctx, out):
+    source, raw, digest = _outgoing_check(ctx, out)
+    try:
+        _pol, others = _permission_context(ctx)
+    except _PermissionError:
+        try:
+            registry = json.loads(core.REGISTRY.read_text(encoding="utf-8"))
+            others = [{"name": r["name"], "root": str(Path(r["root"]).resolve())}
+                      for r in registry["projects"]]
+        except FileNotFoundError as e:
+            raise _PermissionError("注册表或项目根无法核对（FileNotFoundError），请检查项目登记") from e
+    # turn_dir 会创建目录；先检查已有 evidence，避免沿被换向的父目录写副本。
+    _message_path(ctx, ctx.inst.wf, others, directory=True)
+    ctx.inst.evidence.mkdir(parents=True, exist_ok=True)
+    _message_path(ctx, ctx.inst.evidence, others, directory=True)
+    folder = ctx.inst.turn_dir()
+    _message_path(ctx, folder, others, directory=True)
+    aid = secrets.token_hex(16)
+    snapshot = folder / f"send-{aid}.md"
+    fd = os.open(str(snapshot), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        _p, _raw, actual = _scan_message(ctx, snapshot, others)
+        if actual != digest:
+            raise _OutgoingError("待发正文副本与已检查内容不一致")
+    except Exception:
+        snapshot.unlink(missing_ok=True)
+        raise
+    return {"schema": "driver-message/1", "attempt_id": aid, "root": str(ctx.inst.root),
+            "turn": out["turn"], "snapshot": str(snapshot), "sha256": digest,
+            "source_file": str(source), "source_sha256": digest,
+            "outgoing": json.loads(json.dumps(out))}
+
+
+def _check_attempt(ctx, intent, new_send=False):
+    msg = intent.get("message") if isinstance(intent, dict) else None
+    if not isinstance(msg, dict) or msg.get("schema") != "driver-message/1" \
+            or not isinstance(msg.get("attempt_id"), str) or not re.fullmatch(r"[0-9a-f]{32}", msg["attempt_id"]) \
+            or msg.get("root") != str(ctx.inst.root) or type(msg.get("turn")) is not int \
+            or msg["turn"] != ctx.st["turn"] or intent.get("turn") != msg["turn"] \
+            or not isinstance(msg.get("outgoing"), dict):
+        raise _OutgoingError("旧发送意图没有可核对的正文绑定，不能用当前新正文代替")
+    expected = ctx.inst.evidence / f"turn-{msg['turn']:03d}" / f"send-{msg['attempt_id']}.md"
+    if msg.get("snapshot") != str(expected):
+        raise _OutgoingError("发送意图的正文副本身份不符")
+    try:
+        _pol, others = _permission_context(ctx)
+    except _PermissionError:
+        try:
+            registry = json.loads(core.REGISTRY.read_text(encoding="utf-8"))
+            others = [{"name": r["name"], "root": str(Path(r["root"]).resolve())}
+                      for r in registry["projects"]]
+        except FileNotFoundError as e:
+            raise _PermissionError("注册表或项目根无法核对（FileNotFoundError），请检查项目登记") from e
+    p, _raw, digest = _scan_message(ctx, expected, others)
+    if p != expected or digest != msg.get("sha256"):
+        raise _OutgoingError("旧发送正文副本已变化，不能作为发送或轮询依据")
+    if new_send:
+        if ctx.st.get("send_intent") != intent or ctx.st.get("outgoing") != msg["outgoing"]:
+            raise _OutgoingError("发送准备后意图或待发消息已被替换")
+        source, _raw, source_sha = _outgoing_check(ctx, ctx.st["outgoing"])
+        if str(source) != msg.get("source_file") or source_sha != msg.get("source_sha256"):
+            raise _OutgoingError("发送准备后源正文已改变，没有发送")
+    return {**msg["outgoing"], "file": str(p)}
+
+
+def _outgoing_stop(ctx, error):
+    text = str(error)
+    if "旧发送意图" in text and "SEND_UNKNOWN" not in text:
+        text = "[SEND_UNKNOWN] " + text
+    if getattr(error, "secret", False):
+        ctx.inst.event("auto", rule="OUTGOING_SECRET", action="block", detail=text, by="driver")
+    machine.go(ctx.inst, "BLOCKED", by="driver", reason=text, blocked_from=ctx.st["state"], block_reason=text)
+    ctx.st["needs_text"] = text
+    ctx.inst.save()
+    return "user", text
+
+
+def _abort_unsent(ctx, intent, slot, error):
+    """只有当前调用尚未进入 adapter.send 才能用；不释放后来者或旧未知发送的身份。"""
+    inst = ctx.inst
+    with inst.state_lock():
+        inst.save()
+        same = inst.state.get("send_intent") == intent
+        if same:
+            inst.state["send_intent"] = None
+        if slot and slot.get("lease_id"):
+            from . import arbiter
+            arbiter.release(inst, "outgoing_rejected", lease_id=slot["lease_id"], turn=slot.get("turn"))
+            if inst.state.get("send_slot") == slot:
+                inst.state.pop("send_slot", None)
+        inst.save()
+    if not same:
+        ops.add_note(inst, "deviation", "本次尚未发送的尝试被拒绝；当前意图已改变，保留后来者状态", by="driver")
+        return "user", str(error)
+    return _outgoing_stop(ctx, error)
 
 
 # ---------------- 入口 ----------------
@@ -576,6 +757,12 @@ def _new_conversation(ctx, out, why, b) -> tuple:
         return None, "上次自动开新对话的调用中途中断，结果不明（可能已经建好了一个新对话）；为避免重复建对话，不再自动重试"
     if not b:
         return None, "恢复包没有生成"
+    try:
+        _outgoing_check(ctx, out)
+        _pol, others = _permission_context(ctx)
+        _message_path(ctx, inst.outbox, others, directory=True)
+    except _PermissionError as e:
+        return None, str(e)
     sync_status = ""
     if b.get("short"):
         from . import sync
@@ -584,6 +771,11 @@ def _new_conversation(ctx, out, why, b) -> tuple:
     original = src.read_text(encoding="utf-8") if src and src.is_file() else ""
     text, effort, which = _newconv_message(b, original, sync_status)
     draft = inst.outbox / f"turn-{turn:03d}-newconv.md"
+    if os.path.lexists(draft):
+        try:
+            _message_path(ctx, draft, others)
+        except _PermissionError as e:
+            return None, str(e)
     draft.write_text(text, encoding="utf-8")
     chk = ops.check_outgoing(draft, "task")
     if chk["secrets"] or chk["problems"]:
@@ -676,6 +868,16 @@ def h_compose(ctx):
         machine.go(inst, "SEND", by="driver", reason="重发上一条消息（叶子被拒后）")
         return "progress", "重发上一条消息"
     if not out or out.get("turn") != st["turn"]:
+        try:
+            _pol, others = _permission_context(ctx)
+            _message_path(ctx, inst.wf, others, directory=True)
+            inst.outbox.mkdir(parents=True, exist_ok=True)
+            _message_path(ctx, inst.outbox, others, directory=True)
+            target = inst.outbox / f"turn-{st['turn']:03d}.md"
+            if os.path.lexists(target):
+                _message_path(ctx, target, others)
+        except _PermissionError as e:
+            return _outgoing_stop(ctx, e)
         body, kind, effort = _compose_text(ctx)
         p = inst.outbox / f"turn-{st['turn']:03d}.md"
         if body is None and p.exists():
@@ -692,12 +894,20 @@ def h_compose(ctx):
         if st.get("compose_reason") in ("continue", "checkpoint"):   # 1.7.6：用过即清，不再让之后每一轮都变成续接消息
             st.pop("compose_reason", None)
         inst.save()
+    try:
+        _outgoing_check(ctx, out)
+    except _PermissionError as e:
+        return _outgoing_stop(ctx, e)
     _append_tell(inst, out)   # 1.7.6：执行端用 wf tell 留给 Claude 的说明，附在这条待发消息末尾
     _append_limit_carry(inst, out)   # 1.8.2（P0-F）：上一条回复因上限结束时，请 Claude 先从断点补齐
     _append_receipt(inst, out)   # 1.8.7（W83）：回执码，回复要原样写回
-    chk = ops.check_outgoing(Path(out["file"]), out["kind"])
+    try:
+        _outgoing_check(ctx, out)
+        chk = ops.check_outgoing(Path(out["file"]), out["kind"])
+    except (OSError, UnicodeError, _PermissionError) as e:
+        return _outgoing_stop(ctx, e)
     if chk["secrets"]:
-        return _anomaly(ctx, {"source": "compose", "kind": "secret"}, "；".join(chk["secrets"]))
+        return _outgoing_stop(ctx, _OutgoingError("属于必须停下的密钥内容：" + "；".join(chk["secrets"]), secret=True))
     if chk["problems"] and out["kind"] == "report":
         return _anomaly(ctx, {"source": "compose", "kind": "structure"}, "；".join(chk["problems"]))
     c = st.get("conv") or {}
@@ -755,6 +965,9 @@ def h_send(ctx):
     out = st.get("outgoing") or {}
     turn = st["turn"]
     intent = st.get("send_intent")
+    if intent and (not isinstance(intent, dict) or (intent.get("status") == "pending"
+                   and (type(intent.get("turn")) is not int or intent["turn"] != turn))):
+        return _outgoing_stop(ctx, _OutgoingError("已有发送意图的轮次身份不符，保留原意图，不自动重发"))
     tdir = inst.turn_dir()
     gap = int(ctx.pol.get("min_send_gap_s", 0) or 0)   # 1.6.5（W42）：默认 0，不改变原有行为
     ra = st.get("replied_at")
@@ -767,19 +980,28 @@ def h_send(ctx):
                             "（min_send_gap_s，W42：太早发送会接到上一条残留的生成，被误判为已接受）")
     if intent and intent.get("turn") == turn and intent.get("status") == "pending":
         _slot_missing_check(ctx, "发送结果不明的核对")   # B1-A r2：缺 token 也留痕；只核对，不 acquire、不借用、不重发
+        intent = json.loads(json.dumps(intent))
         pargs = ["--project", inst.name, "--turn", turn, "--ref", intent.get("ref") or "", "--out", tdir / "delivered"]
         pargs += anomaly.conv_args(inst)   # 1.7.0（ISOLATION.md S1）：本项目的对话
-        if anomaly.transport_cfg().get("poll_since"):
+        if not intent.get("ref"):
+            try:
+                old_out = _check_attempt(ctx, intent)
+            except _PermissionError as e:
+                return _outgoing_stop(ctx, e)
+        if not intent.get("ref") and anomaly.transport_cfg().get("poll_since"):
             # 1.5.1：没有 ref 时，让适配器按“发送时刻之后、内容与本轮消息相同的那条消息”定位（transport.json 的 poll_since）
-            pargs += ["--since", intent.get("ts") or "", "--message", intent.get("file") or out.get("file") or "",
+            pargs += ["--since", intent.get("ts") or "", "--message", old_out["file"],
                       "--prev-ref", st.get("send_ref") or ""]   # 上一轮的 ref 原样交回，适配器可据此找到会话
         r = anomaly.call("poll", pargs, env_extra=page.poll_env(inst))   # 1.5.3：顺带写 Claude 页面快照
+        inst.save()
+        if st.get("send_intent") != intent or st.get("turn") != turn:
+            return "user", "核对期间发送意图已改变，未把旧轮询结果记到新意图"
         _adapter_warning(inst, "poll", r)
         page.after_poll(inst, "poll", r["data"].get("status"))
         status = r["data"].get("status")
         _read_error_track(st, status == "read_error")   # 1.9.7
         if r["code"] == 0 and status in ("generating", "done"):
-            intent.update(status="accepted", ref=r["data"].get("ref") or intent.get("ref"))
+            st["send_intent"].update(status="accepted", ref=r["data"].get("ref") or intent.get("ref"))
             _send_meta(inst, r["data"], confirmed_by="poll")   # 1.9.4：结果不明后经轮询确认的发送，也记下消息 uuid
             return _finalize_send(ctx, out, "发送曾被中断，经轮询确认消息已被接受", immediate=(status == "done"))
         if status == "read_error":   # 1.9.6：适配器读不了通道，不等于“没有回复”：单独处置，不消耗“结果不明”的等待窗口
@@ -791,6 +1013,10 @@ def h_send(ctx):
     if not out.get("file"):   # 1.8.5（W81）：状态在“发送”却没有待发消息（第 109 轮），不调用适配器，安全停下并说明
         return _anomaly(ctx, {"source": "driver", "kind": "outgoing_missing"},
                         "状态在“发送”，但没有待发消息（outgoing 为空），没有调用适配器。处置：wf unblock --to COMPOSE 重新组织本轮消息")
+    try:
+        _outgoing_check(ctx, out)
+    except _PermissionError as e:
+        return _outgoing_stop(ctx, e)
     rate = anomaly.transport_cfg().get("rate") or {}
     if rate.get("max_sends"):
         win = int(rate.get("window_s", 600))
@@ -823,7 +1049,13 @@ def h_send(ctx):
         fresh, early = _slot_bind(ctx, g, out)
         if early:
             return early
-    st["send_intent"] = {"turn": turn, "status": "pending", "ts": now_iso(), "file": out.get("file")}
+    slot_for_attempt = dict(st.get("send_slot") or {})
+    try:
+        message = _prepare_send(ctx, out)
+    except (OSError, UnicodeError, _PermissionError) as e:
+        return _abort_unsent(ctx, None, slot_for_attempt, e)
+    st["send_intent"] = {"turn": turn, "status": "pending", "ts": now_iso(), "file": out.get("file"), "message": message}
+    this_intent = json.loads(json.dumps(st["send_intent"]))
     try:
         inst.save()   # B1-A：授予 → 保存（send_slot 与发送意图同一次落盘）→ 之后才调用适配器
     except Exception:
@@ -847,13 +1079,22 @@ def h_send(ctx):
             inst.save()
             return "wait", f"外发前的持久标记没有写成（{mk['reason']}），没有发送，30 秒后再看"
     _quota(inst)
-    send_args = ["--project", inst.name, "--turn", turn, "--message", out.get("file"),
+    try:
+        inst.save()
+        send_out = _check_attempt(ctx, this_intent, new_send=True)
+    except _PermissionError as e:
+        return _abort_unsent(ctx, this_intent, slot_for_attempt, e)
+    send_args = ["--project", inst.name, "--turn", turn, "--message", send_out["file"],
                  "--effort", out.get("effort") or "high",
                  "--model", out.get("model") or anomaly.transport_cfg().get("model", "")]
     send_args += anomaly.conv_args(inst)   # 1.7.0（ISOLATION.md S1）：本项目的对话
     if st.get("resend_parent"):
         send_args += ["--parent", st["resend_parent"]]
     r = anomaly.call("send", send_args)
+    inst.save()
+    if st.get("send_intent") != this_intent or st.get("turn") != turn \
+            or (st.get("send_slot") or {}) != slot_for_attempt:
+        return "user", "发送调用期间意图或发送槽已改变，保留当前身份，未把旧结果记到新尝试"
     _adapter_warning(inst, "send", r)
     code = r["code"]
     if code == 0:
@@ -904,19 +1145,36 @@ def _adapter_warning(inst, op, r) -> None:
 
 def _finalize_send(ctx, out, note, immediate=False):
     inst, st = ctx.inst, ctx.st
-    model = out.get("model") or anomaly.transport_cfg().get("model")
+    intent = st["send_intent"]
+    try:
+        sent_out = _check_attempt(ctx, intent)
+    except _PermissionError:
+        sent_out = {"file": None}
+        ops.add_note(inst, "deviation", "已确认旧发送被接受，但缺少可验证的旧正文；未用当前新草稿补作发送证据", by="driver")
+    message = intent.get("message") or {}
+    clear_outgoing = False
+    if isinstance(message, dict) and out == message.get("outgoing"):
+        try:
+            source, _raw, digest = _outgoing_check(ctx, out)
+            clear_outgoing = str(source) == message.get("source_file") and digest == message.get("source_sha256")
+        except _PermissionError:
+            pass
+    model = sent_out.get("model") or anomaly.transport_cfg().get("model")
     append_jsonl(LOCAL / "send_log.jsonl", {"ts": now_iso(), "project": inst.name, "turn": st["turn"]})
     st["send_ref"] = st["send_intent"].get("ref")
     recovery.close(inst, evidence="send_accepted")   # B2-A2a：通道确认接受（不是只有心跳），或结果不明后经轮询确认
     b = st.setdefault("budget", {"date": now().strftime("%Y-%m-%d"), "rounds": 0})
     b["rounds"] = b.get("rounds", 0) + 1
     inst.save()
-    ops.mark_sent(inst, out.get("file"), out.get("kind"), out.get("effort"), model, by="driver",
-                  role=out.get("role"), reasons=out.get("reasons"))
+    ops.mark_sent(inst, sent_out.get("file"), sent_out.get("kind"), sent_out.get("effort"), model, by="driver",
+                  role=sent_out.get("role"), reasons=sent_out.get("reasons"))
     st = inst.state
-    st["last_sent"] = {"turn": st["turn"], "file": out.get("file"), "kind": out.get("kind"), "effort": out.get("effort")}
+    st["last_sent"] = {"turn": st["turn"], "file": sent_out.get("file"), "kind": sent_out.get("kind"), "effort": sent_out.get("effort")}
     st["send_intent"] = None
-    st["outgoing"] = None
+    if clear_outgoing and st.get("outgoing") == out:
+        st["outgoing"] = None
+    elif st.get("outgoing"):
+        ops.add_note(inst, "deviation", "本次确认的是旧消息；保留当前不同的新草稿，它没有被记为已发送", by="driver")
     # 1.8.5（W66）：确认送达时回复已经结束（done），立即去取，不再等 first_poll_after_s
     st["poll_after"] = (now() + timedelta(seconds=0 if immediate else int(ctx.pol.get("first_poll_after_s", 60)))).isoformat(timespec="seconds")
     inst.save()
