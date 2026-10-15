@@ -1,0 +1,391 @@
+{
+  "schema": 1,
+  "doc": "异常字典：驱动器遇到情况时按顺序匹配第一条规则。match 中的键全部满足才算匹配；text 为正则，匹配消息全文。action：retry 退避重试 / quota_wait 等待额度重置 / report 回报给 Claude / continue 请 Claude 从断点继续 / restart 按 wf.json 拉起进程 / await_user 停下问用户 / block 阻塞。超过 max 次后执行 then。项目可在 workflow/anomalies.json 中追加规则（排在本文件之前匹配）。",
+  "rules": [
+    {
+      "id": "SEND_BUSY",
+      "match": {
+        "source": "transport",
+        "op": "send",
+        "code": 2
+      },
+      "action": "retry",
+      "backoff_s": [
+        60,
+        120,
+        300,
+        600
+      ],
+      "max": 6,
+      "then": "block",
+      "why": "通道正忙。最可能的情况是自己的上一条消息正在生成（带工具调用的长回复可达半小时以上，第 40 轮实测 23 分钟）。不中止任何生成，只等待后重试；达到上限后阻塞。会话里看不到新消息、updated_at 不变、is_pending 为 false，都不能说明没有在生成；请看桥接日志里的“正在生成”与“被拒”记录。",
+      "ledger": "F04、F22"
+    },
+    {
+      "id": "QUOTA",
+      "match": {
+        "source": "transport",
+        "code": 3
+      },
+      "action": "quota_wait",
+      "why": "额度用尽。等待重置后自动继续，不轮换账户。",
+      "ledger": "SD-3"
+    },
+    {
+      "id": "NET",
+      "match": {
+        "source": "transport",
+        "code": 4
+      },
+      "action": "retry",
+      "backoff_s": [
+        30,
+        60,
+        120,
+        300
+      ],
+      "max": 5,
+      "then": "block",
+      "why": "网络或通道暂时不可用。"
+    },
+    {
+      "id": "SEND_REJECTED",
+      "match": {
+        "source": "transport",
+        "op": "send",
+        "code": 5
+      },
+      "action": "block",
+      "why": "通道明确拒绝了消息（非暂时性）。需要人工查看。"
+    },
+    {
+      "id": "SEND_UNKNOWN",
+      "match": {
+        "source": "driver",
+        "kind": "send_outcome_unknown"
+      },
+      "action": "block",
+      "why": "上次发送中途被打断，且通道没有任何“已接受或正在生成”的迹象。为避免重复发送，不自动重发。处置：先等待，再用 wf unblock --to SEND 让驱动器重新核对一次；确认没有送达、需要重发时，用 wf resend（决定码加用户原话），不要手改 state.json（第 40 轮手动清除意图造成了重复发送）。policy 的 send_unknown_wait 设为 true 可改为自动等待约一小时。",
+      "ledger": "F14"
+    },
+    {
+      "id": "SEND_UNKNOWN_WAIT",
+      "match": {
+        "source": "driver",
+        "kind": "send_outcome_unknown_wait"
+      },
+      "action": "retry",
+      "backoff_s": [
+        120,
+        300,
+        600,
+        600,
+        600,
+        600,
+        600
+      ],
+      "max": 7,
+      "then": "block",
+      "why": "发送结果不明（适配器超时，消息可能已送达且正在生成）。保留发送意图，约一小时内反复轮询确认，绝不自动重发；仍不明再阻塞，由人用 wf resend 决定。",
+      "ledger": "F14、第 40 轮"
+    },
+    {
+      "id": "POLL_NONE",
+      "match": {
+        "source": "transport",
+        "op": "poll",
+        "status": "none"
+      },
+      "action": "retry",
+      "backoff_s": [
+        120,
+        300,
+        600
+      ],
+      "max": 6,
+      "then": "block",
+      "why": "暂时看不到消息或回复。看不到不等于丢失，先等待。",
+      "ledger": "F14"
+    },
+    {
+      "id": "ADAPTER_MISSING",
+      "match": {
+        "source": "transport",
+        "kind": "not_configured"
+      },
+      "action": "block",
+      "why": "没有配置传输适配器（local/transport.json）。"
+    },
+    {
+      "id": "ADAPTER_BAD",
+      "match": {
+        "source": "transport",
+        "kind": "bad_output"
+      },
+      "action": "block",
+      "why": "传输适配器的输出不符合约定，无法判断结果。"
+    },
+    {
+      "id": "REPLY_INCOMPLETE",
+      "match": {
+        "source": "intake",
+        "kind": "missing_blocks"
+      },
+      "action": "continue",
+      "max": 2,
+      "then": "block",
+      "why": "回复缺少固定块，可能中途被截断。请 Claude 从断点继续，不整条重发。",
+      "ledger": "WR-2"
+    },
+    {
+      "id": "REPLY_TRUNCATED",
+      "match": {
+        "source": "intake",
+        "kind": "reply_truncated"
+      },
+      "action": "continue",
+      "max": 2,
+      "then": "block",
+      "why": "回复因工具调用或长度上限结束，没有完成。固定块齐全也不解析执行，先请 Claude 从断点补齐成一条完整的回复（1.9.5）。"
+    },
+    {
+      "id": "POLL_READ_ERROR",
+      "match": {
+        "source": "driver",
+        "kind": "poll_read_error"
+      },
+      "action": "retry",
+      "backoff_s": [
+        60,
+        120,
+        300,
+        600
+      ],
+      "max": 12,
+      "then": "await_user",
+      "why": "适配器读不了通道（read_error），这不是“没有回复”：保留发送意图、ref 与原对话，不重发、不换对话；请执行端修复通道读取，恢复后按原链路取回回复（1.9.6）。"
+    },
+    {
+      "id": "VERSION_JUMP",
+      "match": {
+        "source": "review",
+        "kind": "version_not_next"
+      },
+      "action": "report",
+      "why": "交付版本不是当前版本的下一个（跳号或回退）。不落地，回报给 Claude。",
+      "ledger": "IN-3"
+    },
+    {
+      "id": "RELEASE_MISSING",
+      "match": {
+        "source": "review",
+        "kind": "release_not_delivered"
+      },
+      "action": "report",
+      "why": "指令要求落地的版本包不在本轮交付的文件中。不落地，回报给 Claude。"
+    },
+    {
+      "id": "DELETE_GUARD",
+      "match": {
+        "source": "apply",
+        "text": "SAFE_DELETE|safe-delete"
+      },
+      "action": "block",
+      "why": "本机删除守卫拦截了删除操作。请在传输配置的 env 中设置可写的守卫状态目录（例如 CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR）。",
+      "ledger": "F16"
+    },
+    {
+      "id": "APPLY_DIRTY",
+      "match": {
+        "source": "apply",
+        "text": "AP-2"
+      },
+      "action": "block",
+      "why": "工作区有未提交的改动。需要说明来源后再处理。",
+      "ledger": "AP-2"
+    },
+    {
+      "id": "APPLY_INVALID",
+      "match": {
+        "source": "apply",
+        "text": "AP-1|AP-4|越界|顶层目录"
+      },
+      "action": "report",
+      "why": "版本包校验未通过，仓库未被改动。回报给 Claude。"
+    },
+    {
+      "id": "FP_MISMATCH",
+      "match": {
+        "source": "apply",
+        "kind": "fingerprint_mismatch"
+      },
+      "action": "report",
+      "why": "落地后的仓库指纹与 Claude 声明的不一致。回报给 Claude。"
+    },
+    {
+      "id": "CMD_NOT_FOUND",
+      "match": {
+        "source": "exec",
+        "code": 127
+      },
+      "action": "report",
+      "why": "命令不存在（PATH 或环境差异）。回报给 Claude。",
+      "ledger": "F18"
+    },
+    {
+      "id": "EXEC_INTERRUPTED",
+      "match": {
+        "source": "driver",
+        "kind": "exec_interrupted"
+      },
+      "action": "report",
+      "why": "上次执行某条命令时驱动器被中断（睡眠、重启等）。不自动重跑该命令，回报给 Claude 决定。"
+    },
+    {
+      "id": "EXEC_TIMEOUT",
+      "match": {
+        "source": "exec",
+        "code": 124
+      },
+      "action": "report",
+      "why": "命令超时被中断。"
+    },
+    {
+      "id": "EXEC_FAIL",
+      "match": {
+        "source": "exec"
+      },
+      "action": "report",
+      "why": "命令执行失败。回报给 Claude。"
+    },
+    {
+      "id": "CHECK_FAIL",
+      "match": {
+        "source": "verify",
+        "kind": "check_failed"
+      },
+      "action": "report",
+      "why": "验收判据未通过。回报给 Claude（连续多轮未通过会停下问用户）。"
+    },
+    {
+      "id": "PROC_DOWN",
+      "match": {
+        "source": "health",
+        "kind": "process_down"
+      },
+      "action": "restart",
+      "max": 2,
+      "then": "block",
+      "why": "声明为长期运行的进程不在运行。按 wf.json 的 start 命令拉起（须在白名单内）。"
+    },
+    {
+      "id": "WAIT_TOO_LONG",
+      "match": {
+        "source": "dwell",
+        "state": "WAIT_REPLY"
+      },
+      "action": "block",
+      "why": "等待回复超过上限，且通道没有给出结束信号。",
+      "ledger": "WR-1"
+    },
+    {
+      "id": "OUTGOING_SECRET",
+      "match": {
+        "source": "compose",
+        "kind": "secret"
+      },
+      "action": "block",
+      "why": "待发消息中疑似含有凭据。禁止发送。",
+      "ledger": "CP-1"
+    },
+    {
+      "id": "PROC_DOWN_FAIL",
+      "match": {
+        "source": "health",
+        "kind": "process_down_unrecoverable"
+      },
+      "action": "block",
+      "why": "长期运行的进程不在运行，且无法自动拉起（启动命令不在白名单，或今天已拉起多次仍失败）。"
+    },
+    {
+      "id": "BUDGET",
+      "match": {
+        "source": "budget",
+        "kind": "daily_limit"
+      },
+      "action": "await_user",
+      "why": "今日自动轮次已达上限。由用户决定是否继续（防止失控消耗额度）。"
+    },
+    {
+      "id": "OUTGOING_STRUCTURE",
+      "match": {
+        "source": "compose",
+        "kind": "structure"
+      },
+      "action": "block",
+      "why": "回报结构不完整，没有发送：先核对标题行“【回报 · 第 N 轮 · vX.Y】”与 ①②③ 三段是否齐全，再查工具。"
+    },
+    {
+      "id": "NO_REPLY_FILE",
+      "match": {
+        "source": "intake",
+        "kind": "no_reply_file"
+      },
+      "action": "block",
+      "why": "收到回复的记录存在，但回复全文文件缺失。"
+    },
+    {
+      "id": "CONTEXT_FULL",
+      "match": {
+        "source": "context",
+        "kind": "conversation_full"
+      },
+      "action": "await_user",
+      "why": "当前对话的体量达到上限，继续会降低回复质量。恢复包已生成，需要开新对话。policy 的 auto_new_conversation 为 true 时由驱动器自动完成（1.6.4）；停在这里说明没有开启，或自动开新对话没有成功（原因见详情）。"
+    },
+    {
+      "id": "NO_REF",
+      "max": 1,
+      "then": "block",
+      "match": {
+        "source": "driver",
+        "kind": "no_ref"
+      },
+      "action": "await_user",
+      "why": "本轮是在驱动器之外手动发出的，没有登记适配器的 ref，驱动器无法轮询接续。手动 wf mark replied 处理本轮；之后用 wf mark sent --ref 发送即可全自动。"
+    },
+    {
+      "id": "LEAF_REFUSED",
+      "match": {
+        "source": "__handled__"
+      },
+      "action": "report",
+      "why": "（由 WAIT_REPLY 的 refused 分支直接处置）"
+    },
+    {
+      "id": "SEND_NOT_LANDED",
+      "match": {
+        "source": "driver",
+        "kind": "send_not_landed"
+      },
+      "action": "block",
+      "why": "适配器报告已接受，但 wf 独立核对发现消息始终没有出现在会话中。为避免重复发送，停下由人确认通道状态。确认没有落地后用 wf resend --code <决定码> 恢复本轮消息并重新发送（1.6.5；执行端可代决：--by executor --reason …）；不要用 wf unblock --to WAIT_REPLY，那会一直等一条不存在的回复。",
+      "ledger": "F20、F22"
+    },
+    {
+      "id": "MULTI_DELIVERY",
+      "match": {
+        "source": "__handled__",
+        "kind": "multi_delivery"
+      },
+      "action": "report",
+      "why": "同一轮有多次生成各自交付了文件；只采用最后一条完整回复的文件，并写入回报（由 WAIT_REPLY 直接处置）。"
+    },
+    {
+      "id": "UNKNOWN",
+      "match": {},
+      "action": "block",
+      "why": "字典中没有对应规则的情况：安全停机，完整上报。"
+    }
+  ]
+}

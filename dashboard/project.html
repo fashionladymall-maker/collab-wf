@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>项目视图</title>
+<style>
+:root {
+  --board: #E6ECF0;
+  --strip: #FFFFFF;
+  --ink: #1B2A3A;
+  --muted: #5B6978;
+  --rule: #C7D1D9;
+  --ok: #2E7A57;
+  --warn: #B4761A;
+  --bad: #B0352B;
+  --busy: #2F5FA8;
+  --off: #98A4AF;
+  --font: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --board: #121A21; --strip: #1B252E; --ink: #DCE4EA; --muted: #93A1AE; --rule: #2C3944;
+    --ok: #5DBB8C; --warn: #E0A548; --bad: #E2695E; --busy: #6E9BE0; --off: #5E6B76;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--board); color: var(--ink); font-family: var(--font);
+  font-size: 15px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+a { color: inherit; text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--busy); outline-offset: 2px; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 20px 20px 48px; }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 24px;
+  border-bottom: 2px solid var(--ink); padding-bottom: 10px; }
+header h1 { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: .01em; }
+header .ver { font-size: 26px; font-weight: 300; margin-left: 10px; }
+header .phase { color: var(--muted); font-size: 15px; margin-left: 12px; }
+header .meta { color: var(--muted); font-size: 13px; text-align: right; }
+.issues { margin-top: 10px; padding: 8px 12px; border-left: 4px solid var(--warn); background: var(--strip); font-size: 14px; }
+
+/* 需要你决定：页面上最大的字 */
+.ask { margin: 22px 0 18px; }
+.ask h2 { margin: 0 0 6px; font-size: 15px; font-weight: 600; color: var(--muted); }
+.ask ol { margin: 0; padding-left: 1.4em; }
+.ask li { font-size: 21px; font-weight: 600; line-height: 1.45; margin: 4px 0; max-width: 60em; }
+.ask .none { font-size: 21px; font-weight: 600; color: var(--ok); }
+
+/* 进度条板：四条航班式进度条 */
+.strips { display: grid; gap: 6px; margin-bottom: 26px; }
+.strip { display: grid; grid-template-columns: 8px 7.5em 1fr auto; align-items: stretch; background: var(--strip);
+  border: 1px solid var(--rule); min-height: 46px; }
+.strip .bar { background: var(--off); }
+.strip[data-s="ok"] .bar { background: var(--ok); }
+.strip[data-s="warn"] .bar { background: var(--warn); }
+.strip[data-s="bad"] .bar { background: var(--bad); }
+.strip[data-s="busy"] .bar { background: var(--busy); }
+.strip .who { font-weight: 700; padding: 11px 12px; border-right: 1px dashed var(--rule); }
+.strip .what { padding: 11px 14px; overflow-wrap: anywhere; }
+.strip .when { padding: 11px 14px; color: var(--muted); font-size: 13px; white-space: nowrap; border-left: 1px dashed var(--rule); }
+
+.grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 26px; align-items: start; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .strip { grid-template-columns: 8px 5.5em 1fr; } .strip .when { display: none; } }
+section { margin-bottom: 26px; }
+section > h2 { font-size: 17px; margin: 0 0 8px; padding-bottom: 4px; border-bottom: 1px solid var(--rule);
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+section > h2 small { font-weight: 400; color: var(--muted); font-size: 13px; }
+.panel { background: var(--strip); border: 1px solid var(--rule); padding: 12px 14px; }
+
+.steps { list-style: none; margin: 0; padding: 0; }
+.steps li { display: grid; grid-template-columns: 1.4em 1fr; padding: 5px 0; border-bottom: 1px dotted var(--rule); }
+.steps li:last-child { border-bottom: 0; }
+.steps li.done { color: var(--muted); }
+.steps li.done span:last-child { text-decoration: line-through; text-decoration-thickness: 1px; }
+.steps li.now { font-weight: 700; }
+.progress { height: 6px; background: var(--rule); margin: 4px 0 10px; }
+.progress i { display: block; height: 100%; background: var(--ok); }
+
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+svg.spark { width: 100%; height: 70px; display: block; margin-top: 10px; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; line-height: 1.5; margin: 6px 0 0;
+  max-height: 260px; overflow: auto; background: var(--board); padding: 8px 10px; }
+details > summary { cursor: pointer; color: var(--muted); font-size: 14px; margin-top: 8px; }
+
+.filters { display: flex; gap: 6px; flex-wrap: wrap; }
+.filters button { font: inherit; font-size: 13px; padding: 2px 10px; border: 1px solid var(--rule); background: var(--strip);
+  color: var(--ink); cursor: pointer; }
+.filters button[aria-pressed="true"] { background: var(--ink); color: var(--strip); border-color: var(--ink); }
+.talk { max-height: 760px; overflow: auto; background: var(--strip); border: 1px solid var(--rule); }
+.msg { padding: 10px 14px; border-bottom: 1px solid var(--rule); }
+.msg header { all: unset; display: flex; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--muted); }
+.msg .role { font-weight: 700; color: var(--ink); }
+.msg[data-r="claude"] { border-left: 4px solid var(--busy); }
+.msg[data-r="executor"] { border-left: 4px solid var(--ok); }
+.msg[data-r="user"] { border-left: 4px solid var(--warn); }
+.msg .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; }
+.tools { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.tools span { font-size: 12px; border: 1px solid var(--rule); padding: 0 6px; color: var(--muted); }
+.empty { color: var(--muted); padding: 14px; }
+
+table { width: 100%; border-collapse: collapse; background: var(--strip); font-size: 14px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); border-bottom: 2px solid var(--rule); }
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); }
+.tag { display: inline-block; padding: 0 6px; font-size: 13px; border: 1px solid currentColor; white-space: nowrap; }
+.t-ok { color: var(--ok); } .t-warn { color: var(--warn); } .t-bad { color: var(--bad); } .t-off { color: var(--muted); }
+
+.docs { list-style: none; margin: 0; padding: 0; }
+.docs li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 1px dotted var(--rule); }
+.docs .k { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.cl h3 { font-size: 15px; margin: 10px 0 2px; }
+.cl ul { margin: 0; padding-left: 1.2em; }
+.err { padding: 12px 14px; border-left: 4px solid var(--bad); background: var(--strip); margin-top: 16px; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div><h1 id="pname" style="display:inline">项目看板</h1><span class="ver" id="pver"></span><span class="phase" id="pphase"></span></div>
+    <div class="meta"><a id="flowlink" href="/">工作流看板</a>　<span id="meta">正在读取…</span></div>
+  </header>
+  <div id="issues"></div>
+  <div id="fatal"></div>
+
+  <div class="ask" id="ask"></div>
+  <div class="strips" id="strips" aria-label="各方当前状态"></div>
+
+  <div class="grid">
+    <div>
+      <section><h2>下一步 <small id="stepcount"></small></h2><div class="panel"><div class="progress"><i id="stepbar" style="width:0"></i></div><ul class="steps" id="steps"></ul></div></section>
+      <section id="hooksec"><h2 id="hooktitle">项目进程</h2><div class="panel" id="hook"></div></section>
+      <section><h2>额度与档位 <small id="usageat"></small></h2><div class="panel" id="usage"></div></section>
+    </div>
+    <div>
+      <section>
+        <h2>对话记录 <div class="filters" id="filters" role="group" aria-label="按角色筛选">
+          <button data-f="all" aria-pressed="true">全部</button><button data-f="user" aria-pressed="false">用户</button>
+          <button data-f="claude" aria-pressed="false">Claude</button><button data-f="executor" aria-pressed="false">执行端</button></div></h2>
+        <div class="talk" id="talk"></div>
+      </section>
+    </div>
+  </div>
+
+  <section><h2>轮次明细 <small>来自 workflow/turns.jsonl，最新的在上</small></h2><div class="tablewrap" id="turns"></div></section>
+
+  <section><h2>失败模式台账 <small>来自 PROJECT.md</small></h2><div class="tablewrap" id="fails"></div></section>
+
+  <div class="grid">
+    <section><h2>版本记录</h2><div class="panel cl" id="versions"></div></section>
+    <section><h2>文档与结果 <small>点击在新标签页打开</small></h2><div class="panel"><ul class="docs" id="docs"></ul>
+      <details><summary>PROJECT.md 全部章节</summary><div id="pmd"></div></details></div></section>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ROLE = {user: "用户", claude: "Claude", executor: "执行端"};
+let filter = "all", last = null;
+const P = new URLSearchParams(location.search).get("p") || "";
+document.getElementById("flowlink").href = `/?p=${encodeURIComponent(P)}`;
+
+function ago(iso) {
+  if (!iso) return "";
+  const s = (Date.now() - new Date(iso)) / 1000;
+  if (isNaN(s)) return "";
+  if (s < 60) return "刚刚";
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  return `${Math.floor(s / 86400)} 天前`;
+}
+const fmtDur = s => s == null ? "—" : s < 60 ? `${Math.round(s)} 秒` : `${Math.floor(s / 60)} 分 ${String(Math.round(s % 60)).padStart(2, "0")} 秒`;
+const clock = iso => iso ? new Date(iso).toLocaleString("zh-CN", {hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}) : "";
+
+function spark(points) {
+  if (!points || points.length < 2) return "";
+  const v = points.map(p => p[1]), lo = Math.min(...v), hi = Math.max(...v), r = hi - lo || 1;
+  const d = v.map((y, i) => `${(i / (v.length - 1) * 300).toFixed(1)},${(56 - (y - lo) / r * 50).toFixed(1)}`).join(" ");
+  const up = v[v.length - 1] >= v[0];
+  return `<svg class="spark" viewBox="0 0 300 60" preserveAspectRatio="none" role="img" aria-label="权益曲线，最低 ${lo.toFixed(2)}，最高 ${hi.toFixed(2)}">
+    <polyline points="${d}" fill="none" stroke="var(${up ? "--ok" : "--bad"})" stroke-width="1.6" vector-effect="non-scaling-stroke"/></svg>`;
+}
+
+function statusTag(s) {
+  const t = String(s || "");
+  const cls = /已解决|已规避/.test(t) ? "t-ok" : /待用户|观察|处理/.test(t) ? "t-warn" : /未解决|失败/.test(t) ? "t-bad" : "t-off";
+  return `<span class="tag ${cls}">${esc(t)}</span>`;
+}
+
+function render(st) {
+  last = st;
+  $("pname").textContent = st.project.name;
+  $("pver").textContent = st.project.version || "版本未知";
+  $("pphase").textContent = st.project.phase ? `阶段：${st.project.phase}` : "";
+  $("meta").textContent = `${st.project.name}，更新于 ${new Date(st.generated_at).toLocaleTimeString("zh-CN", {hour12: false})}，每 20 秒自动刷新`;
+  $("issues").innerHTML = st.project_md_issues.length
+    ? `<div class="issues">PROJECT.md 不符合规范：${st.project_md_issues.map(esc).join("；")}</div>` : "";
+
+  const open = st.decisions.filter(d => !d.done);
+  $("ask").innerHTML = open.length
+    ? `<h2>需要你决定（${open.length}）</h2><ol>${open.map(d => `<li>${esc(d.text)}</li>`).join("")}</ol>`
+    : `<div class="none">目前没有需要你决定的事</div>`;
+
+  $("strips").innerHTML = st.actors.map(a => `<div class="strip" data-s="${esc(a.status)}">
+    <div class="bar"></div><div class="who">${esc(a.name)}</div><div class="what">${esc(a.state)}</div>
+    <div class="when" title="${esc(clock(a.at))}">${esc(ago(a.at))}</div></div>`).join("");
+
+  const steps = st.next_steps, done = steps.filter(s => s.done).length, nowIdx = steps.findIndex(s => !s.done);
+  $("stepcount").textContent = `${done} / ${steps.length} 完成`;
+  $("stepbar").style.width = steps.length ? `${done / steps.length * 100}%` : "0";
+  $("steps").innerHTML = steps.map((s, i) => `<li class="${s.done ? "done" : i === nowIdx ? "now" : ""}">
+    <span>${s.done ? "✓" : i === nowIdx ? "▸" : "○"}</span><span>${esc(s.text)}</span></li>`).join("");
+
+  const h = st.hook;
+  if (!h) { $("hooksec").hidden = true; } else {
+    $("hooksec").hidden = false;
+    $("hooktitle").textContent = h.title || "项目进程";
+    $("hook").innerHTML = `<p style="margin:0 0 8px;font-weight:600" class="t-${esc(h.status === "busy" ? "ok" : h.status)}">${esc(h.summary)}</p>
+      <dl class="kv">${(h.kv || []).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+      ${h.series ? spark(h.series.points) : ""}
+      ${h.log_tail && h.log_tail.length ? `<details><summary>最近日志（${h.log_tail.length} 行）</summary><pre>${esc(h.log_tail.join("\n"))}</pre></details>` : ""}`;
+  }
+
+  const u = st.usage, es = st.effort_stats || {};
+  $("usageat").textContent = u && u.ts ? `采集于 ${clock(u.ts)}` : "";
+  const lim = u && u.limits ? `<dl class="kv">${u.limits.map(l => `<dt>${esc(l.label || l.name)}</dt>
+      <dd>已用 ${esc(l.used_pct)}%${l.resets_at ? `，${esc(clock(l.resets_at))} 重置` : ""}</dd>`).join("")}</dl>`
+    : `<p class="empty" style="padding:0">尚无额度数据（执行端写入 workflow/usage.json 后显示）</p>`;
+  const eff = Object.keys(es).length ? `<table style="margin-top:10px"><tr><th>档位</th><th>轮次</th><th>平均消耗</th><th>平均耗时</th><th>每分钟消耗</th></tr>
+      ${Object.entries(es).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v.turns}${v.samples < v.turns ? `（${v.samples} 轮有用量）` : ""}</td>
+        <td>${v.avg_session_pct == null ? "—" : v.avg_session_pct + "%"}</td><td>${fmtDur(v.avg_duration_s)}</td>
+        <td>${v.pct_per_min == null ? "—" : v.pct_per_min + "%"}</td></tr>`).join("")}</table>
+      <p style="margin:6px 0 0;color:var(--muted);font-size:13px">消耗指 5 小时窗口已用比例的增量。样本少于十几轮时只作参考。</p>`
+    : `<p class="empty" style="padding:8px 0 0">尚无档位统计（turns.jsonl 记录用量前后值后自动计算）</p>`;
+  $("usage").innerHTML = lim + eff;
+
+  renderTalk();
+
+  const KIND = {report: "回报", design: "设计", probe: "探测", other: "其他"};
+  const ST = {sent: ["进行中", "t-warn"], done: ["完成", "t-ok"], error: ["出错", "t-bad"]};
+  const tr = (st.turns || []).slice().reverse();
+  $("turns").innerHTML = tr.length ? `<table><tr><th>轮次</th><th>发送时间</th><th>类型</th><th>档位</th><th>模型</th><th>耗时</th><th>5 小时窗口</th><th>状态</th><th>备注</th></tr>
+    ${tr.map(t => {
+      const b = t.usage_before || {}, a = t.usage_after || {};
+      let use = "—";
+      if (b.session != null && a.session != null) use = a.session >= b.session ? `${b.session}% → ${a.session}%（+${+(a.session - b.session).toFixed(1)}）` : `${b.session}% → ${a.session}%（窗口已重置）`;
+      else if (b.session != null) use = `发送前 ${b.session}%`;
+      const [sl, sc] = ST[t.status] || [t.status || "—", "t-off"];
+      return `<tr><td>${esc(t.turn)}</td><td style="white-space:nowrap">${esc(clock(t.ts_sent))}</td><td>${esc(KIND[t.kind] || t.kind || "—")}</td>
+        <td>${esc(t.effort || "—")}</td><td>${esc((t.model || "—").replace(/^claude-/, ""))}</td><td>${fmtDur(t.duration_s)}</td>
+        <td style="white-space:nowrap">${esc(use)}</td><td><span class="tag ${sc}">${esc(sl)}</span></td><td>${esc(t.note || "")}</td></tr>`;
+    }).join("")}</table>` : `<p class="empty">尚无轮次记录（执行端写入 workflow/turns.jsonl 后显示）</p>`;
+
+  const f = st.failures;
+  $("fails").innerHTML = f.length ? `<table><tr><th>编号</th><th>日期</th><th>现象</th><th>根因</th><th>处置</th><th>状态</th></tr>
+    ${f.map(r => `<tr><td>${esc(r["编号"])}</td><td style="white-space:nowrap">${esc(r["日期"])}</td><td>${esc(r["现象"])}</td>
+      <td>${esc(r["根因"])}</td><td>${esc(r["处置"])}</td><td>${statusTag(r["状态"])}</td></tr>`).join("")}</table>`
+    : `<p class="empty">台账为空</p>`;
+
+  $("versions").innerHTML = st.changelog.map(v => `<h3>${esc(v.title)}</h3><ul>${v.items.map(i => `<li>${esc(i)}</li>`).join("")}</ul>`).join("")
+    + (st.git.length ? `<h3>git 提交</h3><ul>${st.git.map(g => `<li>${esc(g.hash)} ${esc(g.subject)}（${esc(ago(g.time))}）</li>`).join("")}</ul>`
+       : `<p class="empty" style="padding:8px 0 0">仓库尚未初始化 git（运行 wf apply 后自动初始化）</p>`);
+
+  $("docs").innerHTML = st.docs.map(d => `<li><a href="/files/${encodeURIComponent(P)}/${encodeURI(d.path)}" target="_blank" rel="noopener">${esc(d.path)}</a>
+    <span class="k">${esc(d.kind)}，${esc(ago(d.mtime))}</span></li>`).join("");
+  $("pmd").innerHTML = Object.entries(st.sections).map(([k, v]) => `<h3 style="font-size:15px;margin:12px 0 2px">${esc(k)}</h3><pre>${esc(v)}</pre>`).join("");
+}
+
+function renderTalk() {
+  const msgs = (last?.transcript || []).filter(m => filter === "all" || m.role === filter).slice().reverse();
+  $("talk").innerHTML = msgs.length ? msgs.map(m => {
+    const text = m.text || "", long = text.length > 600;
+    const body = long ? `${esc(text.slice(0, 600))}…<details><summary>展开全文（${text.length} 字）</summary><div class="body">${esc(text)}</div></details>` : esc(text);
+    return `<article class="msg" data-r="${esc(m.role)}"><header><span><span class="role">${esc(ROLE[m.role] || m.role)}</span>
+      ${m.turn != null ? `第 ${esc(m.turn)} 轮` : ""}</span><span title="${esc(m.ts)}">${esc(clock(m.ts))}</span></header>
+      <div class="body">${body}</div>
+      ${m.tools && m.tools.length ? `<div class="tools">${m.tools.map(t => `<span title="${esc(t.summary || "")}">${esc(t.name)}${t.summary ? "：" + esc(t.summary.slice(0, 40)) : ""}</span>`).join("")}</div>` : ""}
+    </article>`;
+  }).join("") : `<p class="empty">还没有对话记录。执行端把每条消息追加到 workflow/transcript.jsonl 后，这里会自动出现。</p>`;
+}
+
+$("filters").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  filter = b.dataset.f;
+  for (const x of $("filters").children) x.setAttribute("aria-pressed", String(x === b));
+  renderTalk();
+
+  const KIND = {report: "回报", design: "设计", probe: "探测", other: "其他"};
+  const ST = {sent: ["进行中", "t-warn"], done: ["完成", "t-ok"], error: ["出错", "t-bad"]};
+  const tr = (st.turns || []).slice().reverse();
+  $("turns").innerHTML = tr.length ? `<table><tr><th>轮次</th><th>发送时间</th><th>类型</th><th>档位</th><th>模型</th><th>耗时</th><th>5 小时窗口</th><th>状态</th><th>备注</th></tr>
+    ${tr.map(t => {
+      const b = t.usage_before || {}, a = t.usage_after || {};
+      let use = "—";
+      if (b.session != null && a.session != null) use = a.session >= b.session ? `${b.session}% → ${a.session}%（+${+(a.session - b.session).toFixed(1)}）` : `${b.session}% → ${a.session}%（窗口已重置）`;
+      else if (b.session != null) use = `发送前 ${b.session}%`;
+      const [sl, sc] = ST[t.status] || [t.status || "—", "t-off"];
+      return `<tr><td>${esc(t.turn)}</td><td style="white-space:nowrap">${esc(clock(t.ts_sent))}</td><td>${esc(KIND[t.kind] || t.kind || "—")}</td>
+        <td>${esc(t.effort || "—")}</td><td>${esc((t.model || "—").replace(/^claude-/, ""))}</td><td>${fmtDur(t.duration_s)}</td>
+        <td style="white-space:nowrap">${esc(use)}</td><td><span class="tag ${sc}">${esc(sl)}</span></td><td>${esc(t.note || "")}</td></tr>`;
+    }).join("")}</table>` : `<p class="empty">尚无轮次记录（执行端写入 workflow/turns.jsonl 后显示）</p>`;
+});
+
+async function tick() {
+  try {
+    const r = await fetch(`/api/project?p=${encodeURIComponent(P)}`, {cache: "no-store"});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    render(await r.json());
+    $("fatal").innerHTML = "";
+  } catch (e) {
+    $("fatal").innerHTML = `<div class="err">读取状态失败：${esc(e.message)}。确认看板服务仍在运行（wf serve --status），然后刷新页面。</div>`;
+  }
+}
+tick();
+setInterval(tick, 20000);
+</script>
+</body>
+</html>

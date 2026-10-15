@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "doc": "WorkBuddy 聊天窗口里，用户说的话 → 执行端运行的 wf 命令。needs_code：必须带上待决事项的决定码（用户回复里给出，或执行端先用 wf ask 呈报后用户回复）。said：必须把用户原话逐字放进 --said。executor_may_start：执行端能否在用户没说的情况下自行发起。批准类意图一律 executor_may_start=false。",
+  "intents": [
+    {"id": "approve", "phrases": ["批准 <码>", "同意 <码>", "可以 <码>", "行 <码>"],
+     "command": "按决定码对应的事项执行：wf ask --json 中该码的 command 字段（wf approve / wf policy approve / wf goals approve --code <码> --said <原话>）",
+     "needs_code": true, "said": true, "executor_may_start": false,
+     "note": "只说“批准”“好的”而没有码：不执行，回复当前待决事项和它们的码，请用户说清是哪一件"},
+    {"id": "confirm_goal", "phrases": ["确认 <码>"],
+     "command": "wf goals confirm <目标编号> --code <码> --said <原话>", "needs_code": true, "said": true, "executor_may_start": false},
+    {"id": "resume", "phrases": ["继续 <码>", "恢复 <码>"],
+     "command": "wf unpause --code <码> --said <原话>", "needs_code": true, "said": true, "executor_may_start": false},
+    {"id": "resolved", "phrases": ["已处理 <码>"],
+     "command": "wf unblock --to <ask 中给出的步骤> --code <码> --said <原话>", "needs_code": true, "said": true, "executor_may_start": false},
+    {"id": "pause", "phrases": ["暂停", "先停一下", "这个项目先放着", "别动了"],
+     "command": "wf pause --note <原话>", "needs_code": false, "said": true, "executor_may_start": true,
+     "note": "让事情更安全的动作，执行端在发现异常时也可以自行暂停，并立即呈报原因"},
+    {"id": "undo", "phrases": ["退回上一版", "撤销", "刚才那版不对"],
+     "command": "wf undo --note <原话>", "needs_code": false, "said": true, "executor_may_start": false,
+     "note": "回退并暂停。执行端可以建议，但只在用户说了之后执行"},
+    {"id": "new_task", "phrases": ["新任务：……", "帮我做……", "开始……"],
+     "command": "把用户的描述写成任务文件（templates/task.md 的格式，引用用户原话）→ wf kick --message <文件>",
+     "needs_code": false, "said": true, "executor_may_start": false},
+    {"id": "status", "phrases": ["现在到哪了", "怎么样了", "进度"],
+     "command": "wf explain（并附 wf ask 的待决事项）；用一两句话转述，不贴整段输出", "needs_code": false, "said": false,
+     "executor_may_start": true},
+    {"id": "why_failed", "phrases": ["上次为什么失败", "出了什么问题"],
+     "command": "wf decisions --n 10 与 wf audit --n 20，挑出失败与自动处置的几条转述", "needs_code": false, "said": false,
+     "executor_may_start": true},
+    {"id": "show_board", "phrases": ["打开看板", "给我看看"],
+     "command": "在 WorkBuddy 的浏览器面板中打开 http://127.0.0.1:8765/ （看板没在运行就 wf serve --daemon）",
+     "needs_code": false, "said": false, "executor_may_start": true}
+  ],
+  "executor_only": [
+    {"command": "wf doctor / wf schedule status / wf transport test / wf self-check", "why": "健康检查，执行端每次被唤醒时自己跑，有问题再呈报"},
+    {"command": "wf bootstrap", "why": "用户已授权开新对话不需批准；只有“把两个文件拖进新对话”需要用户动手，执行端呈报时说清楚"},
+    {"command": "wf serve --daemon / --stop", "why": "看板进程的维护"},
+    {"command": "wf self-update", "why": "用户说“升级工具”或 Claude 交付了新版本时执行；它改变自动化自身，执行前在聊天里说一声"}
+  ],
+  "never": ["wf approve、wf policy approve、wf goals approve、wf goals confirm、wf unpause、wf unblock：没有用户本轮的原话与正确的决定码，一律不执行",
+            "把用户对另一件事的同意，用在当前待决事项上",
+            "替用户编写 --said 的内容；--said 必须是用户在聊天里逐字说的话"]
+}

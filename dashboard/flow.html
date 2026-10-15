@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工作流看板</title>
+<style>
+:root {
+  --panel: #D8DFE4; --card: #F3F5F7; --ink: #1E2B38; --muted: #5A6875; --rule: #B9C4CC;
+  --rail: #2E3E4E; --lamp-on: #E8A317; --lamp-done: #FFFFFF; --lamp-off: #8E9BA6; --red: #C2392F; --green: #2F7A55;
+  --font: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --panel: #10171E; --card: #18222C; --ink: #D7DFE6; --muted: #91A0AD; --rule: #2C3946;
+    --rail: #8395A6; --lamp-done: #D7DFE6; --lamp-off: #4B5865; --red: #E2685D; --green: #5DBB8C; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--panel); color: var(--ink); font: 15px/1.6 var(--font); font-variant-numeric: tabular-nums; }
+a { color: inherit; text-underline-offset: 3px; }
+button, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--lamp-on); outline-offset: 2px; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 18px 20px 48px; }
+
+header.top { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; justify-content: space-between; }
+header.top h1 { margin: 0; font-size: 22px; font-weight: 700; }
+.pick { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.pick select { background: var(--card); border: 1px solid var(--rule); padding: 3px 8px; }
+.meta { color: var(--muted); font-size: 13px; }
+.warnline { margin-top: 10px; padding: 8px 12px; background: var(--card); border-left: 4px solid var(--red); }
+.asks { margin-top: 10px; padding: 8px 12px; background: var(--card); border-left: 4px solid var(--lamp-on); }
+.asks ol { margin: 4px 0 0; padding-left: 1.4em; }
+
+/* 运行图：页面上唯一的“主角” */
+.mimic { margin: 16px 0 18px; background: var(--card); border: 1px solid var(--rule); padding: 8px 8px 2px; }
+.mimic svg { display: block; width: 100%; height: auto; }
+.rail { fill: none; stroke: var(--rail); stroke-width: 6; }
+.siding { fill: none; stroke: var(--rail); stroke-width: 2; stroke-dasharray: 6 6; opacity: .6; }
+.chev { fill: var(--rail); }
+.st { cursor: pointer; }
+.st .lamp { stroke: var(--rail); stroke-width: 3; fill: var(--lamp-off); }
+.st.done .lamp { fill: var(--lamp-done); }
+.st.cur .lamp { fill: var(--lamp-on); }
+.st.cur.bad .lamp, .st.bad .lamp { fill: var(--red); }
+.st .halo { fill: none; stroke: var(--lamp-on); stroke-width: 2; opacity: 0; }
+.st.cur .halo { opacity: .9; animation: halo 2.4s ease-out infinite; }
+.st.cur.bad .halo { stroke: var(--red); }
+.st.sel .ring { stroke: var(--ink); stroke-width: 1.5; fill: none; stroke-dasharray: 3 3; }
+.st text { fill: var(--ink); font-size: 15px; font-weight: 600; }
+.st text.own { fill: var(--muted); font-size: 12px; font-weight: 400; }
+.st text.cnt { fill: var(--muted); font-size: 11px; font-weight: 400; }
+@keyframes halo { 0% { r: 16px; opacity: .9; } 100% { r: 30px; opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .st.cur .halo { animation: none; opacity: .6; r: 22px; } }
+
+.grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 18px; align-items: start; }
+@media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+section { margin-bottom: 18px; }
+section > h2 { font-size: 16px; margin: 0 0 6px; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+section > h2 small { font-weight: 400; color: var(--muted); font-size: 13px; }
+.card { background: var(--card); border: 1px solid var(--rule); padding: 12px 14px; }
+
+.now .state { font-size: 28px; font-weight: 700; line-height: 1.2; margin: 0; }
+.now .state small { font-size: 15px; font-weight: 400; color: var(--muted); margin-left: 8px; }
+.now .line { display: flex; flex-wrap: wrap; gap: 4px 18px; color: var(--muted); margin: 6px 0 10px; }
+.now .dwell { color: var(--ink); font-weight: 600; }
+.bar { height: 6px; background: var(--rule); margin: 4px 0 10px; }
+.bar i { display: block; height: 100%; background: var(--green); }
+.bar.over i { background: var(--red); }
+h3 { font-size: 14px; margin: 10px 0 2px; color: var(--muted); font-weight: 600; }
+ul.plain { margin: 0; padding-left: 1.2em; }
+ul.plain li { margin: 2px 0; }
+.alert { border-left: 4px solid var(--red); padding: 6px 10px; margin: 8px 0; background: var(--panel); }
+.tag { display: inline-block; padding: 0 6px; font-size: 12.5px; border: 1px solid currentColor; white-space: nowrap; }
+.t-ok { color: var(--green); } .t-bad { color: var(--red); } .t-warn { color: #B4761A; } .t-off { color: var(--muted); }
+
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.tw { overflow-x: auto; }
+code { font-size: 12.5px; overflow-wrap: anywhere; }
+
+.tl .row { display: grid; grid-template-columns: 5.5em 1fr 6.5em; gap: 8px; align-items: center; margin: 3px 0; font-size: 13px; }
+.tl .track { display: flex; height: 16px; background: var(--panel); overflow: hidden; }
+.tl .seg { height: 100%; min-width: 2px; border-right: 1px solid var(--card); }
+.tl .seg.forced { background-image: repeating-linear-gradient(45deg, transparent 0 4px, rgba(0,0,0,.25) 4px 6px); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+.legend i { display: inline-block; width: 10px; height: 10px; margin-right: 4px; vertical-align: -1px; }
+.empty { color: var(--muted); }
+.agents { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+.agent { background: var(--card); border: 1px solid var(--rule); border-top: 4px solid var(--lamp-off); padding: 10px 12px; }
+.agent[data-s="ok"] { border-top-color: var(--green); } .agent[data-s="busy"] { border-top-color: var(--lamp-on); }
+.agent[data-s="warn"] { border-top-color: #B4761A; } .agent[data-s="bad"] { border-top-color: var(--red); }
+.agent h3 { margin: 0; color: var(--ink); font-size: 15px; } .agent .r { color: var(--muted); font-size: 12.5px; }
+.agent p { margin: 6px 0 4px; } .agent ul { margin: 0; padding-left: 1.1em; color: var(--muted); font-size: 12.5px; }
+.ask { background: var(--card); border: 2px solid var(--lamp-on); padding: 12px 14px; margin-bottom: 8px; }
+.ask h3 { margin: 0 0 4px; color: var(--ink); font-size: 17px; }
+.ask .code { font-size: 22px; font-weight: 700; letter-spacing: .12em; }
+.ask .say { font-size: 18px; font-weight: 700; color: var(--ink); background: var(--panel); padding: 2px 8px; display: inline-block; margin: 4px 6px 0 0; }
+.note { background: var(--card); border-left: 4px solid var(--lamp-off); padding: 6px 10px; margin-bottom: 6px; }
+.err { margin-top: 12px; padding: 10px 12px; border-left: 4px solid var(--red); background: var(--card); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>工作流看板</h1>
+    <div class="pick">
+      <label>项目 <select id="proj" aria-label="选择项目"></select></label>
+      <a id="projlink" href="#">项目视图</a>
+      <span class="meta" id="meta">正在读取…</span>
+    </div>
+  </header>
+  <div id="banners"></div>
+  <section id="askwrap" hidden><h2>需要你决定 <small>在 WorkBuddy 聊天窗口里回复引号里的话即可</small></h2><div id="asks"></div></section>
+  <div id="fatal"></div>
+
+  <div class="mimic" aria-label="工作流运行图"><svg id="svg" viewBox="0 0 1000 340" role="img" aria-labelledby="svgt"><title id="svgt">工作流运行图</title></svg></div>
+
+  <div class="grid">
+    <section><h2>驱动器 <small id="drvmeta"></small></h2><div class="card" id="drv"></div></section>
+    <section><h2>目标 <small id="goalmeta"></small></h2><div class="card" id="goals"></div></section>
+  </div>
+
+  <section><h2>工具调用进度 <small>最近几轮：Claude 的工具调用、执行端执行的命令、驱动器的自动处置</small></h2><div class="card tw" id="toolsprog"></div></section>
+
+  <section><h2>Agent 进度 <small>每个参与者现在在做什么</small></h2><div class="agents" id="agents"></div></section>
+
+  <div class="grid">
+    <section><h2>现在 <small id="turnno"></small></h2><div class="card now" id="now"></div></section>
+    <section><h2 id="seltitle">步骤说明 <small>点击运行图上的站点查看其他步骤</small></h2><div class="card" id="detail"></div></section>
+  </div>
+
+  <section><h2>轮次时间线 <small>每一行是一轮，色块长度为该步骤的实际停留时间</small></h2><div class="card tl" id="tl"></div></section>
+
+  <div class="grid">
+    <section><h2>本轮执行 <small id="execsum"></small></h2><div class="card" id="exec"></div></section>
+    <section><h2>事件流 <small>最新的在上</small></h2><div class="card tw" id="events"></div></section>
+  </div>
+
+  <div class="grid">
+    <section><h2>需要注意 <small id="attnmeta">本轮</small></h2><div class="card" id="attn"></div></section>
+    <section><h2>决策日志 <small>做了什么、为什么、证据、结果</small></h2><div class="card tw" id="decs"></div></section>
+  </div>
+
+  <section><h2>各步骤统计 <small>来自事件记录，只含实测值</small></h2><div class="card tw" id="stats"></div></section>
+  <section id="pagesec"><h2>Claude 页面快照 <small id="pagemeta">读取中…</small></h2><div class="card" id="pagebox"></div></section>
+  <section id="talksec"><h2>对话记录 <small id="talkmeta"></small></h2><div class="card" id="talkbox"></div></section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const COLORS = {COMPOSE:"#6C8EBF", SEND:"#4F7CAC", WAIT_REPLY:"#E8A317", INTAKE:"#7FA37A", REVIEW:"#A7884F",
+  APPLY:"#8C6BB1", EXECUTE:"#3E8E7E", VERIFY:"#5C9E5C", IDLE:"#AEB8C1", WAIT_SCHEDULE:"#C5CDD4",
+  AWAITING_USER:"#D9925B", QUOTA_WAIT:"#B9A6C9", BLOCKED:"#C2392F"};
+const POS = {COMPOSE:[160,70], SEND:[390,70], WAIT_REPLY:[620,70], INTAKE:[850,70],
+  REVIEW:[850,210], APPLY:[620,210], EXECUTE:[390,210], VERIFY:[160,210]};
+const HOLD_X = {IDLE:140, WAIT_SCHEDULE:320, AWAITING_USER:500, QUOTA_WAIT:680, BLOCKED:860};
+let DEF = null, FLOW = null, PROJ = new URLSearchParams(location.search).get("p"), SEL = null, lastFetch = 0;
+
+const dur = s => {
+  if (s == null) return "—";
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return `${s} 秒`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分 ${String(s % 60).padStart(2, "0")} 秒`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时 ${Math.floor(s % 3600 / 60)} 分`;
+  return `${Math.floor(s / 86400)} 天 ${Math.floor(s % 86400 / 3600)} 小时`;
+};
+const clock = iso => iso ? new Date(iso).toLocaleString("zh-CN", {hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"}) : "";
+const owner = sid => DEF.owners[DEF.states[sid].owner] || "";
+
+function drawSkeleton() {
+  const s = [];
+  s.push(`<rect class="rail" x="160" y="70" width="690" height="140" rx="70"/>`);
+  for (const [x, y, r] of [[275,70,0],[505,70,0],[735,70,0],[920,140,90],[735,210,180],[505,210,180],[275,210,180],[90,140,270]])
+    s.push(`<path class="chev" transform="translate(${x},${y}) rotate(${r})" d="M-6,-7 L6,0 L-6,7 Z"/>`);
+  s.push(`<line class="siding" x1="90" y1="300" x2="910" y2="300"/>`);
+  s.push(`<text x="40" y="305" style="fill:var(--muted);font-size:12px">等待区</text>`);
+  for (const sid of DEF.loop) {
+    const [x, y] = POS[sid], top = y < 140;
+    s.push(`<g class="st" data-sid="${sid}" tabindex="0" role="button" aria-label="${esc(DEF.states[sid].name)}">
+      <circle class="halo" cx="${x}" cy="${y}" r="16"/><circle class="ring" cx="${x}" cy="${y}" r="22"/>
+      <circle class="lamp" cx="${x}" cy="${y}" r="14"/>
+      <text x="${x}" y="${top ? y - 34 : y + 42}" text-anchor="middle">${esc(DEF.states[sid].name)}</text>
+      <text class="own" x="${x}" y="${top ? y - 19 : y + 59}" text-anchor="middle">${esc(owner(sid))}</text>
+      <text class="cnt" x="${x + 20}" y="${y + (top ? 24 : -18)}" data-cnt="${sid}"></text></g>`);
+  }
+  for (const sid of DEF.holds) {
+    const x = HOLD_X[sid];
+    s.push(`<g class="st hold" data-sid="${sid}" tabindex="0" role="button" aria-label="${esc(DEF.states[sid].name)}">
+      <circle class="halo" cx="${x}" cy="300" r="16"/><circle class="ring" cx="${x}" cy="300" r="20"/>
+      <rect class="lamp" x="${x - 12}" y="288" width="24" height="24" rx="4"/>
+      <text x="${x}" y="334" text-anchor="middle" style="font-size:13px">${esc(DEF.states[sid].name)}</text></g>`);
+  }
+  $("svg").insertAdjacentHTML("beforeend", s.join(""));
+  for (const g of document.querySelectorAll(".st")) {
+    const pick = () => { SEL = g.dataset.sid; renderDetail(); paint(); };
+    g.addEventListener("click", pick);
+    g.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+  }
+}
+
+function paint() {
+  if (!FLOW) return;
+  const st = FLOW.status, segs = FLOW.timeline.segments.filter(x => x.turn === st.turn);
+  const visited = new Set(segs.map(x => x.state));
+  const fails = {};
+  for (const e of FLOW.events) if (e.type === "fail" && e.turn === st.turn) fails[e.state] = (fails[e.state] || 0) + 1;
+  for (const g of document.querySelectorAll(".st")) {
+    const sid = g.dataset.sid, cur = sid === st.state;
+    g.classList.toggle("cur", cur);
+    g.classList.toggle("done", !cur && visited.has(sid) && DEF.loop.includes(sid));
+    g.classList.toggle("bad", (cur && (st.stuck || sid === "BLOCKED" || st.attempts > 0)) || (!cur && !!fails[sid]));
+    g.classList.toggle("sel", sid === (SEL || st.state));
+    const c = g.querySelector("[data-cnt]");
+    if (c) c.textContent = fails[sid] ? `失败 ${fails[sid]}` : "";
+  }
+}
+
+function renderNow() {
+  const s = FLOW.status, d = DEF.states[s.state];
+  $("turnno").textContent = `第 ${s.turn} 轮`;
+  const lim = s.max_dwell_s, pct = lim ? Math.min(100, s.dwell_s / lim * 100) : 0;
+  const parts = [];
+  parts.push(`<p class="state">${esc(s.name)}<small>${esc(s.state)}</small></p>`);
+  parts.push(`<div class="line"><span>负责：${esc(s.owner_name)}</span><span>已停留 <span class="dwell" id="dwell">${dur(s.dwell_s)}</span></span>
+    ${lim ? `<span>上限 ${dur(lim)}</span>` : ""}${s.max_attempts ? `<span>失败 ${s.attempts} / ${s.max_attempts}</span>` : ""}</div>`);
+  if (lim) parts.push(`<div class="bar${s.stuck ? " over" : ""}"><i style="width:${pct}%"></i></div>`);
+  if (s.state === "BLOCKED") parts.push(`<div class="alert"><b>阻塞原因：</b>${esc(s.block_reason)}（来自 ${esc(s.blocked_from || s.prev)}）</div>`);
+  if (s.until) parts.push(`<div class="${s.overdue_s ? "alert" : ""}"><b>等待到</b> ${esc(clock(s.until))}：${esc(s.wait_reason || "")}
+    ${s.overdue_s ? `<br><b>已逾期 ${dur(s.overdue_s)}</b>` : ""}</div>`);
+  if (s.stuck) parts.push(`<div class="alert">停留已超过上限。对照下面的异常处置表排查。</div>`);
+  if (s.state === "REVIEW") parts.push(`<p>评审：${s.review_accepted ? '<span class="tag t-ok">已接受</span>' : '<span class="tag t-warn">未接受</span>'}</p>`);
+  parts.push(`<p style="margin:6px 0">${esc(s.summary)}</p>`);
+  parts.push(`<h3>退出条件</h3><ul class="plain">${s.exit.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`);
+  parts.push(`<h3>现在要做的</h3><ul class="plain">${s.how.map(x => `<li><code>${esc(x)}</code></li>`).join("")}</ul>`);
+  if (s.stuck || s.attempts || s.state === "BLOCKED") parts.push(problemTable(s.problems));
+  $("now").innerHTML = parts.join("");
+}
+
+function problemTable(ps) {
+  if (!ps || !ps.length) return "";
+  return `<h3>已知异常与处置</h3><div class="tw"><table><tr><th>编号</th><th>现象</th><th>判定</th><th>处置</th></tr>
+    ${ps.map(p => `<tr><td>${esc(p.id)}${p.ledger ? `<br><span class="tag t-off">${esc(p.ledger)}</span>` : ""}</td>
+      <td>${esc(p.symptom)}</td><td>${esc(p.judge)}</td><td>${esc(p.action)}</td></tr>`).join("")}</table></div>`;
+}
+
+function renderDetail() {
+  const sid = SEL || FLOW.status.state, d = DEF.states[sid], stat = FLOW.timeline.stats[sid] || {};
+  $("seltitle").innerHTML = `步骤说明：${esc(d.name)} <small>点击运行图上的站点查看其他步骤</small>`;
+  const list = (t, a) => a && a.length ? `<h3>${t}</h3><ul class="plain">${a.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : "";
+  $("detail").innerHTML = `<p style="margin:0 0 4px"><b>${esc(sid)}</b>　负责：${esc(owner(sid))}　
+      ${d.max_dwell_s ? `停留上限 ${dur(d.max_dwell_s)}　` : ""}${d.max_attempts ? `失败上限 ${d.max_attempts} 次` : ""}</p>
+    <p style="margin:0">${esc(d.summary)}</p>
+    ${list("怎么做", d.how)}${list("进入条件", d.entry)}${list("退出条件", d.exit)}${list("证据", d.evidence)}
+    <h3>可进入</h3><p style="margin:0">${(d.next || []).map(n => esc(DEF.states[n].name)).join("、")}</p>
+    <h3>实测</h3><p style="margin:0">进入 ${stat.n || 0} 次，平均停留 ${dur(stat.avg_s)}，最长 ${dur(stat.max_s)}，失败 ${stat.fails || 0} 次</p>
+    ${problemTable(d.problems)}`;
+}
+
+function renderTimeline() {
+  const segs = FLOW.timeline.segments, turns = [...new Set(segs.map(s => s.turn))].sort((a, b) => b - a);
+  if (!turns.length) { $("tl").innerHTML = `<p class="empty">还没有事件记录。</p>`; return; }
+  const rows = turns.map(t => {
+    const ss = segs.filter(s => s.turn === t), tot = ss.reduce((a, s) => a + Math.max(s.dur_s, 1), 0);
+    return `<div class="row"><span>第 ${t} 轮</span><div class="track">${ss.map(s =>
+      `<div class="seg${s.forced ? " forced" : ""}" style="flex:${Math.max(s.dur_s, 1) / tot};background-color:${COLORS[s.state] || "#999"}"
+        title="${esc(DEF.states[s.state]?.name || s.state)}：${esc(dur(s.dur_s))}${s.open ? "（进行中）" : ""}${s.forced ? "（人工更正）" : ""}"></div>`).join("")}</div>
+      <span style="text-align:right">${dur(tot)}</span></div>`;
+  });
+  const used = [...new Set(segs.map(s => s.state))];
+  $("tl").innerHTML = rows.join("") + `<div class="legend">${used.map(s => `<span><i style="background:${COLORS[s]}"></i>${esc(DEF.states[s]?.name || s)}</span>`).join("")}
+    <span><i style="background:repeating-linear-gradient(45deg,#999 0 3px,#555 3px 5px)"></i>人工更正</span></div>`;
+}
+
+function renderExec() {
+  const td = FLOW.turn_detail, V = {pass: ["通过", "t-ok"], fail: ["未通过", "t-bad"], deviation: ["有偏离", "t-warn"], skip: ["暂缓", "t-off"]};
+  const parts = [];
+  if (td.intake && td.intake.blocks_missing.length) parts.push(`<div class="alert">回复缺少固定块：${td.intake.blocks_missing.map(esc).join("、")}</div>`);
+  if (td.checklist.length) {
+    const done = td.checklist.filter(c => c.verdict).length;
+    $("execsum").textContent = `回报清单 ${done} / ${td.checklist.length} 已验收`;
+    parts.push(`<h3 style="margin-top:0">回报清单</h3><table>${td.checklist.map(c => {
+      const [l, cls] = V[c.verdict] || ["未验收", "t-off"];
+      return `<tr><td>${c.n}</td><td>${esc(c.item)}${c.note ? `<br><span class="meta">${esc(c.note)}</span>` : ""}</td>
+        <td><span class="tag ${cls}">${l}</span></td><td>${esc(c.evidence || "")}</td></tr>`; }).join("")}</table>`);
+  } else $("execsum").textContent = "";
+  if (td.review) parts.push(`<h3>评审</h3><p style="margin:0">需用户批准 ${td.review.need_user} 条，谨慎 ${td.review.caution} 条，
+    ${td.review.accepted ? '<span class="tag t-ok">已接受</span>' : '<span class="tag t-warn">未接受</span>'}</p>`);
+  if (td.execs.length) parts.push(`<h3>命令与证据</h3><table>${td.execs.map(e => `<tr><td>${esc(e.id)}</td>
+    <td><span class="tag ${e.exit_code === 0 ? "t-ok" : "t-bad"}">exit ${esc(e.exit_code ?? "…")}</span></td>
+    <td><code>${esc(e.cmd)}</code></td><td style="white-space:nowrap">${e.duration_s != null ? dur(e.duration_s) : "进行中"}</td></tr>`).join("")}</table>`);
+  $("exec").innerHTML = parts.join("") || `<p class="empty">本轮还没有解析回复或执行命令。</p>`;
+}
+
+function evText(e) {
+  const n = sid => esc(DEF.states[sid]?.name || sid || "");
+  switch (e.type) {
+    case "transition": return `${n(e.frm)} → ${n(e.to)}${e.reason ? `：${esc(e.reason)}` : ""}${e.forced ? ' <span class="tag t-warn">人工更正</span>' : ""}`;
+    case "fail": return `<span class="t-bad">失败</span> 第 ${e.attempt} 次${e.symptom ? `（${esc(e.symptom)}）` : ""}：${esc(e.reason)}`;
+    case "exec": return `执行 ${esc(e.cid)} <span class="tag ${e.exit_code === 0 ? "t-ok" : "t-bad"}">exit ${esc(e.exit_code)}</span> <code>${esc(e.cmd)}</code>`;
+    case "apply": return `落地 ${esc(e.version)}（${esc(e.commit || "无变化")}，${esc(e.changed)} 个文件）`;
+    case "rollback": return `回滚 ${esc(e.frm)} → ${esc(e.to_version)}`;
+    case "verify": return `验收第 ${esc(e.item)} 项：${esc(e.verdict)}`;
+    case "intake": return `解析回复：${esc(e.commands)} 条命令，${esc(e.checklist)} 项清单${e.missing ? `，缺 ${esc(e.missing.join("、"))}` : ""}`;
+    case "review": return `评审已接受${e.user_approved ? `（用户批准：${esc(e.user_approved)}）` : ""}`;
+    case "note": return `备注（${esc(e.kind)}）：${esc(e.text)}`;
+    case "auto": return `<span class="tag t-warn">自动处置</span> ${esc(e.rule)} → ${esc(e.action)}（第 ${esc(e.attempt)} 次）：${esc(e.detail || "")}`;
+    case "tick": return `驱动器运行，退出码 ${esc(e.exit)}：${esc(e.note || "")}`;
+    case "goal_check": return `目标 ${esc(e.goal)}：${e.ok ? "通过" : "未通过"} ${esc(e.why || "")}`;
+    case "approve": return `<span class="tag t-ok">用户批准</span> ${esc(e.kind)}：${esc(e.note || "")}`;
+    case "pause": return `<span class="tag t-bad">暂停</span> ${esc(e.note || "")}`;
+    case "unpause": return `恢复自动化：${esc(e.note || "")}`;
+    default: return `${esc(e.type)} ${esc(e.reason || e.file || "")}`;
+  }
+}
+
+function renderEvents() {
+  const evs = FLOW.events.slice().reverse().slice(0, 40);
+  $("events").innerHTML = evs.length ? `<table>${evs.map(e => `<tr><td style="white-space:nowrap">${esc(clock(e.ts))}</td>
+    <td style="white-space:nowrap">第 ${esc(e.turn)} 轮</td><td>${evText(e)}</td></tr>`).join("")}</table>` : `<p class="empty">暂无事件。</p>`;
+}
+
+function renderStats() {
+  const st = FLOW.timeline.stats, ids = [...DEF.loop, ...DEF.holds].filter(s => st[s]);
+  $("stats").innerHTML = ids.length ? `<table><tr><th>步骤</th><th>负责</th><th>进入次数</th><th>平均停留</th><th>最长停留</th><th>失败</th></tr>
+    ${ids.map(s => `<tr><td>${esc(DEF.states[s].name)}</td><td>${esc(owner(s))}</td><td>${st[s].n}</td><td>${dur(st[s].avg_s)}</td>
+      <td>${dur(st[s].max_s)}</td><td>${st[s].fails || 0}</td></tr>`).join("")}</table>` : `<p class="empty">完成第一轮后显示。</p>`;
+}
+
+function renderDriver() {
+  const e = FLOW.explain || {}, d = FLOW.driver, inf = FLOW.driver_inflight, P = FLOW.policy || {};
+  const parts = [`<p class="state" style="font-size:22px">${esc(e.why || "")}</p>
+    <div class="line"><span>位置：${esc(e.where || "")}</span><span>需要：<b>${esc(e.who || "")}</b></span></div>
+    <p style="margin:4px 0 8px"><code>${esc(e.what || "")}</code></p>`];
+  if (FLOW.paused) parts.push(`<div class="alert">自动化已暂停：${esc(FLOW.paused.note || "")}（${esc(clock(FLOW.paused.ts))}）</div>`);
+  if (!P.approved) parts.push(`<div class="alert">白名单${P.changed_since_approval ? "在批准后被改动" : P.exists ? "尚未批准" : "不存在"}，驱动器不会自动执行。</div>`);
+  if (inf) parts.push(inf.alive ? `<p><span class="tag t-ok">正在运行</span> PID ${esc(inf.pid)}，开始于 ${esc(clock(inf.started))}</p>`
+    : `<div class="alert">上一次驱动（PID ${esc(inf.pid)}）未正常结束，下次运行会从记录处接续。</div>`);
+  if (d) {
+    const names = {0: "有进展", 10: "等待外部", 20: "需要用户", 30: "目标达成", 1: "内部错误"};
+    $("drvmeta").textContent = `最近一次 ${clock(d.ts)}，退出码 ${d.exit}（${names[d.exit] || ""}）`;
+    if (d.did && d.did.length) parts.push(`<h3>最近一次做了什么</h3><ul class="plain">${d.did.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`);
+  } else $("drvmeta").textContent = "尚未运行过";
+  $("drv").innerHTML = parts.join("");
+}
+
+function renderGoals() {
+  const g = FLOW.goals || {};
+  if (!g.defined) { $("goalmeta").textContent = ""; $("goals").innerHTML = `<p class="empty">项目没有定义目标（workflow/goals.json）。</p>`; return; }
+  $("goalmeta").textContent = `${g.done} / ${g.total}` + (g.approved ? "" : (g.changed_since_approval ? "，批准后被改动" : "，尚未批准"));
+  const pct = g.total ? g.done / g.total * 100 : 0;
+  $("goals").innerHTML = `<div class="bar"><i style="width:${pct}%"></i></div>
+    ${g.approved ? "" : `<div class="alert">目标定义未生效：需要用户审阅后 wf goals approve。</div>`}
+    <table>${g.items.map(i => `<tr><td>${i.ok ? '<span class="tag t-ok">通过</span>' : '<span class="tag t-off">未通过</span>'}</td>
+      <td><b>${esc(i.id)}</b> ${esc(i.title)}<br><span class="meta">${i.kind === "exec" ? "可执行判据" : "人工确认"}：${esc(i.detail)}</span></td>
+      <td class="meta">通过即：${esc(i.means || "")}<br>未通过：${esc(i.on_fail || "")}</td></tr>`).join("")}</table>`;
+}
+
+function renderAgents() {
+  $("agents").innerHTML = (FLOW.agents || []).map(a => `<div class="agent" data-s="${esc(a.status)}">
+    <h3>${esc(a.name)}</h3><div class="r">${esc(a.role)}</div><p>${esc(a.state)}</p>
+    ${a.at ? `<div class="r">${esc(clock(a.at))}</div>` : ""}
+    ${a.metrics && a.metrics.length ? `<ul>${a.metrics.map(m => `<li>${esc(m)}</li>`).join("")}</ul>` : ""}</div>`).join("");
+}
+
+function renderAttention() {
+  const a = FLOW.attention || [];
+  $("attn").innerHTML = a.length ? `<ul class="plain">${a.map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : `<p class="empty">本轮没有需要注意的事项。</p>`;
+  const d = (FLOW.decisions || []).slice().reverse();
+  $("decs").innerHTML = d.length ? `<table><tr><th>时间</th><th>阶段</th><th>决定与理由</th><th>结果</th></tr>${d.map(r => `<tr>
+    <td style="white-space:nowrap">${esc(clock(r.ts))}<br><span class="meta">第 ${esc(r.turn)} 轮</span></td><td>${esc(r.phase)}</td>
+    <td>${esc(r.decision)}<br><span class="meta">${esc(r.why)}${r.evidence ? "；证据：" + esc(r.evidence) : ""}</span></td>
+    <td>${esc(r.result || "")}</td></tr>`).join("")}</table>` : `<p class="empty">还没有决策记录。</p>`;
+}
+
+function renderAsks() {
+  const a = FLOW.asks || {items: [], notices: []};
+  const items = a.items || [], notes = a.notices || [];
+  $("askwrap").hidden = !(items.length || notes.length);
+  $("asks").innerHTML = items.map(it => `<div class="ask">
+      <h3>${esc(it.title)}　<span class="code">${esc(it.code)}</span></h3>
+      <p style="margin:0 0 4px">${esc(it.why)}</p>
+      <div>回复：${it.reply.map(r => `<span class="say">「${esc(r)}」</span>`).join("")}</div>
+      <p class="meta" style="margin:6px 0 0">不处理会怎样：${esc(it.consequence)}${it.basis ? "；依据：" + esc(it.basis) : ""}</p></div>`).join("")
+    + notes.map(n => `<div class="note"><b>${esc(n.title)}</b>：${esc(n.why)}</div>`).join("");
+}
+
+function renderToolsProgress() {
+  const rows = FLOW.tools_progress || [];
+  $("toolsprog").innerHTML = rows.length ? `<table><tr><th>轮次</th><th>Claude 的工具调用</th><th>执行端命令</th><th>自动处置</th></tr>${rows.map(r => `<tr>
+    <td>第 ${esc(r.turn)} 轮</td><td>${Object.entries(r.claude || {}).map(([k, v]) => `${esc(k)} × ${v}`).join("，") || "—"}</td>
+    <td>${r.cmds} 条${r.failed ? `，<span class="t-bad">失败 ${r.failed}</span>` : ""}</td><td>${r.auto || 0}</td></tr>`).join("")}</table>`
+    : `<p class="empty">还没有工具调用记录。</p>`;
+}
+
+function renderBanners() {
+  const s = FLOW.status, b = [];
+  if (FLOW.server_version && FLOW.tool_version && FLOW.server_version !== FLOW.tool_version)
+    b.push(`<div class="warnline"><b>看板正在运行旧版本 ${esc(FLOW.server_version)} 的代码</b>，工具已是 ${esc(FLOW.tool_version)}。页面显示的内容可能不完整，请让执行端重启看板。</div>`);
+  if (FLOW.next_wake) b.push(`<div class="asks" style="border-left-color:var(--rule)">下一次自动检查约在 ${esc(clock(FLOW.next_wake))}</div>`);
+  if (FLOW.pin && FLOW.tool_version && !FLOW.tool_version.startsWith(FLOW.pin + "."))
+    b.push(`<div class="warnline">项目固定的工具版本是 ${esc(FLOW.pin)}，当前工具是 ${esc(FLOW.tool_version)}。运行 wf doctor 查看是否需要 wf pin 或回滚工具。</div>`);
+  if (FLOW.paused) b.push(`<div class="asks"><b>项目已暂停</b>：${esc(FLOW.paused.note || "")}。驱动器不会推进，手动命令仍可用。恢复：wf unpause --note …</div>`);
+  if (FLOW.open_decisions.length) b.push(`<div class="asks"><b>需要用户决定（${FLOW.open_decisions.length}）</b>
+    <ol>${FLOW.open_decisions.map(d => `<li>${esc(d)}</li>`).join("")}</ol></div>`);
+  $("banners").innerHTML = b.join("");
+}
+
+async function loadProjects() {
+  const r = await (await fetch("/api/projects", {cache: "no-store"})).json();
+  const sel = $("proj");
+  if (!r.projects.length) { $("fatal").innerHTML = `<div class="err">还没有接入任何项目。在项目目录运行 wf init --adopt（已有项目）或 wf init --name 名称（新项目）。</div>`; return false; }
+  if (!PROJ || !r.projects.some(p => p.name === PROJ)) PROJ = r.projects[0].name;
+  sel.innerHTML = r.projects.map(p => { const tag = p.error ? "（不可用）" : p.paused ? "（已暂停）" : p.needs_user ? "（需处理）" : `：${esc(p.state_name)}`;
+    return `<option value="${esc(p.name)}"${p.name === PROJ ? " selected" : ""}>${esc(p.name)}${tag}</option>`; }).join("");
+  $("projlink").href = `/project.html?p=${encodeURIComponent(PROJ)}`;
+  return true;
+}
+
+async function tick() {
+  try {
+    const r = await fetch(`/api/flow?p=${encodeURIComponent(PROJ)}`, {cache: "no-store"});
+    const j = await r.json();
+    if (j.error) throw new Error(j.error);
+    FLOW = j; lastFetch = Date.now();
+    $("meta").textContent = `工具 ${j.tool_version}，项目 ${j.version || "—"}，更新于 ${new Date().toLocaleTimeString("zh-CN", {hour12: false})}`;
+    renderBanners(); renderAsks(); renderDriver(); renderGoals(); renderToolsProgress(); renderAgents(); renderAttention(); renderNow(); renderDetail(); renderTimeline(); renderExec(); renderEvents(); renderStats(); paint();
+    $("fatal").innerHTML = "";
+  } catch (e) {
+    $("fatal").innerHTML = `<div class="err">读取失败：${esc(e.message)}。确认看板服务在运行（wf serve --status）。</div>`;
+  }
+}
+
+(async function init() {
+  try {
+    DEF = await (await fetch("/api/definition", {cache: "no-store"})).json();
+    drawSkeleton();
+    if (!(await loadProjects())) return;
+    $("proj").addEventListener("change", e => { PROJ = e.target.value; SEL = null; history.replaceState(null, "", `?p=${encodeURIComponent(PROJ)}`);
+      $("projlink").href = `/project.html?p=${encodeURIComponent(PROJ)}`; tick(); });
+    await tick();
+    setInterval(() => { if (document.visibilityState === "visible") tick(); }, 3000);
+    setInterval(() => { if (document.visibilityState === "visible") loadProjects(); }, 30000);
+    setInterval(() => { if (FLOW && $("dwell")) $("dwell").textContent = dur(FLOW.status.dwell_s + (Date.now() - lastFetch) / 1000); }, 1000);
+  } catch (e) {
+    $("fatal").innerHTML = `<div class="err">初始化失败：${esc(e.message)}</div>`;
+  }
+})();
+</script>
+<style>
+/* 1.5.3：Claude 页面快照与对话记录 */
+#pagebox .pmsg, #talkbox .tmsg { border-top: 1px solid rgba(127,127,127,.25); padding: 8px 0; }
+#pagebox .pmsg:first-of-type, #talkbox .tmsg:first-of-type { border-top: 0; }
+.pv-head { font-size: 13px; opacity: .85; margin-bottom: 4px; }
+.pv-role { font-weight: 600; }
+.pv-pre { white-space: pre-wrap; word-break: break-word; margin: 4px 0; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-height: 560px; overflow: auto; background: rgba(127,127,127,.07); padding: 6px 8px; border-radius: 4px; }
+.pv-blk summary { cursor: pointer; font-size: 13px; }
+.pv-bar { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+.pv-bar button, .pv-bar select { font: inherit; font-size: 13px; padding: 2px 10px; border: 1px solid rgba(127,127,127,.4);
+  background: transparent; border-radius: 4px; cursor: pointer; color: inherit; }
+.pv-bar button[aria-pressed="true"] { background: rgba(127,127,127,.2); }
+.pv-shot { margin: 0 0 10px; }
+.pv-shot img { display: block; max-width: 100%; max-height: 720px; object-fit: contain; object-position: top left;
+  border: 1px solid rgba(127,127,127,.35); border-radius: 4px; }
+.pv-shot figcaption { font-size: 13px; opacity: .85; margin-top: 4px; }
+</style>
+<script>
+/* 1.5.3：Claude 页面快照（执行端每看一次页面就更新）与对话记录（逐字原文）。只读：数据来自 /api/page 与 /api/transcript。 */
+(() => {
+  const E = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+  const T = iso => iso ? new Date(iso).toLocaleString("zh-CN", {hour12: false, month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit"}) : "";
+  const AGO = iso => {
+    if (!iso) return "";
+    const s = (Date.now() - new Date(iso)) / 1000;
+    if (isNaN(s)) return "";
+    if (s < 60) return "刚刚";
+    if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+    if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+    return `${Math.floor(s / 86400)} 天前`;
+  };
+  const OPEN_LIMIT = 1500;
+  const pre = txt => `<div class="pv-pre">${E(txt)}</div>`;
+  const fold = (label, txt) => `<details class="pv-blk"><summary>${E(label)}（${String(txt ?? "").length} 字，点击展开全文）</summary>${pre(txt)}</details>`;
+  const body = (label, txt) => String(txt ?? "").length <= OPEN_LIMIT ? pre(txt) : fold(label, txt);
+  const proj = () => (typeof PROJ !== "undefined" && PROJ) || new URLSearchParams(location.search).get("p") || "";
+  const $$ = id => document.getElementById(id);
+  let lastProj = null;
+
+  // ---------- Claude 页面快照 ----------
+  let pageData = null, pageSha = null, pageTurn = "", pageAll = false;
+  // 1.5.4：内容指纹、最近一张截图、最近一次截图结果，任一变化才重画（保留已展开的内容）
+  const keyOf = m => `${(m || {}).sha || ""}|${((m || {}).shot || {}).at || ""}|${((m || {}).shot_last || {}).status || ""}`;
+  const SHOT_WHY = {unavailable: "浏览器没开调试端口或打不开页面", unchanged: "页面没有变化，沿用上一张", error: "截图出错",
+    none: "适配器这次没有给出截图", bad: "适配器写出的不是 PNG", too_big: "截图太大，没有收下"};
+  function shotBlock(r) {   // 1.5.4：页面截图（PNG），与文本快照成对
+    const m = r.meta || {}, p = proj(), turn = pageTurn && (r.shots || []).map(String).includes(String(pageTurn)) ? pageTurn : "";
+    if (pageTurn && !turn) return `<p class="meta">第 ${E(pageTurn)} 轮没有截图。</p>`;
+    const shot = m.shot, last = m.shot_last;
+    const note = !turn && last && last.status !== "ok"
+      ? `<p class="meta">本次查看没有新截图：${E(last.reason || SHOT_WHY[last.status] || last.status)}${shot ? `；下面是 ${E(T(shot.at))} 的截图` : ""}</p>` : "";
+    if (!shot) return note || `<p class="meta">还没有页面截图（适配器按 docs/SNAPSHOT.md 第 5 节写出后显示）。</p>`;
+    const url = `/api/page-image?p=${encodeURIComponent(p)}${turn ? "&turn=" + encodeURIComponent(turn) : ""}&v=${encodeURIComponent(shot.at || "")}`;
+    return note + `<figure class="pv-shot"><a href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="Claude 页面截图" loading="lazy"></a>
+      <figcaption>${turn ? `第 ${E(turn)} 轮的截图` : `截图 ${E(T(shot.captured_at || shot.at))}`} · ${E(shot.width)}×${E(shot.height)}${shot.mode === "full" ? " · 整页" : ""} · 点击看原图</figcaption></figure>`;
+  }
+  function blockHtml(b) {
+    const t = b && b.type, txt = b && b.text;
+    if (t === "text") return body("正文", txt);
+    if (t === "thinking") return fold("思考", txt);
+    if (t === "tool_use") return fold("工具调用" + (b.name ? "：" + b.name : ""), txt);
+    if (t === "tool_result") return fold("工具结果" + (b.name ? "：" + b.name : "") + (b.is_error ? "（出错）" : ""), txt);
+    return fold(t || "其他内容", txt);
+  }
+  function pageMetaText(m) {
+    return `最近查看 ${T(m.checked_at)}（${AGO(m.checked_at)}，累计 ${m.looks || 0} 次）· 内容更新于 ${T(m.changed_at)} · ${m.messages ?? "?"} 条消息`;
+  }
+  function renderPage() {
+    const box = $$("pagebox"), meta = $$("pagemeta"), r = pageData;
+    if (!box) return;
+    if (!r || r.error) { meta.textContent = ""; box.innerHTML = `<p class="empty">${E((r && r.error) || "读取中…")}</p>`; return; }
+    const m = r.meta || {};
+    if (!m.sha) {
+      meta.textContent = "还没有快照";
+      box.innerHTML = shotBlock(r) + `<p class="empty">还没有页面快照。适配器按 docs/SNAPSHOT.md 在每次轮询时写出快照后，这里会自动出现；执行端也可以运行 wf look 看一次。</p>`;
+      return;
+    }
+    meta.textContent = pageMetaText(m);
+    const s = r.snapshot || {}, conv = s.conversation || {};
+    const msgs = (s.messages || []).slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    const shown = pageAll ? msgs : msgs.slice(-12);
+    const turns = (r.turns || []).slice().reverse().map(t => `<option value="${E(t)}"${String(t) === String(pageTurn) ? " selected" : ""}>第 ${E(t)} 轮的最后一次</option>`).join("");
+    box.innerHTML = shotBlock(r) + `<div class="pv-bar"><select id="pv-turn" aria-label="选择快照"><option value="">最新</option>${turns}</select>
+        ${msgs.length > 12 ? `<button id="pv-all" aria-pressed="${pageAll}">${pageAll ? "只看最近 12 条" : `显示全部 ${msgs.length} 条`}</button>` : ""}
+        <span class="meta">${E(conv.name || "")}${conv.model ? " · " + E(conv.model) : ""} · 抓取于 ${E(T(s.captured_at))}</span></div>` +
+      (shown.length ? shown.map(x => `<div class="pmsg"><div class="pv-head"><span class="pv-role">${x.role === "assistant" ? "Claude" : "执行端发出"}</span>
+        · #${E(x.index)} · ${E(T(x.created_at))}${x.stop_reason ? " · " + E(x.stop_reason) : ""}${x.truncated ? " · 已截断" : ""}</div>
+        ${(x.blocks || []).map(blockHtml).join("")}</div>`).join("") : `<p class="empty">快照里没有消息。</p>`);
+    const all = $$("pv-all");
+    if (all) all.onclick = () => { pageAll = !pageAll; renderPage(); };
+    $$("pv-turn").onchange = e => { pageTurn = e.target.value; pageSha = null; loadPage(true); };
+  }
+  async function loadPage(force) {
+    const p = proj();
+    if (!p) return;
+    const q = `/api/page?p=${encodeURIComponent(p)}${pageTurn ? "&turn=" + encodeURIComponent(pageTurn) : ""}`;
+    try {
+      if (!force && pageData && !pageData.error) {
+        const m = await (await fetch(q + "&meta=1", {cache: "no-store"})).json();
+        if (m.meta && keyOf(m.meta) === pageSha) {   // 内容与截图都没变：只更新“最近查看”，不重画（保留已展开的内容）
+          pageData.meta = m.meta;
+          pageData.turns = m.turns;
+          if (m.meta.sha) $$("pagemeta").textContent = pageMetaText(m.meta);
+          return;
+        }
+        if (pageTurn) return;   // 正在看历史快照：不自动切换
+      }
+      pageData = await (await fetch(q, {cache: "no-store"})).json();
+      pageSha = keyOf(pageData.meta);
+      renderPage();
+    } catch (e) {
+      pageData = {error: `读取快照失败：${e}`};
+      renderPage();
+    }
+  }
+
+  // ---------- 对话记录（逐字原文） ----------
+  const ROLE = {user: "用户", claude: "Claude", executor: "执行端"};
+  let talk = [], talkFilter = "all", talkAll = false;
+  function toolNames(t) {
+    if (!t) return "";
+    return Array.isArray(t) ? t.map(x => typeof x === "string" ? x : (x && (x.name || x.tool)) || JSON.stringify(x)).join("、") : String(t);
+  }
+  function renderTalk() {
+    const box = $$("talkbox");
+    if (!box) return;
+    const rows = talk.filter(m => talkFilter === "all" || m.role === talkFilter).slice().reverse();
+    const shown = talkAll ? rows : rows.slice(0, 20);
+    const btn = (f, n) => `<button data-tf="${f}" aria-pressed="${talkFilter === f}">${n}</button>`;
+    $$("talkmeta").textContent = `共 ${talk.length} 条，逐字原文，最新的在上`;
+    box.innerHTML = `<div class="pv-bar">${btn("all", "全部")}${btn("user", "用户")}${btn("claude", "Claude")}${btn("executor", "执行端")}
+        ${rows.length > 20 ? `<button id="tv-all" aria-pressed="${talkAll}">${talkAll ? "只看最近 20 条" : `显示全部 ${rows.length} 条`}</button>` : ""}</div>` +
+      (shown.length ? shown.map(m => `<div class="tmsg"><div class="pv-head"><span class="pv-role">${E(ROLE[m.role] || m.role)}</span>
+        · 第 ${E(m.turn)} 轮 · ${E(T(m.ts))}${m.kind ? " · " + E(m.kind) : ""}${m.title ? " · " + E(m.title) : ""}${m.code ? " · 决定码 " + E(m.code) : ""}</div>
+        ${body("全文", m.text)}${m.tools ? `<div class="meta">工具：${E(toolNames(m.tools))}</div>` : ""}</div>`).join("")
+        : `<p class="empty">还没有这一类记录。</p>`);
+    box.querySelectorAll("[data-tf]").forEach(b => { b.onclick = () => { talkFilter = b.dataset.tf; renderTalk(); }; });
+    const ta = $$("tv-all");
+    if (ta) ta.onclick = () => { talkAll = !talkAll; renderTalk(); };
+  }
+  async function loadTalk() {
+    const p = proj();
+    if (!p) return;
+    try {
+      const r = await (await fetch(`/api/transcript?p=${encodeURIComponent(p)}&after=${talk.length}`, {cache: "no-store"})).json();
+      if (r.error) { $$("talkbox").innerHTML = `<p class="empty">${E(r.error)}</p>`; return; }
+      if (r.reset) talk = [];
+      if ((r.entries && r.entries.length) || r.reset || !$$("talkbox").innerHTML) {
+        talk = talk.concat(r.entries || []);
+        renderTalk();
+      }
+    } catch (e) { /* 下次再试 */ }
+  }
+
+  async function tick() {
+    const p = proj();
+    if (p !== lastProj) { lastProj = p; talk = []; pageData = null; pageSha = null; pageTurn = ""; }
+    await Promise.all([loadPage(false), loadTalk()]);
+  }
+  setTimeout(tick, 1200);
+  setInterval(tick, 20000);
+})();
+</script>
+</body>
+</html>
