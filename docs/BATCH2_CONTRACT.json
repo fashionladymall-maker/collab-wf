@@ -64,7 +64,11 @@
       "wflib/driver.py",
       "wflib/arbiter.py",
       "wflib/recovery.py",
-      "wflib/selftest_lane_a.py"
+      "wflib/selftest_lane_a.py",
+      "wflib/drill.py",
+      "wflib/driver_review.py",
+      "wflib/selftest_driver_review.py",
+      "wflib/selftest_send_fixtures.py"
     ],
     "B": [
       "wflib/admin.py",
@@ -73,7 +77,11 @@
       "wflib/anomaly.py",
       "wflib/fidelity.py",
       "wflib/review.py",
-      "wflib/selftest_lane_b.py"
+      "wflib/selftest_lane_b.py",
+      "wflib/install_history.py",
+      "wflib/selftest_install_history.py",
+      "wflib/selftest_install_commit.py",
+      "wflib/selftest_review.py"
     ],
     "C": [
       "wflib/goals.py",
@@ -84,7 +92,17 @@
       "wflib/selftest.py",
       "wflib/selftest_v15.py",
       "wflib/selftest_v18.py",
-      "wflib/selftest_driver.py"
+      "wflib/selftest_driver.py",
+      "wflib/live_history.py",
+      "wflib/selftest_live_history.py",
+      "wflib/selftest_c5_integration.py"
+    ],
+    "MAIN": [
+      "docs/DEVELOPMENT.md",
+      "docs/BATCH2_CONTRACT.json",
+      "docs/B3_FIXTURES.md",
+      "wflib/b3_fixtures.py",
+      "wflib/selftest_b3_fixtures.py"
     ]
   },
   "frozen": [
@@ -104,7 +122,316 @@
     "queue_share": "unknown absent actual ready/picked protocol, ordinary progress is not T3 pickup",
     "manual_ready": "default skeleton not permanently excluded; approved exec successes permit acceptance ready; empty exec set never reached"
   },
-  "status": "design contract; completion requires independent evidence, not this declaration",
+  "status": "design contract with recorded evidence; completion of any item requires independent evidence at its acceptance level, not this declaration",
   "source": "DEVELOPMENT.md",
-  "production_changed": false
+  "production_changed": false,
+  "revision": "MAIN-CONTRACT-B3-20261015",
+  "amendments": [
+    {
+      "id": "MAIN-CONTRACT-B3-20261015",
+      "by": "Claude MAIN contract card (docs and B3 synthetic fixtures only)",
+      "base": "integ/batch2 b523be470cd3252cd72210bf04cad8b76f62aa15",
+      "summary": "register owners of files added or changed in batch 2; record frozen-file exceptions; list active and queued cards; define acceptance levels; record evidence with its source; state task-protocol capabilities and gaps; add B3 synthetic fixtures",
+      "does_not_change": [
+        "product code",
+        "wflib/selftest.py aggregation",
+        "docs/C5_HISTORY.md",
+        "MANIFEST.json",
+        "VERSION"
+      ]
+    }
+  ],
+  "doc_owners": {
+    "A": [
+      "docs/DRIVER_REVIEW.md",
+      "docs/DRILL.md"
+    ],
+    "B": [
+      "docs/REVIEW.md"
+    ],
+    "C": [
+      "docs/C5_HISTORY.md"
+    ],
+    "MAIN": [
+      "docs/DEVELOPMENT.md",
+      "docs/BATCH2_CONTRACT.json",
+      "docs/B3_FIXTURES.md"
+    ],
+    "notes": {
+      "docs/REVIEW.md": "review.RULES_PATH: its bytes are bound into every review request (rules sha256); a change invalidates review reuse, so only a registered B card may edit it"
+    }
+  },
+  "ownership_registration_notes": {
+    "pending_merge": {
+      "wflib/live_history.py": "present only on PR32 cs/c/c5-integration 71514c16c946 (not merged into integ/batch2; blocked by P1)",
+      "wflib/selftest_live_history.py": "present only on PR32 cs/c/c5-integration 71514c16c946 (not merged into integ/batch2; blocked by P1)",
+      "wflib/selftest_c5_integration.py": "present only on PR32 cs/c/c5-integration 71514c16c946 (not merged into integ/batch2; blocked by P1)"
+    },
+    "added_in_batch2_without_prior_registration": {
+      "wflib/driver_review.py": "ded5f77",
+      "wflib/selftest_driver_review.py": "ded5f77",
+      "wflib/install_history.py": "903c5c7 (PR31)",
+      "wflib/selftest_install_history.py": "903c5c7 (PR31)",
+      "wflib/selftest_install_commit.py": "a90d31a",
+      "wflib/selftest_review.py": "584756d",
+      "wflib/selftest_send_fixtures.py": "8bae38b"
+    },
+    "changed_in_batch2_without_prior_registration": {
+      "wflib/drill.py": "c8de07a, b2fb692"
+    },
+    "unassigned_legacy": [
+      "adapters/__init__.py",
+      "adapters/base.py",
+      "adapters/example_echo.py",
+      "wflib/__init__.py",
+      "wflib/asks.py",
+      "wflib/fake_transport.py",
+      "wflib/heartbeat.py",
+      "wflib/machine.py",
+      "wflib/notify.py",
+      "wflib/page.py",
+      "wflib/projectmd.py",
+      "wflib/roles.py",
+      "wflib/server.py",
+      "wflib/signals.py",
+      "wflib/sync.py",
+      "wflib/watchdog.py"
+    ],
+    "unassigned_rule": "untouched 1.9.7 modules have no owner; register a card and owner before any change",
+    "manifest": "MANIFEST.json on development branches is still the 1.9.7 release manifest (67 files, without batch-2 modules); it is rebuilt only in the temporary candidate copy (DEVELOPMENT.md step 7), not per card"
+  },
+  "frozen_exceptions": [
+    {
+      "file": "wflib/ops.py",
+      "commit": "903c5c7263ea (PR31, cs/b/c5-history)",
+      "change": "run_exec allocates an install-exec/1 identity {id, nonce}, passes WF_INSTALL_EXEC_CONTEXT and an inherited receipt FD, reads install-exec-receipt/1 lines, records install_refs/install_receipt_error in exec metadata and event",
+      "status": "retroactive: merged into integ/batch2 b523be4 before an exception was registered",
+      "boundary": "the receipt FD and nonce are visible to the whole bash -c process tree, so a receipt links an invocation; it is not provenance. Cross-invocation forgery is refused by install_history comparing prepared.exec with the invocation context. Since PR31 every exec event carries install_exec, including non-install commands"
+    },
+    {
+      "file": "wflib/ops.py",
+      "card": "D1",
+      "conversation": "55071928 (per MAIN message; not verified by this card)",
+      "scope": "complete cNN / install-exec/1 / receipt association for the real driver h_apply path",
+      "status": "in progress; unreviewed",
+      "conditions": [
+        "no change to run_exec behaviour for non-install commands unless covered by tests",
+        "separate reviewed PR with GPT independent review",
+        "rest of ops.py unchanged"
+      ]
+    }
+  ],
+  "cross_lane_leases": [
+    {
+      "card": "D1",
+      "file": "wflib/release.py",
+      "owner_lane": "B",
+      "rule": "B lane does not write release.py until D1 is merged or withdrawn; D1 must not change review-binding semantics owned by B without B review"
+    }
+  ],
+  "active_cards": [
+    {
+      "id": "G1",
+      "conversation": "4ff72701 (per MAIN message)",
+      "lane": "C",
+      "files": [
+        "wflib/goals.py",
+        "wflib/live.py",
+        "docs/C5_HISTORY.md",
+        "new trust test (name per its commit)"
+      ],
+      "scope": "positive, versioned host production trust; keep a usable registration path; never permanently False"
+    },
+    {
+      "id": "D1",
+      "conversation": "55071928 (per MAIN message)",
+      "lane": "A (cross-lane B, frozen exception)",
+      "files": [
+        "wflib/driver.py",
+        "wflib/driver_review.py",
+        "wflib/release.py",
+        "wflib/ops.py",
+        "new identity test (name per its commit)"
+      ],
+      "scope": "real h_apply full cNN / install-exec/1 / receipt association"
+    },
+    {
+      "id": "MAIN-CONTRACT-B3",
+      "lane": "MAIN",
+      "files": [
+        "docs/DEVELOPMENT.md",
+        "docs/BATCH2_CONTRACT.json",
+        "docs/B3_FIXTURES.md",
+        "wflib/b3_fixtures.py",
+        "wflib/selftest_b3_fixtures.py"
+      ],
+      "scope": "contract and DEVELOPMENT.md amendments; B3 pure-synthetic fixture generator and its targeted test"
+    }
+  ],
+  "queued_cards": [
+    {
+      "id": "C-L1",
+      "after": [
+        "G1"
+      ],
+      "lane": "C",
+      "file": "wflib/live_history.py",
+      "defect": "GPT-CT5: successful `wf apply` and `python3 \"... wf.py\" self-update` without a receipt are dropped; only the substring `wf self-update` is recognised as a legacy install",
+      "fixture": "S01-legacy-host-1.9.7"
+    },
+    {
+      "id": "A-DR1",
+      "after": [
+        "D1"
+      ],
+      "lane": "A",
+      "file": "wflib/drill.py",
+      "defect": "GPT-CT3: drill block/timeout with outer exit 0 leaks the attempt"
+    },
+    {
+      "id": "C-TX1",
+      "after": [
+        "G1",
+        "D1"
+      ],
+      "lane": "C (B consult on tx schema)",
+      "defect": "CL-CT5: a failed install transaction without a receipt is invisible to C5 and to segment 4; with a non-synthetic-looking verifier the goal was granted verified (synthetic probe)",
+      "fixture": "S07b-install-tx-failed-closed"
+    },
+    {
+      "id": "A-B3-SEND",
+      "after": [
+        "D1"
+      ],
+      "lane": "A",
+      "defect": "B3 items from DEVELOPMENT.md: accepted send-intent crash protection; WAIT_REPLY missing-field NO_REF",
+      "fixture": "S02a, S02b, S03"
+    }
+  ],
+  "queued_cards_status": "proposals recorded by this contract card; each starts only when MAIN dispatches it",
+  "acceptance_levels": {
+    "L0-synthetic": "results produced only from synthetic fixtures, stand-in reviewers/verifiers or probes; proves logic or a counterexample; can never authorize an installation or count as a real round",
+    "L1-module": "targeted tests of one card on its branch, bound to commit/tree, command, interpreter, exit code, count",
+    "L2-integration-linux": "full aggregate selftest plus counterexamples on the combined integration tree, Linux",
+    "L3-target-mac": "the same on the target Mac (m4) with its real Python 3.9",
+    "L4-candidate": "batch-3 formal candidate: version, rebuilt MANIFEST, probes, real default gates, rollback drill, original-site boundary re-check; not started",
+    "L5-production": "real installation, R1 three consecutive real rounds, U1 user confirmation; not authorized",
+    "rules": [
+      "a level never substitutes for another",
+      "mechanical_pass, verified, NA and manual confirmation stay separate",
+      "results reported by another party are recorded with their source and marked not reproduced",
+      "no synthetic result is cited as production readiness"
+    ]
+  },
+  "acceptance_records": [
+    {
+      "tree": "094cba7358fded66cadab954000fe2bef605b7e5",
+      "commits": [
+        "6e09e68 (Claude local trial merge, not pushed)",
+        "017a0e8 (GPT cs/ic/c5-combined-validation)"
+      ],
+      "contents": "integ/batch2 b523be4 + PR32 71514c1",
+      "results": [
+        {
+          "by": "Claude",
+          "level": "L2-integration-linux",
+          "env": "Linux, non-root, private CPython 3.9.25 without startup .pth",
+          "lane_c": "182/182",
+          "full_selftest": "665/665",
+          "reproduced_by_this_card": true
+        },
+        {
+          "by": "GPT",
+          "level": "L2-integration-linux and L3-target-mac",
+          "full_selftest": "665/665 (Linux and m4)",
+          "install_history": "16/16",
+          "source": "MAIN message",
+          "reproduced_by_this_card": false
+        }
+      ],
+      "verdict": "mechanically green; NOT mergeable: P1-1 and P1-2 open"
+    },
+    {
+      "tree": "0d4ce5ad6c7f0e0c63b0c8aa7202fd2fc16ae753",
+      "commits": [
+        "b523be4 integ/batch2"
+      ],
+      "results": [
+        {
+          "by": "Claude",
+          "level": "L2-integration-linux",
+          "full_selftest": "636/636",
+          "env": "same as above",
+          "reproduced_by_this_card": true
+        }
+      ],
+      "note": "the combined tree adds exactly 29 C5 checks; no batch-2 check lost or changed"
+    }
+  ],
+  "open_defects": [
+    {
+      "id": "P1-1",
+      "owner_card": "G1",
+      "summary": "goal grant depends on a negative synthetic declaration; synthetic probe CT4 reached verified with a stand-in verifier that only omitted the flag"
+    },
+    {
+      "id": "P1-2",
+      "owner_card": "D1",
+      "summary": "driver h_apply installs carry no exec receipt; strict report passes but authorization is permanently unavailable"
+    },
+    {
+      "id": "CL-CT5",
+      "owner_card": "C-TX1 (queued)",
+      "summary": "failed transaction without receipt hidden from C5 and segment 4"
+    },
+    {
+      "id": "GPT-CT3",
+      "owner_card": "A-DR1 (queued)",
+      "summary": "drill block/timeout outer exit 0 leaks attempt",
+      "source": "GPT, per MAIN message; not reproduced by this card"
+    },
+    {
+      "id": "GPT-CT5",
+      "owner_card": "C-L1 (queued)",
+      "summary": "legacy installer spellings without receipt dropped",
+      "source": "GPT, per MAIN message; not reproduced by this card; fixture S01 encodes the shape"
+    },
+    {
+      "id": "OBS-R03",
+      "owner_card": "G1 (reference only)",
+      "summary": "after a verifier pin change review.status falls back to provenance level unavailable whose synthetic field is a default False; it does not mean non-synthetic"
+    }
+  ],
+  "closed_observations": [
+    {
+      "id": "GPT-CT6",
+      "summary": "ordinary exec / Git include / symlink root: green",
+      "source": "GPT, per MAIN message"
+    }
+  ],
+  "task_protocol": {
+    "exists": [
+      "wf task list|done|cancel|supersede|progress (wflib/tasks.py, CLI in wf.py)",
+      "per-task generation (uuid4) and rev; done/cancel/supersede/progress must quote the current generation",
+      "done requires a non-empty result note",
+      "--evidence: a file inside the project (recorded as relative path and sha256) or a bare 64-hex digest",
+      "secret-pattern check on evidence text and resolved paths"
+    ],
+    "does_not_exist": [
+      "no claim or lease action: a task cannot be claimed exclusively by an executor or card",
+      "evidence is not bound to commit, tree, command, interpreter, environment, exit code, count or duration",
+      "a bare 64-hex digest is accepted without verifying what it digests",
+      "no cross-machine or platform attestation of who ran what",
+      "development cards (A/B/C, G1, D1, this card) are not wf tasks; they are tracked in conversations and PRs",
+      "records in this contract are documentation, not machine-verified evidence"
+    ],
+    "rule": "do not describe task claim/done as an evidence protocol until such a protocol is implemented and tested"
+  },
+  "test_environment_rules": [
+    "run as a non-root user; root makes permission-failure cases pass or fail for the wrong reason",
+    "run in an isolated session (setsid); one observed run was terminated by a process-group signal",
+    "use an interpreter without startup .pth hooks (setuptools distutils-precedence.pth makes C2b audits fail closed); the interpreter found as python3 on PATH matters, not only sys.executable",
+    "use a private interpreter path and record its tree digest before and after each run; a shared /opt path was replaced by another actor during this review",
+    "bind every record to commit, tree, command, interpreter digest, exit code, count, duration and log digest"
+  ]
 }
