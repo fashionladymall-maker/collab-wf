@@ -1,4 +1,5 @@
-"""B1-B 车道测试：bootstrap 交接材料同源（r2 增加独立审查 R1–R5、r3 增加 R6–R7 的反例）；B2-B1a：init 默认骨架。
+"""B1-B 车道测试：bootstrap 交接材料同源（r2 增加独立审查 R1–R5、r3 增加 R6–R7 的反例）；B2-B1a：init 默认骨架；
+B2-B1b：强门禁“破坏性或跨项目”与权限扩大的两个提供方（C1_PROVIDERS，c1-provider/1）及变异对照。
 
 覆盖：有版本库时一次固定提交（工具 zip、WORKFLOW.md、模板、VERSION、清单同源，生成期间 HEAD 移动不影响）；
 现场未提交改动只声明、冻结后另出只读覆盖包（hash 对应冻结字节、不可安装、不被正式同步与自动安装选中）；
@@ -1169,10 +1170,480 @@ def _t_b1a_workflow_link(_ok, base: Path):
         json.dumps([plain_ok, adopt_res], ensure_ascii=False))
 
 
+# ---------------- B2-B1b：强门禁“破坏性或跨项目”与权限扩大（两个 c1-provider/1 提供方） ----------------
+# 只用临时目录：项目、项目根外的目录、指向根外的符号链接、另一个已注册项目都建在临时目录里；
+# 注册表写进子进程的临时 local（WF_LOCAL_DIR），不碰真实注册表与项目。
+
+USER_MARKS_B1B = ("必须停下的", "新增内容命中", "底线文件", "底线行为检查")   # 与 notify.USER_MARKS 同义，用于反查
+
+
+def _b1b_env(td: Path) -> dict:
+    root = td / "proj"
+    for d in ("build/sub/deep", "docs/sub", "tools", "scripts"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    for f in ("a.txt", "notes.txt", "build/sub/x.o", "archive.tar"):
+        (root / f).write_text("x\n", encoding="utf-8")
+    outside = td / "outside"
+    outside.mkdir()
+    (outside / "deep").mkdir()
+    (outside / "victim").write_text("不应被删\n", encoding="utf-8")
+    os.symlink(outside, root / "linkout")
+    os.symlink(outside, root / "build" / "link-out")   # r2：clean 目录里的链接项，通配展开后会经它出根
+    os.symlink(outside / "deep", root / "link-parent")
+    os.symlink(outside / "deep", root / "build" / "link-parent")
+    os.symlink(root / "docs" / "sub", root / "link-in")
+    os.symlink(root / "build" / "sub" / "deep", root / "build" / "link-in")
+    other = td / "other"
+    (other / "workflow").mkdir(parents=True)
+    (td / "elsewhere" / "proj").mkdir(parents=True)
+    from .policy import DEFAULT_PIPE_FILTERS
+    pol = {"allow": [".*"], "pipe_filters": list(DEFAULT_PIPE_FILTERS), "auto_apply": True, "auto_self_update": True,
+           "review_required": False, "clean_dirs": ["build", "linkout"]}
+    return {"root": root, "outside": outside, "other": other, "pol": pol, "others": [{"name": "other", "root": str(other)}]}
+
+
+def _pv(category: str, body) -> dict:
+    """c1-provider/1：每个用例都实际运行；抛异常的记 ran=False、ok=False；整体出错写 error。"""
+    cases, err = [], None
+    td = Path(tempfile.mkdtemp(prefix="wf-b1b-"))
+
+    def case(name, polarity, fn):
+        try:
+            ok, detail = fn()
+            cases.append({"name": name, "polarity": polarity, "ran": True, "ok": bool(ok), "detail": str(detail)[:300]})
+        except Exception as e:   # noqa: BLE001
+            cases.append({"name": name, "polarity": polarity, "ran": False, "ok": False,
+                          "detail": f"{type(e).__name__}: {e}"[:300]})
+    try:
+        body(case, td)
+    except Exception as e:   # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    return {"category": category, "provider": "B", "schema": "c1-provider/1", "cases": cases, "error": err}
+
+
+def _rules(r: dict) -> list:
+    return [h["rule"] for h in r.get("strong") or []]
+
+
+def _b1b_pos(policy, cmd, pol, want, **kw):
+    r = policy.classify(cmd, pol, **kw)
+    ok = (not r["auto"]) and policy.STRONG_CATEGORY in r["categories"] and want in _rules(r) \
+        and not any(m in x for x in r["reasons"] if "强门禁" in x for m in USER_MARKS_B1B)
+    return ok, f"auto={r['auto']} rules={_rules(r)}"
+
+
+def _b1b_neg(policy, cmd, pol, **kw):
+    r = policy.classify(cmd, pol, **kw)
+    return r["auto"] and not r["strong"], f"auto={r['auto']} rules={_rules(r)} reasons={r['reasons'][:2]}"
+
+
+def _e2e_review(base: Path, name: str, cmds: list, pol: dict) -> tuple:
+    """真实 driver.h_review：项目、已批准的 policy、本轮 intake.json 都是真的；返回 (状态, review.json, 批准事项的路由)。"""
+    import time
+    from . import asks, driver, notify, policy
+    inst = _mk_project(base, name)
+    (inst.wf / "policy.json").write_text(json.dumps(pol), encoding="utf-8")
+    policy.approve(inst, "policy", "测试")
+    inst.state.update(state="REVIEW", turn=1)
+    inst.save()
+    (inst.turn_dir() / "intake.json").write_text(json.dumps({"commands": cmds, "directives": {}, "user_decisions": []}),
+                                                 encoding="utf-8")
+    driver.h_review(driver.Ctx(inst, pol, time.time() + 60))
+    rv = json.loads((inst.turn_dir() / "review.json").read_text(encoding="utf-8"))
+    routes = [notify.route(i) for i in asks.pending(inst) if i["kind"] == "approve"]
+    return inst.state["state"], rv, routes
+
+
+POS_B1B = [
+    ("项目根外递归删除", "rm -rf ../x", "RECURSIVE_DELETE"),
+    ("规范化后在根外", "rm -rf /tmp/../srv/b1b-x", "OUTSIDE_WRITE"),
+    ("clean_dirs 里的符号链接不生效", "rm -rf linkout/", "RECURSIVE_DELETE"),
+    ("从 clean_dirs 经 .. 跳出", "rm -rf build/../docs", "RECURSIVE_DELETE"),
+    ("删除整个项目根", "rm -rf .", "RECURSIVE_DELETE"),
+    ("根目录通配", "rm -rf *", "RECURSIVE_DELETE"),
+    ("引号拼接程序名", "r''m -rf ../x", "RECURSIVE_DELETE"),
+    ("反斜杠程序名", "\\rm -rf ../x", "RECURSIVE_DELETE"),
+    ("绝对路径程序", "/bin/rm -rf ../x", "RECURSIVE_DELETE"),
+    ("env 赋值外壳", "env A=1 rm -rf ../x", "RECURSIVE_DELETE"),
+    ("command 外壳", "command rm -rf ../x", "RECURSIVE_DELETE"),
+    ("nohup 外壳", "nohup rm -rf ../x", "RECURSIVE_DELETE"),
+    ("timeout 外壳", "timeout 5 rm -rf ../x", "RECURSIVE_DELETE"),
+    ("前置环境变量自报项目", "WF_PROJECT=me rm -rf ../x", "RECURSIVE_DELETE"),
+    ("注释自报在项目内", "rm -rf ../x # 项目内", "RECURSIVE_DELETE"),
+    ("同名目录在别处", "rm -rf ../elsewhere/proj/x", "OUTSIDE_WRITE"),
+    ("引号里的 # 不是注释", "rm -rf \"#\" ../q", "OUTSIDE_WRITE"),
+    ("词中的 # 不是注释", "rm -rf x#y ../z", "OUTSIDE_WRITE"),
+    ("强推", "git push --force origin main", "GIT_DESTRUCTIVE"),
+    ("加号强推", "git push origin +main", "GIT_DESTRUCTIVE"),
+    ("删除远端分支", "git push origin :main", "GIT_DESTRUCTIVE"),
+    ("--delete", "git push --delete origin x", "GIT_DESTRUCTIVE"),
+    ("git clean", "git clean -fdx", "GIT_DESTRUCTIVE"),
+    ("reset --hard", "git reset --hard HEAD~1", "GIT_DESTRUCTIVE"),
+    ("删除分支", "git branch -D x", "GIT_DESTRUCTIVE"),
+    ("根外仓库提交", "git -C ../other commit -am x", "GIT_OUTSIDE"),
+    ("launchctl bootout", "launchctl bootout gui/501/local.x", "GLOBAL_SERVICE"),
+    ("pkill", "pkill -f wf", "GLOBAL_SERVICE"),
+    ("kill", "kill 123", "GLOBAL_SERVICE"),
+    ("brew services", "brew services stop x", "GLOBAL_SERVICE"),
+    ("crontab -r", "crontab -r", "GLOBAL_SERVICE"),
+    ("sudo", "sudo ls", "PRIV"),
+    ("bash -c", "bash -c \"echo hi\"", "OPAQUE"),
+    ("bash -lc 组合短参数", "bash -lc \"echo hi\"", "OPAQUE"),
+    ("python -c", "python3 -c \"print(1)\"", "OPAQUE"),
+    ("eval", "eval ls", "OPAQUE"),
+    ("根外脚本", "bash /tmp/evil.sh", "OPAQUE"),
+    ("命令替换", "echo $(rm -rf ../x)", "OPAQUE"),
+    ("find -delete", "find . -name x -delete", "RECURSIVE_DELETE"),
+    ("find -exec rm", "find . -exec rm {} \\;", "RECURSIVE_DELETE"),
+    ("xargs rm", "ls | xargs rm -rf", "XARGS_WRITE"),
+    ("重定向写到根外", "echo x > ../y", "OUTSIDE_WRITE"),
+    ("sed -i 改根外文件", "sed -i 's/a/b/' /etc/hosts", "OUTSIDE_WRITE"),
+    ("dd 写根外", "dd if=a.txt of=/tmp/x", "OUTSIDE_WRITE"),
+    ("cd 到根外", "cd /tmp", "CHDIR"),
+    ("多行命令", "echo hi #c\nrm -rf ../x", "MULTILINE"),
+    ("引号不配对", "echo \"a", "UNPARSEABLE"),
+    ("分开写的 -r -f", "rm -r -f ../x", "RECURSIVE_DELETE"),
+    ("长参数 --recursive", "rm --recursive ../x", "RECURSIVE_DELETE"),
+    ("-- 之后的操作数", "rm -rf -- ../x", "RECURSIVE_DELETE"),
+    ("程序名来自变量", "$RM -rf ../x", "OPAQUE"),
+    ("管道交给 shell 执行", "echo ls | bash", "OPAQUE"),
+    ("~ 路径", "rm -rf ~/x", "OUTSIDE_WRITE"),
+    ("cp -t 根外目录", "cp -t ../x a.txt", "OUTSIDE_WRITE"),
+    ("mv 从根外搬入", "mv ../x a.txt", "OUTSIDE_WRITE"),
+    ("perl -pi -e", "perl -pi -e 's/a/b/' notes.txt", "OPAQUE"),
+    ("exec 外壳", "exec rm -rf ../x", "RECURSIVE_DELETE"),
+    ("nice -n 外壳", "nice -n 5 rm -rf ../x", "RECURSIVE_DELETE"),
+    ("xargs -I{}", "ls | xargs -I{} rm {}", "XARGS_WRITE"),
+    # r2（常规独立审查 BLOCK-1..4 及同语义变体）
+    ("通配后续段经符号链接出根", "rm -rf build/*/victim", "RECURSIVE_DELETE"),
+    ("通配以 / 结尾会跟进链接", "rm -rf build/*/", "RECURSIVE_DELETE"),
+    ("非递归删除经通配出根", "rm build/*/victim", "OUTSIDE_WRITE"),
+    ("大括号展开出根", "rm -rf build/{x,../../outside}", "RECURSIVE_DELETE"),
+    ("大括号拼出程序与参数", "{rm,-rf,../x}", "RECURSIVE_DELETE"),
+    ("程序名用通配", "/bin/r? -rf ../x", "OPAQUE"),
+    ("tar 连写 -xC 目录", "tar -xC ../outside -f archive.tar", "OUTSIDE_WRITE"),
+    ("tar 分开写 -C", "tar -xf archive.tar -C ../outside", "OUTSIDE_WRITE"),
+    ("tar -C 与值连写", "tar -x -C../outside -f archive.tar", "OUTSIDE_WRITE"),
+    ("tar --directory=", "tar --directory=../outside -xf archive.tar", "OUTSIDE_WRITE"),
+    ("tar 旧式写法", "tar xCf ../outside archive.tar", "OUTSIDE_WRITE"),
+    ("tar 打包写到根外", "tar -czf ../out.tgz docs", "OUTSIDE_WRITE"),
+    ("tar --to-command", "tar -xf archive.tar --to-command=sh", "OPAQUE"),
+    ("tar 解包时改写成员路径", "tar -xf archive.tar -s ',^,../,'", "OUTSIDE_WRITE"),
+    ("curl -o 连写", "curl -o../outside/file https://example.invalid/data", "OUTSIDE_WRITE"),
+    ("curl -o 分开写", "curl -o ../outside/f https://example.invalid/data", "OUTSIDE_WRITE"),
+    ("curl --output=", "curl --output=../outside/f https://example.invalid/data", "OUTSIDE_WRITE"),
+    ("curl 组合短参数 -sSLo", "curl -sSLo../x https://example.invalid/data", "OUTSIDE_WRITE"),
+    ("curl --output-dir", "curl --output-dir ../outside -O https://example.invalid/f", "OUTSIDE_WRITE"),
+    ("curl -K 配置文件", "curl -K cfg https://example.invalid/data", "OPAQUE"),
+    ("wget -P 连写", "wget -P../outside https://example.invalid/data", "OUTSIDE_WRITE"),
+    ("wget -O 连写", "wget -O../outside/f https://example.invalid/data", "OUTSIDE_WRITE"),
+    ("wget --directory-prefix=", "wget --directory-prefix=../outside https://example.invalid/data", "OUTSIDE_WRITE"),
+    ("wget -e 执行指令", "wget -e robots=off https://example.invalid/data", "OPAQUE"),
+    ("cp -t 连写", "cp -t../x a.txt", "OUTSIDE_WRITE"),
+    ("touch -r 引用与目标都在根外", "touch -r /etc/hosts ../x", "OUTSIDE_WRITE"),
+    ("macOS sed -i '' 改根外文件", "sed -i '' 's/a/b/' /etc/hosts", "OUTSIDE_WRITE"),
+    # r3（边界独立审查四组及同语义变体）
+    ("env -C 连写目录", "env -C../outside touch victim", "CHDIR"),
+    ("env 组合短选项里带 -C", "env -iC../outside touch victim", "CHDIR"),
+    ("env -C 分开写", "env -C ../outside touch victim", "CHDIR"),
+    ("env --chdir 单独跟值", "env --chdir ../outside touch victim", "CHDIR"),
+    ("env --chdir=", "env --chdir=../outside touch victim", "CHDIR"),
+    ("env -S 连写", "env -S'rm -rf ../x'", "OPAQUE"),
+    ("make -C 根外", "make -C ../other clean", "OPAQUE"),
+    ("make -f 根外", "make -f /tmp/x.mk", "OPAQUE"),
+    ("! 前缀的递归删除", "! rm -rf docs", "RECURSIVE_DELETE"),
+    ("! 前缀的提权", "! sudo true", "PRIV"),
+    ("{ } 命令组", "{ rm -rf ../x; }", "RECURSIVE_DELETE"),
+    ("then 之后的命令", "then rm -rf ../x", "RECURSIVE_DELETE"),
+    # r4：先解析符号链接再处理 ..，不能按字面折叠 link/..。
+    ("符号链接后 .. 的 touch 仍在根外", "touch link-parent/../victim", "OUTSIDE_WRITE"),
+    ("符号链接后 .. 的复制目标仍在根外", "cp a.txt link-parent/../copied", "OUTSIDE_WRITE"),
+    ("clean_dirs 内链接后 .. 的删除仍在根外", "rm -rf build/link-parent/../victim", "OUTSIDE_WRITE"),
+    ("删除链接带尾 slash 时跟随到根外", "rm -rf build/link-parent/", "OUTSIDE_WRITE"),
+]
+NEG_B1B = [
+    ("clean_dirs 内递归删除", "rm -rf build/"), ("clean_dirs 内通配", "rm -rf build/sub/*.o"), ("clean_dirs 本身", "rm -rf build"),
+    ("带注释的合法清理", "rm -rf build/ # 清理"), ("项目内删单个文件", "rm notes.txt"), ("项目内复制", "cp a.txt b.txt"),
+    ("项目内移动", "mv a.txt docs/a.txt"), ("项目内建目录", "mkdir -p out/x"), ("项目内 touch", "touch docs/n.md"),
+    ("读根外文件", "cat /etc/hosts"), ("git status", "git status"), ("git log", "git log -1"),
+    ("launchctl list", "launchctl list"), ("普通 push", "git push origin main"), ("项目脚本", "python3 tools/build.py"),
+    ("项目 shell 脚本", "bash scripts/x.sh"), ("python -m", "python3 -m json.tool a.txt"),
+    ("引号里的危险文字", "echo \"rm -rf ../x\""), ("检索危险文字", "grep -n 'launchctl bootout' notes.txt"),
+    ("引号里的 #", "echo '#'"), ("词中 #", "echo a#b"), ("$#", "echo $# x"),
+    ("sed -i 的脚本以 / 开头", "sed -i '/^#/d' notes.txt"), ("find 只查", "find . -name '*.py'"), ("管道过滤", "ls | grep x"),
+    ("kill -l", "kill -l"), ("自动安装的固定形式", "wf self-update --auto workflow/outbox/collab-wf-1.9.9.zip"),
+    ("生产构建器形式", "python3 build_wf_198.py --out workflow/outbox"), ("2>&1", "echo x 2>&1"),
+    ("python3 --version", "python3 --version"), ("bash --version", "bash --version"), ("command -v", "command -v rm"),
+    ("读工具目录（非 local）", "cat " + str(WF_HOME / "VERSION")),
+    # r2（常规独立审查 BLOCK-1..4 的正常用法对照）
+    ("clean_dirs 内通配（链接项只删链接本身）", "rm -rf build/*"), ("clean_dirs 内大括号", "rm -rf build/{sub,nothing}"),
+    ("clean_dirs 内序列展开", "rm -rf build/{a..c}"), ("tar 只列出", "tar -tf archive.tar"), ("tar 旧式只列出", "tar tf archive.tar"),
+    ("tar 解包到项目内", "tar -xf archive.tar -C build/out"), ("tar 打包到项目内", "tar -czf build/out.tgz docs"),
+    ("tar 解包到当前目录", "tar -xf archive.tar"),
+    ("curl 输出到项目内", "curl -o build/out.json https://example.invalid/data"),
+    ("curl 组合短参数输出到项目内", "curl -sSLo build/x https://example.invalid/data"),
+    ("curl 只输出到标准输出", "curl -s https://example.invalid/data"),
+    ("wget 存到项目内", "wget -P build https://example.invalid/data"), ("wget 输出到标准输出", "wget -qO- https://example.invalid/data"),
+    ("cp 只读工具目录里的源", "cp " + str(WF_HOME / "VERSION") + " docs/tool-version"),
+    ("touch -r 只读根外引用", "touch -r /etc/hosts docs/n.md"), ("macOS sed -i '' 的脚本以 / 开头", "sed -i '' '/^#/d' notes.txt"),
+    ("sed -i.bak", "sed -i.bak 's/a/b/' notes.txt"), ("sed -i -e", "sed -i -e 's/a/b/' notes.txt"),
+    ("cp 大括号目标在项目内", "cp a.txt build/{p,q}.txt"), ("install -m 的值不是路径", "install -m 644 a.txt build/a.txt"),
+    ("mkdir -m 的值不是路径", "mkdir -m 755 out"), ("echo 路径文字", "echo /etc/hosts"),
+    # r3（边界独立审查四组的正常用法对照）
+    ("env 只设变量", "env MODE=test touch docs/victim"), ("env -u 分开写", "env -u MODE touch docs/victim"),
+    ("env -u 连写", "env -uMODE touch docs/victim"), ("env -i", "env -i touch docs/victim"),
+    ("make 项目内", "make build"), ("make -C 项目内", "make -C build"),
+    ("! 前缀的合法清理", "! rm -rf build/sub"), ("引号里的 !", "echo \"!\""), ("文字里的 !", "echo 'hello!'"),
+    ("! true", "! true"), ("! grep", "! grep -q x notes.txt"),
+    # r4：普通 ..、根内链接后 .. 以及不跟随删除末段链接仍按真实目标判定。
+    ("普通 .. 回到根内", "touch docs/../notes.txt"),
+    ("根内链接后 .. 的写入", "touch link-in/../notes.txt"),
+    ("clean_dirs 内链接后 .. 的清理", "rm -rf build/link-in/../cache"),
+    ("删除末段链接本身", "rm -rf build/link-parent"),
+]
+
+
+def provider_destructive() -> dict:
+    """C1 第 2 条 2S-destructive-or-crossproject（提供方 B）。"""
+    from . import core, notify, policy
+
+    def body(case, td):
+        e = _b1b_env(td)
+        root, pol, oth = e["root"], e["pol"], e["others"]
+        for name, cmd, want in POS_B1B:
+            case(f"命中：{name}（{cmd!r}）", "pos", lambda c=cmd, w=want: _b1b_pos(policy, c, pol, w, root=root, others=oth))
+        for name, cmd in NEG_B1B:
+            case(f"不误拦：{name}（{cmd!r}）", "neg", lambda c=cmd: _b1b_neg(policy, c, pol, root=root, others=oth))
+        other = e["other"]
+        case("命中：写进另一个已注册项目（显式 others）", "pos",
+             lambda: _b1b_pos(policy, f"cp a.txt {other}/x", pol, "OTHER_PROJECT", root=root, others=oth))
+        case("命中：读另一个项目的 workflow/", "pos",
+             lambda: _b1b_pos(policy, f"cat {other}/workflow/state.json", pol, "OTHER_PROJECT", root=root, others=oth))
+        case("命中：读工具运行状态目录 LOCAL", "pos",
+             lambda: _b1b_pos(policy, f"cat {core.LOCAL}/transport.json", pol, "OTHER_PROJECT", root=root, others=oth))
+        case("命中：cp 的源是 LOCAL（读也拦）", "pos",
+             lambda: _b1b_pos(policy, f"cp {core.LOCAL}/transport.json docs/", pol, "OTHER_PROJECT", root=root, others=oth))
+        case("命中：cp 写进工具目录", "pos",
+             lambda: _b1b_pos(policy, f"cp a.txt {WF_HOME}/b1b-x", pol, "OTHER_PROJECT", root=root, others=oth))
+        # r3：受保护目录不分大小写（macOS 默认文件系统不分大小写，换个大小写是同一个目录）
+        case("命中：LOCAL 换个大小写也拦", "pos",
+             lambda: _b1b_pos(policy, f"cat {str(core.LOCAL).swapcase()}/transport.json", pol, "OTHER_PROJECT",
+                              root=root, others=oth))
+
+        # r3：clean_dirs 的保护名按规范化后的路径段核对
+        def norm_clean():
+            bad = ["./workflow", "././workflow/", "./.git", "Workflow", "build/../workflow"]
+            ok_dirs, probs = policy.clean_dirs({"clean_dirs": bad}, root)
+            hits = [_b1b_pos(policy, cmd, {**pol, "clean_dirs": [cd]}, "RECURSIVE_DELETE", root=root, others=oth)[0]
+                    for cd, cmd in (("./workflow", "rm -rf workflow"), ("././workflow/", "rm -rf ./workflow"),
+                                    ("Workflow", "rm -rf Workflow"))]
+            return ok_dirs == [] and len(probs) == len(bad) and all(hits), f"{ok_dirs} {len(probs)} {hits}"
+        case("命中：./workflow、././workflow/、大小写变体都不能成为清理目录", "pos", norm_clean)
+
+        def norm_clean_ok():
+            ok_dirs, probs = policy.clean_dirs({"clean_dirs": ["./build", "build/./sub"]}, root)
+            p2 = {**pol, "clean_dirs": ["./build"]}
+            negs = [_b1b_neg(policy, cmd, p2, root=root, others=oth)[0] for cmd in ("rm -rf ./build/", "rm -rf build/sub")]
+            return ok_dirs == ["build", "build/sub"] and not probs and all(negs), f"{ok_dirs} {probs} {negs}"
+        case("不误拦：./build 规范化后正常生效", "neg", norm_clean_ok)
+
+        # r3：递归操作的范围之内有另一个已注册项目（嵌套在 clean 目录里）
+        n2 = td / "nested-case"
+        for d in ("build/sub", "build/nested/workflow", "src"):
+            (n2 / d).mkdir(parents=True, exist_ok=True)
+        (n2 / "build" / "nested" / "workflow" / "state.json").write_text("{}\n", encoding="utf-8")
+        on2 = [{"name": "nested", "root": str(n2 / "build" / "nested")}]
+        p3 = {**pol, "clean_dirs": ["build"]}
+        for cmd in ("rm -rf build", "rm -rf build/*", "mv build build2", "chmod -R 777 build", "rsync -a --delete src/ build/"):
+            case(f"命中：递归范围包含另一个项目（{cmd!r}）", "pos",
+                 lambda c=cmd: _b1b_pos(policy, c, p3, "OTHER_PROJECT", root=n2, others=on2))
+        for cmd in ("rm -rf build/sub", "chmod -R 755 build/sub", "rsync -a --delete src/ build/sub/", "mv build/sub build/sub2"):
+            case(f"不误拦：与另一个项目不相交（{cmd!r}）", "neg",
+                 lambda c=cmd: _b1b_neg(policy, c, p3, root=n2, others=on2))
+
+        def via_registry():
+            core.register("b1b-other", other)
+            try:
+                return _b1b_pos(policy, f"cp a.txt {other}/y", pol, "OTHER_PROJECT", root=root)
+            finally:
+                reg = core.load_registry()
+                reg["projects"] = [p for p in reg["projects"] if p.get("name") != "b1b-other"]
+                core.write_json(core.REGISTRY, reg)
+        case("命中：另一个项目来自注册表（others 缺省）", "pos", via_registry)
+        case("命中：没有 root 时递归删除一律命中（无法核实 clean_dirs）", "pos",
+             lambda: _b1b_pos(policy, "rm -rf build/", pol, "RECURSIVE_DELETE"))
+        case("不误拦：没有 root 时项目内普通写照常", "neg", lambda: _b1b_neg(policy, "cp a.txt b.txt", pol))
+
+        def bad_clean():
+            p3 = {**pol, "clean_dirs": ["../x", "workflow", ".git", "/abs", "~/h"]}
+            ok_dirs, probs = policy.clean_dirs(p3, root)
+            hits = [_b1b_pos(policy, c, p3, "RECURSIVE_DELETE", root=root, others=oth)[0]
+                    for c in ("rm -rf ../x/", "rm -rf workflow/", "rm -rf .git")]
+            return ok_dirs == [] and len(probs) == 5 and all(hits), f"{ok_dirs} {len(probs)} {hits}"
+        case("命中：clean_dirs 里的无效项一律不生效", "pos", bad_clean)
+
+        def floor_kept():
+            r = policy.classify("cat .env", pol, root=root, others=oth)
+            why = "- 命令 1「cat .env」：" + "；".join(r["reasons"])
+            return (not r["auto"] and "密钥" in r["categories"]
+                    and notify.route({"kind": "approve", "why": why}) == "user"), str(r["categories"])
+        case("命中：底线（密钥）仍停下且只交用户", "pos", floor_kept)
+
+        def strong_route():
+            r = policy.classify("rm -rf ../x", pol, root=root, others=oth)
+            why = "- 命令 1「rm -rf ../x」：" + "；".join(r["reasons"])
+            return (not r["auto"] and notify.route({"kind": "approve", "why": why}) == "executor"), why[:200]
+        case("命中：强门禁先交执行端（不冒充底线、不自动执行）", "pos", strong_route)
+
+        def compat():
+            r = policy.classify("echo hi", pol)
+            r2 = policy.classify("rm -rf build", {"allow": ["^echo "]})
+            return (set(r) == {"cmd", "auto", "reasons", "categories", "manual", "strong"} and r["auto"]
+                    and "不在已批准的命令白名单中" in r2["reasons"] and any("强门禁" in x for x in r2["reasons"])), \
+                str(r2["reasons"])[:200]
+        case("不误拦：两参数调用兼容，原有原因保留、只追加", "neg", compat)
+        e2e = td / "e2e"
+        e2e.mkdir()
+
+        def e2e_pos():
+            s, rv, routes = _e2e_review(e2e, "e2e-pos", ["rm -rf ../x"], pol)
+            return s == "AWAITING_USER" and _rules(rv["rows"][0]) and routes == ["executor"], f"{s} {routes}"
+        case("命中：真实 h_review 下 allow=.* 也停在等待批准、路由执行端", "pos", e2e_pos)
+
+        def e2e_neg():
+            s, rv, routes = _e2e_review(e2e, "e2e-neg", ["echo hi"], pol)
+            return s != "AWAITING_USER" and rv["auto"] and routes == [], f"{s} {routes}"
+        case("不误拦：真实 h_review 下普通命令照常通过", "neg", e2e_neg)
+    return _pv("2S-destructive-or-crossproject", body)
+
+
+def provider_widening() -> dict:
+    """C1 第 2 条 2S-widening（提供方 B）：权限扩大不自动批准，收紧照常自动批准。"""
+    import time
+    from . import driver, policy
+    old = {"allow": ["^a ", "^b "], "stop": [{"pattern": "x"}], "max_rounds_per_day": 24, "clean_dirs": ["build"],
+           "pipe_filters": ["head", "tail", "grep"]}
+    widen = [("allow 新增 .*", {**old, "allow": ["^a ", "^b ", ".*"]}),
+             ("clean_dirs 新增", {**old, "clean_dirs": ["build", "dist"]}),
+             ("删掉停止规则", {**old, "stop": []}),
+             ("新开自动安装", {**old, "auto_self_update": True}),
+             ("不认识的键", {**old, "foo": 1})]
+    narrow = [("删 allow", {**old, "allow": ["^a "]}), ("删 clean_dirs", {**old, "clean_dirs": []}),
+              ("调低每日上限", {**old, "max_rounds_per_day": 10}), ("只改时间参数", {**old, "poll_interval_s": 30})]
+
+    def body(case, td):
+        for name, new in widen:
+            case(f"命中：{name}", "pos", lambda n=new: (bool(policy.widening(old, n)), policy.widening(old, n)))
+        for name, new in narrow:
+            case(f"不误拦：{name}", "neg", lambda n=new: (policy.widening(old, n) == [], policy.widening(old, n)))
+
+        def setup(name):
+            inst = _mk_project(td, name)
+            (inst.wf / "policy.json").write_text(json.dumps(old), encoding="utf-8")
+            policy.approve(inst, "policy", "测试")
+            return inst
+
+        def findings(new):
+            inst = setup(f"rf-{len(json.dumps(new))}-{os.urandom(3).hex()}")
+            src = td / f"src-{os.urandom(3).hex()}"
+            (src / "workflow").mkdir(parents=True)
+            (src / "workflow" / "policy.json").write_text(json.dumps(new), encoding="utf-8")
+            return policy.release_findings(inst, src, old)
+        case("命中：版本包里扩大的 policy.json 给出 finding", "pos",
+             lambda: (bool(findings(widen[0][1])), "有 finding"))
+        case("不误拦：版本包里收紧的 policy.json 没有 finding", "neg",
+             lambda: (findings(narrow[0][1]) == [], "无 finding"))
+
+        def auto_approve(new):
+            inst = setup(f"aa-{os.urandom(3).hex()}")
+            before = {"policy": {"approved": True, "sha": policy.sha256(inst.wf / "policy.json")}, "goals": {}}
+            (inst.wf / "policy.json").write_text(json.dumps(new), encoding="utf-8")
+            driver._auto_approve_neutral(driver.Ctx(inst, old, time.time() + 60), before, "v0.2")
+            return policy.status(inst, "policy")["approved"]
+        case("命中：扩大的变更落地后不被驱动器自动批准", "pos", lambda: (auto_approve(widen[1][1]) is False, "未批准"))
+        case("不误拦：收紧的变更落地后由驱动器自动批准", "neg", lambda: (auto_approve(narrow[1][1]) is True, "已批准"))
+    return _pv("2S-widening", body)
+
+
+C1_PROVIDERS = {"2S-destructive-or-crossproject": provider_destructive, "2S-widening": provider_widening}
+
+
+def _pv_ok(r: dict) -> tuple:
+    cs = r.get("cases") or []
+    pos = [c for c in cs if c["polarity"] == "pos"]
+    neg = [c for c in cs if c["polarity"] == "neg"]
+    bad = [c for c in cs if not (c["ran"] and c["ok"])]
+    good = (r.get("schema") == "c1-provider/1" and not r.get("error") and pos and neg and not bad)
+    return bool(good), f"pos {len(pos)} neg {len(neg)} 失败 {[(c['name'], c['detail']) for c in bad][:4]} error={r.get('error')}"
+
+
+def _t_b1b_providers(_ok, base: Path):
+    for cat, fn in C1_PROVIDERS.items():
+        r = fn()
+        good, detail = _pv_ok(r)
+        _ok(f"B2-B1b 提供方 {cat}：c1-provider/1，正例与反例都实际运行且全部符合（{detail.split(' 失败')[0]}）", good, detail)
+
+
+def _t_b1b_mutations(_ok, base: Path):
+    """变异对照：把判定弄坏，提供方必须报失败（证明用例不是空转）。"""
+    from . import policy
+    with _patched(policy, "strong_gates", lambda *a, **k: []):
+        r = provider_destructive()
+    failed_pos = [c for c in r["cases"] if c["polarity"] == "pos" and not c["ok"]]
+    _ok("B2-B1b 变异对照：去掉强门禁判定后，破坏性或跨项目的正例成批失败", len(failed_pos) >= len(POS_B1B), str(len(failed_pos)))
+    with _patched(policy, "MAY_SHRINK", ("allow", "pipe_filters")):
+        r = provider_widening()
+    bad = [c["name"] for c in r["cases"] if not c["ok"]]
+    _ok("B2-B1b 变异对照：clean_dirs 不按“只能收紧”处理时，删 clean_dirs 被误判为扩大", any("删 clean_dirs" in x for x in bad),
+        str(bad))
+    with _patched(policy, "_strip_comments", lambda s: s):
+        hit_with_comment = bool(policy.strong_gates("rm -rf build/ # 清理", {"clean_dirs": ["build"]},
+                                                    root=_b1b_env(base)["root"], others=[]))
+    _ok("B2-B1b 变异对照：不去掉注释时，带注释的合法清理会被误拦（所以按 bash 的注释规则去掉注释）", hit_with_comment)
+    e = _b1b_env(base / "m")
+    real = bool(policy.strong_gates("rm -rf linkout/", {"clean_dirs": ["linkout", "build"]}, root=e["root"], others=[]))
+    with _patched(os.path, "realpath", os.path.abspath):
+        fooled = bool(policy.strong_gates("rm -rf linkout/", {"clean_dirs": ["linkout", "build"]}, root=e["root"], others=[]))
+    _ok("B2-B1b 变异对照：不解析符号链接时，指向根外的 clean_dirs 会被放过；解析时命中", real and not fooled, f"{real} {fooled}")
+    import glob as _glob
+    e2 = _b1b_env(base / "m2")
+    p2 = {"clean_dirs": ["build"]}
+    real = bool(policy.strong_gates("rm -rf build/*/victim", p2, root=e2["root"], others=[]))
+    with _patched(_glob, "glob", lambda *a, **k: []):
+        fooled = bool(policy.strong_gates("rm -rf build/*/victim", p2, root=e2["root"], others=[]))
+    _ok("B2-B1b r2 变异对照：只核通配前缀、不核实际匹配时，经 clean 目录里的链接出根的删除被放过；核实际匹配时命中",
+        real and not fooled, f"{real} {fooled}")
+    real = bool(policy.strong_gates("tar -xC ../outside -f archive.tar", p2, root=e2["root"], others=[]))
+    with _patched(policy, "_SPEC", {**policy._SPEC, "tar": ("", set(), set(), set())}):
+        fooled = bool(policy.strong_gates("tar -xC ../outside -f archive.tar", p2, root=e2["root"], others=[]))
+    _ok("B2-B1b r2 变异对照：不按参数语义解析连写短参数时，tar -xC 的根外目录被放过；按语义解析时命中", real and not fooled,
+        f"{real} {fooled}")
+    real = bool(policy.strong_gates("! rm -rf docs", p2, root=e2["root"], others=[]))
+    with _patched(policy, "_RESERVED", set()):
+        fooled = bool(policy.strong_gates("! rm -rf docs", p2, root=e2["root"], others=[]))
+    _ok("B2-B1b r3 变异对照：不剥掉命令前的保留字时，! rm -rf 被放过；剥掉时命中", real and not fooled, f"{real} {fooled}")
+    real = bool(policy.strong_gates("env -C../outside touch victim", p2, root=e2["root"], others=[]))
+    with _patched(policy, "_ENV_ARG", ""):
+        fooled = bool(policy.strong_gates("env -C../outside touch victim", p2, root=e2["root"], others=[]))
+    _ok("B2-B1b r3 变异对照：env 的 -C 不按带参短选项解析时，连写的根外目录被放过；按语义解析时命中", real and not fooled,
+        f"{real} {fooled}")
+    n3 = base / "m3"
+    (n3 / "build" / "nested" / "workflow").mkdir(parents=True)
+    on3 = [{"name": "nested", "root": str(n3 / "build" / "nested")}]
+    real = bool(policy.strong_gates("rm -rf build", p2, root=n3, others=on3))
+    with _patched(policy, "_contained", lambda rp, c: None):
+        fooled = bool(policy.strong_gates("rm -rf build", p2, root=n3, others=on3))
+    _ok("B2-B1b r3 变异对照：不查递归范围之内的受保护目录时，删除包含另一个项目的 clean 目录被放过；查时命中",
+        real and not fooled, f"{real} {fooled}")
+
+
 TESTS = [_t_clean, _t_dirty5, _t_freeze_once, _t_head_moved, _t_nogit, _t_failures, _t_compat, _t_short,
          _t_r1_attributes, _t_r1_verify, _t_r2_walk_errors, _t_r3_symlinks_git, _t_r3_symlinks_nogit,
          _t_r4_publish, _t_r5_short, _t_r6_restore_retry, _t_r7_parent_swap, _t_r7_capability,
-         _t_b1a_init_new, _t_b1a_init_existing, _t_b1a_init_refuse, _t_b1a_init_safe, _t_b1a_workflow_link]
+         _t_b1a_init_new, _t_b1a_init_existing, _t_b1a_init_refuse, _t_b1a_init_safe, _t_b1a_workflow_link,
+         _t_b1b_providers, _t_b1b_mutations]
 
 
 def run_lane_b(_ok) -> None:
