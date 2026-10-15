@@ -763,22 +763,45 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     (local / "transport.json").write_text(json.dumps(tcfg))
 
     # C2d. 1.6.8（P1-D）：wf drill review 在隔离目录里让真实驱动器消费审查程序的 block 与超时
-    rvb = tmp / "t-review-drill-block"
-    rvb.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：削弱了四道底线"]}\'\n')
-    rvb.chmod(0o755)
-    rvt = tmp / "t-review-drill-slow"
-    rvt.write_text("#!/bin/sh\nsleep 6\necho '{\"verdict\": \"pass\"}'\n")
-    rvt.chmod(0o755)
+    from .selftest_review import RUNNER
+
+    def drill_runner(name, behavior):
+        host = tmp / name
+        host.mkdir()
+        runner = host / "runner.py"
+        runner.write_text(RUNNER.format(py=sys.executable), encoding="utf-8")
+        runner.chmod(0o755)
+        (host / "behavior.json").write_text(json.dumps(behavior), encoding="utf-8")
+        return runner
+
+    def drill_records(base):
+        attempts = [json.loads(p.read_text()) for p in (base / "local/reviews/attempts").glob("*/attempt.json")]
+        decisions = [json.loads(p.read_text())["decision"]
+                     for p in (base / "project/workflow/evidence/install/driver-review").glob("*-decision.json")]
+        tags = subprocess.run(["git", "tag"], cwd=base / "project", capture_output=True, text=True).stdout.split()
+        unchanged = "v0.2" not in tags and not list(
+            (base / "project/workflow/evidence/install").glob("tx-*/started.json"))
+        return attempts, decisions, unchanged
+
+    rvb = drill_runner("drill-block-host", {"verdict": "block", "model": "test-reviewer"})
+    rvt = drill_runner("drill-timeout-host", {"sleep": 6})
     rcb, ob = _wf(env, tmp, "drill", "review", "--kind", "block", "--dir", str(tmp / "drill-b"), "--review", str(rvb))
     resb = json.loads((tmp / "drill-b" / "drill-result.json").read_text(encoding="utf-8")) if (tmp / "drill-b" / "drill-result.json").exists() else {}
-    _ok("1.6.8 演练 block：驱动器停在 AWAITING_USER、审查意见可见、版本包没有落地；演练项目已暂停、不在生产注册表里",
-        rcb == 0 and resb.get("ok") and resb.get("state") == "AWAITING_USER"
+    ab, db, unchanged_b = drill_records(tmp / "drill-b")
+    _ok("演练 block：新协议真实attempt核验为synthetic block、BLOCKED且没有安装；不在生产注册表里",
+        rcb == 0 and resb.get("ok") and resb.get("state") == "BLOCKED"
+        and len(ab) == len(db) == 1 and ab[0].get("state") == "completed"
+        and ab[0].get("verdict_claimed") == db[0].get("verdict") == "block"
+        and db[0].get("provenance", {}).get("synthetic") and not db[0].get("allowed") and unchanged_b
         and resb.get("project", "x") not in (local / "registry.json").read_text(encoding="utf-8"), ob[-800:])
     rct, ot = _wf(env, tmp, "drill", "review", "--kind", "timeout", "--dir", str(tmp / "drill-t"), "--review", str(rvt),
                   "--review-timeout-s", "2")
     rest = json.loads((tmp / "drill-t" / "drill-result.json").read_text(encoding="utf-8")) if (tmp / "drill-t" / "drill-result.json").exists() else {}
-    _ok("1.6.8 演练超时：决策日志记“未审查”、没有结论文件、良性版本包照常落地并继续",
-        rct == 0 and rest.get("ok"), ot[-800:])
+    at, dt, unchanged_t = drill_records(tmp / "drill-t")
+    _ok("演练超时：新协议真实attempt为timeout、BLOCKED且没有安装",
+        rct == 0 and rest.get("ok") and rest.get("state") == "BLOCKED"
+        and len(at) == len(dt) == 1 and at[0].get("state") == "timeout"
+        and at[0].get("runner", {}).get("timed_out") and not dt[0].get("allowed") and unchanged_t, ot[-800:])
     rcx, ox = _wf(env, tmp, "drill", "review", "--kind", "block", "--dir", str(tmp / "drill-b"), "--review", str(rvb))
     _ok("1.6.8 演练目录不空时拒绝运行（不覆盖、不删除已有证据）", rcx != 0 and "必须不存在或为空" in ox, ox[-300:])
 
