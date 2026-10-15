@@ -49,6 +49,8 @@ HELP = """collab-wf {v} —— Claude × 执行端 协作工作流
   wf pause / wf unpause --note / wf undo --note    暂停、恢复、回退上一个版本并暂停
   wf audit [--n 40]                   自动执行过的一切：做了什么、依据什么、结果如何
   wf goals [check | approve --note | confirm <编号> --note]    目标与完成判据
+  wf goals na <编号> --condition … --scope … --reason … --judged-by …    记录不适用及判定依据
+  wf metrics [--first N] [--last N]    只读指标与证据覆盖；缺失数据保持未知
   wf policy [approve --note]          自动执行的命令白名单
   wf transport [test]                 检查传输适配器配置 / 黑盒一致性检查（不发送消息）
   wf effort                           档位与角色规则，以及按档位、角色的复盘统计
@@ -401,8 +403,12 @@ def main(argv=None):
     x = sub.add_parser("unpause"); x.add_argument("--code"); x.add_argument("--said", "--note", dest="said"); _by_args(x)   # 1.7.5
     x = sub.add_parser("undo"); x.add_argument("--note", required=True)
     x = sub.add_parser("audit"); x.add_argument("--n", type=int, default=40)
-    x = sub.add_parser("goals"); x.add_argument("action", nargs="?", default="show", choices=["show", "check", "approve", "confirm"])
+    x = sub.add_parser("metrics"); x.add_argument("--first", type=int); x.add_argument("--last", type=int)
+    x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    x = sub.add_parser("goals"); x.add_argument("action", nargs="?", default="show", choices=["show", "check", "approve", "confirm", "na"])
     x.add_argument("gid", nargs="?"); x.add_argument("--said", "--note", dest="said"); x.add_argument("--code"); _by_args(x)
+    x.add_argument("--condition"); x.add_argument("--scope"); x.add_argument("--judged-by")
+    x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     x = sub.add_parser("policy"); x.add_argument("action", nargs="?", default="show", choices=["show", "approve"])
     x.add_argument("--said", "--note", dest="said"); x.add_argument("--code"); _by_args(x)
     x = sub.add_parser("ask"); x.add_argument("--new", action="store_true"); x.add_argument("--mark-shown", action="store_true")
@@ -416,11 +422,12 @@ def main(argv=None):
     x.add_argument("tid", nargs="?"); x.add_argument("--note")   # B2-FIX-A1：不给时为 None，用来拒绝不适用的参数
     x.add_argument("--reason"); x.add_argument("--by-task", dest="by_task")   # 1.8.2
     x.add_argument("--generation")   # B2-A1：新记录必须带它现在的代次；旧记录不带或写 legacy
-    x.add_argument("--rev", type=int)   # B2-A1：同一代次内的附加校验
+    x.add_argument("--rev", "--expect-rev", dest="rev", type=int)   # 同一代次内的附加校验，保留原参数
     x.add_argument("--evidence", action="append", default=[])   # B2-A1：done 的证据，项目内文件或 64 位摘要，可多次
     x.add_argument("--by-generation", dest="by_generation")   # B2-A1：接替者的代次（与 --by-task 一起）
     xg = x.add_mutually_exclusive_group()
     xg.add_argument("--interrupted", action="store_true"); xg.add_argument("--resumed", action="store_true")   # B2-A1
+    x.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     x = sub.add_parser("transport"); x.add_argument("action", nargs="?", default="check", choices=["check", "test"])
     sub.add_parser("effort")
     x = sub.add_parser("decisions"); x.add_argument("--n", type=int, default=40); x.add_argument("--turn", type=int)
@@ -855,6 +862,19 @@ def main(argv=None):
                     print(f"{r['key']}  [{r.get('for')}] {r.get('title')}：{r.get('why') or ''}（自 {r.get('since')}，来源 {r.get('source')}）")
                 if not rows:
                     print("没有信号")
+    elif c == "metrics":
+        try:
+            from wflib import metrics
+        except ImportError as e:
+            raise WfError("metrics_unavailable：当前工具缺少指标模块") from e
+        report = metrics.compute(_p(args), first=args.first, last=args.last)
+        if args.json:
+            out(report)
+        else:
+            print(f"项目 {report['project']} 指标（来源：{report['provenance']}）")
+            for name, item in report["metrics"].items():
+                value = "未知" if item["unknown"] else str(item["value"])
+                print(f"  {name}：{value}；样本 {item['n']}；覆盖率 {item['coverage']}")
     elif c == "task":
         from wflib import tasks
         inst = _p(args)
@@ -1085,6 +1105,10 @@ def main(argv=None):
         _print_audit(_p(args), args.n)
     elif c == "goals":
         from wflib import goals, policy
+        if args.action != "na" and any(v is not None for v in (args.condition, args.scope, args.judged_by)):
+            raise WfError("--condition、--scope、--judged-by 只用于 wf goals na")
+        if args.action == "na" and any(v is not None for v in (args.said, args.code, args.by)):
+            raise WfError("wf goals na 使用 --reason 和 --judged-by 记录依据，不接受批准或确认参数")
         inst = _p(args)
         if args.action == "approve":
             g = goals.load(inst)
@@ -1097,6 +1121,14 @@ def main(argv=None):
             note, by = _decide_as(inst, "goals", it, args)
             r = policy.approve(inst, "goals", note, by=by)
             print(f"已批准目标定义（sha256 {r['sha256'][:12]}）。今后对 goals.json 的任何改动都需要重新批准。")
+        elif args.action == "na":
+            if not args.gid:
+                raise WfError("用法：wf goals na <目标编号> --condition … --scope … --reason … --judged-by …")
+            rec = goals.mark_na(inst, args.gid, args.condition, args.scope, args.reason, args.judged_by)
+            if args.json:
+                out(rec)
+            else:
+                print(f"已记录 {args.gid} 不适用（判定人：{rec['by']}）；不计入目标完成")
         elif args.action == "confirm":
             if not args.gid or not args.code or not args.said:
                 raise WfError("用法：wf goals confirm <目标编号> --code <决定码> --said \"用户原话\"")
