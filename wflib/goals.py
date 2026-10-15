@@ -226,6 +226,16 @@ def _sha256_file(p: Path):
         return None
 
 
+def _result_state(inst):
+    """Strict mixed input/output state. Never clear unreadable history to write."""
+    from . import live
+    source, raw = live._file_source(inst.wf / "goals_state.json")
+    records = {} if raw is None else live._strict_json(raw, source["path"])
+    if any(not isinstance(value, dict) for value in records.values()):
+        raise live._InputProblem("corrupt", source["path"], "goal result slots must be objects")
+    return records
+
+
 def _manifest_files(root) -> dict:
     """r2（F3）：与 release._tool_files() 相同的文件选择规则（那里固定读 WF_HOME，这里可指定根目录），只读。
     安装树里的普通文件逐个 sha256，排除 .git、local、__pycache__ 下的文件、.pyc 与 MANIFEST.json 本身；
@@ -275,15 +285,41 @@ def _project_fp(inst: Instance):
         return None
 
 
-def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str) -> dict:
-    """B1-C：verified 的唯一来源。在本进程内直接调用 live.check（受控的规范路径），不读命令输出、不读外部摘要文件。"""
+def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snapshot=None, closure=None, capture_problem=None) -> dict:
+    """C2c-1：由冻结输入直接评价并留存采集证据；完整闭包/C5 未就绪前不授予新版 verified。"""
     from . import live
     spec = x.get("live") or {}
-    segs = [int(n) for n in spec.get("segments") or []]
-    rounds = int(spec.get("rounds", 3))
+    segs = spec.get("segments") or []
+    rounds = spec.get("rounds", 3)
     why = []
+    collection = None
     try:
-        r = live.check(inst, rounds)
+        if not isinstance(segs, list) or not segs or any(type(n) is not int or n not in LIVE_SEGMENTS for n in segs):
+            raise live._InputProblem("corrupt", "parameters", "invalid live segments")
+        if capture_problem:
+            raise capture_problem
+        if snapshot is None:
+            snapshot = live._capture_inputs(inst, rounds=rounds)
+        descriptor = snapshot.descriptor
+        descriptor["parameters"] = {"rounds": rounds, "budget_s": spec.get("budget_s", 300)}
+        if type(rounds) is not int or rounds <= 0 or type(descriptor["parameters"]["budget_s"]) is not int \
+                or descriptor["parameters"]["budget_s"] < 0:
+            raise live._InputProblem("corrupt", "parameters", "invalid live parameters")
+        snapshot = live._FrozenInputs(snapshot.root, snapshot.project, dict(snapshot.raw), descriptor)
+        collection = live._evaluate_snapshot(snapshot)
+        if not isinstance(closure, dict) or closure.get("complete") is not True:
+            raise live._InputProblem("unsupported", "closure", "complete closure not collected")
+        collection["closure"] = closure
+        collection["closure_sha256"] = hashlib.sha256(live._canonical(closure).encode()).hexdigest()
+        collection["report_sha256"] = hashlib.sha256(live._canonical(collection["report"]).encode()).hexdigest()
+        r = collection["report"]
+        # C2c-1 collects a strict read set. Complete project/tool closure and
+        # historical installation verification are intentionally still pending.
+        why.append("install_history_unavailable（C2c-1 仅采集，尚未开放新版 verified）")
+    except live._InputProblem as e:
+        r = {}
+        collection = {"state": e.state, "source": e.source, "detail": e.detail, "authorization": "unavailable"}
+        why.append(f"实景输入 {e.state}：{e.source}：{e.detail}")
     except Exception as e:   # noqa: BLE001
         r = {}
         why.append(f"live.check 运行出错：{type(e).__name__}: {e}"[:300])
@@ -309,13 +345,24 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str) -> dict
     if not fp:
         why.append("算不出项目指纹")
     ev = d / f"{stamp}-{x['id']}-live.json"
-    ev.write_text(json.dumps({"goal": x["id"], "summary": sm, "rounds": (r or {}).get("rounds")}, ensure_ascii=False,
-                             sort_keys=True, indent=1), encoding="utf-8")
-    binding = {"project": inst.name, "segments": segs, "rounds": rounds, "tool_digest": tool["digest"],
+    write_json(ev, {"goal": x["id"], "summary": sm, "rounds": (r or {}).get("rounds"), "collection": collection})
+    try:
+        dependencies = _dep_defs(load(inst), x)
+    except Exception as e:
+        dependencies = None
+        why.append(f"递归依赖无法核对：{type(e).__name__}")
+    binding = {"schema": "live-collection/2", "project": inst.name, "segments": segs, "rounds": rounds, "tool_digest": tool["digest"],
                "tool_head": tool["head"], "tool_dirty": tool["dirty"] != [], "project_fp": fp, "goals_sha": st["current"],
                "summary_sha256": sm.get("rounds_sha256"), "evidence": str(ev.relative_to(inst.root)),
-               "evidence_sha256": _sha256_file(ev)}
-    return {"granted": not why, "why": why, "ts": now_iso(), "binding": binding}
+               "evidence_sha256": _sha256_file(ev), "authorization": "unavailable",
+               "window_inputs_sha256": (collection or {}).get("inputs_sha256"),
+               "closure_sha256": (collection or {}).get("closure_sha256"),
+               "report_sha256": (collection or {}).get("report_sha256"),
+               "goal_sha256": _goal_def_sha(x), "dependency_definitions": dependencies,
+               "content_complete": isinstance(closure, dict) and closure.get("complete") is True,
+               "authorization_complete": False}
+    return {"granted": False, "why": why, "ts": now_iso(), "binding": binding,
+            "collection": collection}
 
 
 # ———————— B2-C2b：逐目标机械绑定 v2（mech-binding/2） ————————
@@ -323,7 +370,7 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str) -> dict
 # 闭包按检查命令推导；项目 python 脚本另由运行时审计（sys.addaudithook 记下的打开、列目录、换目录、子进程、网络）证明
 # 实际读取的输入。无关目标变化可复用；相关变化、绑定不成立（unbound）、坏的或无法识别的绑定一律失败关闭、不复用。
 # 只有明确的旧格式（没有 binding，或 binding 只有 goals_sha/evidence_sha256）按全局 goals_sha 兼容；
-# 带 live 映射的目标写显式的 goals-sha/1（verified 仍按 B1 的全局绑定）。
+# 带 live 映射的机械结果写 goals-sha/1；C2c-1 的 live-collection/1 仅采集，不授予 verified。
 MECH_SCHEMA = "mech-binding/2"
 GLOBAL_SCHEMA = "goals-sha/1"
 CLOSURE_RULE = "closure/5"
@@ -1178,10 +1225,15 @@ def run_checks(inst: Instance, timeout=900, by="driver") -> dict:
         return progress(inst)
     d = inst.evidence / "goals"
     d.mkdir(parents=True, exist_ok=True)
-    gs = read_json(inst.wf / "goals_state.json", {}) or {}
+    try:
+        gs = _result_state(inst)
+    except Exception:
+        return progress(inst)
     env = _check_env(inst)
     import shutil
     import tempfile
+    import uuid
+    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
     cores, pre, pre_cache = {}, {}, {}
     for x in g["goals"]:   # B2-C2b：检查前先算各目标的静态绑定与候选闭包的内容摘要，检查后再算一次
         if x["kind"] != "exec" or isinstance(x.get("live"), dict):
@@ -1199,11 +1251,11 @@ def run_checks(inst: Instance, timeout=900, by="driver") -> dict:
                 pre[(x["id"], kind)] = _closure_state(inst, kind, core["static"].get("affects"), pre_cache)
             except _Unknown as e:
                 pre[(x["id"], kind)] = e
-    ran, audits = [], {}
+    ran, audits, live_stamps = [], {}, {}
     for x in g["goals"]:
         if x["kind"] != "exec":
             continue
-        stamp = time.strftime("%Y%m%d-%H%M%S")
+        stamp = run_id
         t0 = time.time()
         core = cores.get(x["id"])
         audit_dir, run_env = None, env
@@ -1235,8 +1287,8 @@ def run_checks(inst: Instance, timeout=900, by="driver") -> dict:
                        "layer": "mechanical_pass" if ok else "failed",   # B1-C：记录层面只到机械层
                        "binding": {"schema": GLOBAL_SCHEMA if live else MECH_SCHEMA, "goals_sha": st["current"],
                                    "evidence_sha256": _sha256_file(ev)}}
-        if live:   # B1-C：声明了实景映射的目标，另由 live.check 实测决定能否授予 verified
-            gs[x["id"]]["verified"] = _live_attest(inst, x, st, d, stamp)
+        if live:
+            live_stamps[x["id"]] = stamp
         ran.append(x)
         inst.event("goal_check", goal=x["id"], ok=ok, why="；".join(why) or None, by=by)
     post_cache = {}
@@ -1282,7 +1334,40 @@ def run_checks(inst: Instance, timeout=900, by="driver") -> dict:
             rec["binding"] = dict(base, deps=core["deps"], static=core["static"], kind=kind, affects=aff, state=state)
             if runtime is not None:
                 rec["binding"]["runtime"] = runtime
-    write_json(inst.wf / "goals_state.json", gs)
+    live_goals = [x for x in ran if isinstance(x.get("live"), dict)]
+    if live_goals:
+        from . import live as live_module
+        # All mechanical evidence and every goal_check precede the common
+        # frozen collection. No event is appended after this point.
+        contract = {"protocol": "live-output/2", "run_id": run_id, "replace_slots": [x["id"] for x in ran],
+                    "evidence": {x["id"]: str((d / f"{run_id}-{x['id']}-live.json").relative_to(inst.root))
+                                 for x in live_goals}}
+        snapshot = closure = problem = None
+        with inst.state_lock():
+            try:
+                _project_fp(inst)  # Load diagnostic modules before freezing the whole tool tree.
+                snapshot = live_module._capture_inputs(Instance(inst.root), output_contract=contract)
+                closure = live_module._closure_inputs(Instance(inst.root), snapshot, tool_root=_TOOL_ROOT, records=gs)
+            except live_module._InputProblem as e:
+                problem = e
+            except Exception as e:
+                problem = live_module._InputProblem("unknown", "collection", f"collection failed: {type(e).__name__}")
+            for x in live_goals:
+                gs[x["id"]]["verified"] = _live_attest(
+                    inst, x, st, d, live_stamps[x["id"]], snapshot=snapshot, closure=closure, capture_problem=problem)
+            if snapshot is not None and closure is not None:
+                validation = live_module._revalidate_inputs(Instance(inst.root), snapshot.descriptor)
+                closure_validation = live_module._revalidate_closure(
+                    Instance(inst.root), snapshot, closure, tool_root=_TOOL_ROOT, records=gs)
+                for x in live_goals:
+                    record = gs[x["id"]]["verified"]
+                    record["collection_validation"] = validation
+                    record["closure_validation"] = closure_validation
+                    if not validation["valid"]:
+                        record["why"].append(f"提交前实景输入 {validation['state']}")
+            write_json(inst.wf / "goals_state.json", gs)
+    else:
+        write_json(inst.wf / "goals_state.json", gs)
     return progress(inst)
 
 
@@ -1291,7 +1376,12 @@ def progress(inst: Instance) -> dict:
     st = policy.status(inst, "goals")
     if not g:
         return {"defined": False, "approved": False, "items": [], "done": 0, "total": 0, "reached": False}
-    gs = read_json(inst.wf / "goals_state.json", {}) or {}
+    result_problem = None
+    try:
+        gs = _result_state(inst)
+    except Exception as e:
+        gs = {}
+        result_problem = f"goals_state 无法核对：{e}"
     conf = _confirmations(inst)
     items = []
     cache = {}
@@ -1332,7 +1422,8 @@ def progress(inst: Instance) -> dict:
             "items": items, "done": done, "total": len(items),
             # B2-C2a：至少要有一个可执行目标才可能达成——空目标、只有人工目标时即使批准、全部确认也不算达成
             "reached": st["approved"] and done == len(items) and any(x.get("kind") == "exec" for x in g["goals"]),
-            "issues": validate(g), "phase": _phase(g), "history": _history(g), "counts": counts}
+            "issues": validate(g) + ([result_problem] if result_problem else []),
+            "phase": _phase(g), "history": _history(g), "counts": counts}
 
 
 def _na_valid(na, r: dict, x: dict, st: dict) -> tuple:
@@ -1346,42 +1437,109 @@ def _na_valid(na, r: dict, x: dict, st: dict) -> tuple:
     return not why, why
 
 
-def _verified_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict) -> tuple:
+def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict) -> dict:
+    """One strict consumer for collection/display/authorization; no legacy grant."""
+    from . import live
+    failure = lambda state, why: {"valid": False, "state": state, "why": [str(why)],
+                                  "authorization": "unavailable"}
     v = r.get("verified")
+    if not isinstance(v, dict):
+        return failure("unknown", "还没有严格实景采集记录")
+    b = v.get("binding")
+    if not isinstance(b, dict) or b.get("schema") != "live-collection/2":
+        return failure("unsupported", "旧版或未知实景凭证缺少完整严格输入闭包，必须重新采集；granted/summary 自报不能授权")
+    c = v.get("collection")
+    if not isinstance(c, dict) or c.get("state") != "collected":
+        state = c.get("state", "unknown") if isinstance(c, dict) else "unknown"
+        return failure(state, (c or {}).get("detail", "严格采集未完成") if isinstance(c, dict) else "严格采集未完成")
+    key = ("live-collection/2", x.get("id"), hashlib.sha256(_canon(v).encode()).hexdigest())
+    if key in cache:
+        return cache[key]
+    try:
+        descriptor, closure, report = c["window_inputs"], c["closure"], c["report"]
+        contract = live._validate_output_contract(inst, descriptor["output_contract"])
+        if v.get("granted") is not False or b.get("authorization") != "unavailable" \
+                or c.get("authorization") != "unavailable":
+            raise live._InputProblem("corrupt", "binding", "C5 unavailable 时不能自报 granted/authorization")
+        if not st.get("approved") or b.get("project") != inst.name or b.get("goals_sha") != st.get("current"):
+            raise live._InputProblem("changed", "goals", "目标批准或项目身份已改变")
+        if b.get("goal_sha256") != _goal_def_sha(x) or b.get("dependency_definitions") != _dep_defs(load(inst), x):
+            raise live._InputProblem("changed", "goals", "目标/递归依赖定义已改变")
+        params = descriptor["parameters"]
+        spec = x["live"]
+        if params != {"rounds": spec.get("rounds", 3), "budget_s": spec.get("budget_s", 300)} \
+                or b.get("segments") != spec.get("segments") or b.get("rounds") != params["rounds"]:
+            raise live._InputProblem("changed", "parameters", "实景参数已改变")
+        for field, payload in (("window_inputs_sha256", descriptor), ("closure_sha256", closure), ("report_sha256", report)):
+            digest = hashlib.sha256(live._canonical(payload).encode()).hexdigest()
+            if not b.get(field) or b[field] != digest:
+                raise live._InputProblem("corrupt", field, "实景绑定摘要缺失或不一致")
+        if c.get("inputs_sha256") != b["window_inputs_sha256"] or c.get("closure_sha256") != b["closure_sha256"] \
+                or c.get("report_sha256") != b["report_sha256"]:
+            raise live._InputProblem("corrupt", "collection", "采集与绑定摘要不一致")
+        evidence = contract["evidence"].get(x["id"])
+        if b.get("evidence") != evidence or not b.get("evidence_sha256"):
+            raise live._InputProblem("corrupt", "evidence", "实景证据路径/hash 不属于本次输出协议")
+        with inst.state_lock():
+            current = Instance(inst.root)
+            snapshot = live._capture_inputs(current, rounds=params["rounds"], budget_s=params["budget_s"], output_contract=contract)
+            if snapshot.descriptor != descriptor:
+                raise live._InputProblem("changed", "window_inputs", "窗口来源、字节或选择器已改变")
+            state_source, state_bytes = live._file_source(inst.wf / "goals_state.json")
+            if state_bytes is None:
+                raise live._InputProblem("unknown", "goals_state", "结果输出缺失")
+            if state_source["mode"] != 0o600:
+                raise live._InputProblem("corrupt", "goals_state", "结果输出权限不符合原子写入协议")
+            records = live._strict_json(state_bytes, inst.wf / "goals_state.json")
+            validation = live._revalidate_closure(current, snapshot, closure, tool_root=_TOOL_ROOT, records=records)
+            if not validation["valid"]:
+                raise live._InputProblem(validation["state"], validation.get("source", "closure"),
+                                         validation.get("detail", "完整内容闭包已改变"))
+            # Every protocol output has a shape and evidence obligation. One
+            # goal cannot hide arbitrary data in another replaced slot.
+            for gid, output in contract["evidence"].items():
+                peer = records[gid].get("verified")
+                if not isinstance(peer, dict) or peer.get("granted") is not False \
+                        or set(peer) != {"granted", "why", "ts", "binding", "collection", "collection_validation", "closure_validation"} \
+                        or not isinstance(peer.get("binding"), dict) or peer["binding"].get("schema") != "live-collection/2":
+                    raise live._InputProblem("corrupt", "goals_state", "同批实景输出槽位格式不正确")
+                pb, pc = peer["binding"], peer.get("collection")
+                for field in ("collection_validation", "closure_validation"):
+                    advisory = peer[field]
+                    if not isinstance(advisory, dict) or set(advisory) != {"valid", "state",
+                            "inputs_sha256" if field == "collection_validation" else "closure_sha256"} \
+                            or advisory.get("valid") is not True or advisory.get("state") != "stable":
+                        raise live._InputProblem("corrupt", "goals_state", "同批校验输出格式不正确")
+                output_source, data = live._file_source(inst.root / output)
+                if data is None or output_source["mode"] != 0o600 \
+                        or hashlib.sha256(data).hexdigest() != pb.get("evidence_sha256"):
+                    raise live._InputProblem("corrupt", output, "实景证据缺失或被改动")
+                document = live._strict_json(data, output)
+                if set(document) != {"goal", "summary", "rounds", "collection"} or document["goal"] != gid \
+                        or document["collection"] != pc or not isinstance(pc, dict) or pc.get("closure") != closure \
+                        or document["summary"] != pc.get("report", {}).get("summary") \
+                        or document["rounds"] != pc.get("report", {}).get("rounds"):
+                    raise live._InputProblem("corrupt", output, "实景证据与冻结采集不一致")
+            recomputed = live._evaluate_snapshot(snapshot)["report"]
+            if report != recomputed:
+                raise live._InputProblem("corrupt", "summary", "自报报告与冻结输入重新评价不一致")
+        result = {"valid": True, "state": "stable", "why": ["install_history_unavailable"],
+                  "authorization": "unavailable", "complete": True,
+                  "inputs_sha256": b["window_inputs_sha256"], "closure_sha256": b["closure_sha256"]}
+    except live._InputProblem as e:
+        result = failure(e.state, f"{e.source}：{e.detail}")
+    except Exception as e:   # Bad stored material must never break progress or grant.
+        result = failure("corrupt", f"无法核对实景绑定：{type(e).__name__}")
+    cache[key] = result
+    return result
+
+
+def _verified_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict) -> tuple:
     if not isinstance(x.get("live"), dict):
         return False, []
-    if not isinstance(v, dict):
-        return False, ["还没有 live.check 的实测记录"]
-    if not v.get("granted"):
-        return False, list(v.get("why") or ["实测未授予 verified"])
-    b = v.get("binding") or {}
-    why = []
-    if b.get("project") != inst.name:
-        why.append("绑定的项目不一致")
-    if b.get("goals_sha") != st["current"]:
-        why.append("目标已改动")
-    spec = x["live"]
-    if b.get("segments") != [int(n) for n in spec.get("segments") or []] or b.get("rounds") != int(spec.get("rounds", 3)):
-        why.append("目标声明的实景段与绑定不一致")
-    ev = inst.root / str(b.get("evidence") or "")
-    if not b.get("evidence") or not b.get("evidence_sha256") or _sha256_file(ev) != b.get("evidence_sha256"):
-        why.append("实景证据文件缺失或被改动")
-    else:
-        why += _evidence_problems(inst, ev, b, spec)
-    if "tool" not in cache:
-        cache["tool"] = _tool_state()
-    t = cache["tool"]
-    if t["dirty"] is None:
-        why.append("无法确认工具是否有未提交改动")
-    elif t["dirty"] or b.get("tool_dirty") is not False:
-        why.append("工具有未提交改动")
-    if not b.get("tool_digest") or t["digest"] != b.get("tool_digest"):
-        why.append("工具文件摘要与绑定不一致")
-    if "fp" not in cache:
-        cache["fp"] = _project_fp(inst)
-    if not b.get("project_fp") or cache["fp"] != b.get("project_fp"):
-        why.append("项目指纹与绑定不一致")
-    return not why, why
+    validation = _live_binding_valid(inst, r, x, st, cache)
+    # This card deliberately cannot grant: the C5 history provider is absent.
+    return False, validation["why"]
 
 
 def _evidence_problems(inst: Instance, ev: Path, b: dict, spec: dict) -> list:
@@ -1418,6 +1576,8 @@ def _layer(inst, g, x, i, r, na, st, cache) -> None:
             es = b.get("evidence_sha256")
             b["evidence_intact"] = (_sha256_file(inst.root / str(r.get("evidence") or "")) == es) if es else None
             i["binding"] = b
+        if isinstance(x.get("live"), dict):
+            i["collection"] = _live_binding_valid(inst, r, x, st, cache)
         if i["ok"]:
             vok, vwhy = _verified_valid(inst, r, x, st, cache)
             mech_intact = (i["binding"] or {}).get("evidence_intact")

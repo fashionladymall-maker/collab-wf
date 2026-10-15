@@ -12,9 +12,27 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@t"]
+
+
+@contextmanager
+def _canonical_fixture_local():
+    """Canonicalize the isolated fixture root, including macOS /var aliases.
+
+    This changes test-owned root references only. Real symlinks inside that
+    root remain visible to the unchanged product reader and are unsupported.
+    """
+    from . import core, live
+    previous = core.LOCAL, live.LOCAL
+    canonical = core.LOCAL.resolve()
+    core.LOCAL = live.LOCAL = canonical
+    try:
+        yield canonical
+    finally:
+        core.LOCAL, live.LOCAL = previous
 
 
 def _git(cwd, *args, env=None):
@@ -319,8 +337,10 @@ def _t_live_struct(_ok):
 
 
 def _t_verified(_ok):
-    """verified：只由 run_checks 直接调用 live.check 授予；任意 exit 0、evidence 字符串、未声明映射都不行；
-    工具 dirty、工具摘要、项目指纹、目标变化与证据篡改都使绑定失效；工具没有版本库时不授予。"""
+    """C2c migration: preserve every B1 scenario, but C5-unavailable cannot grant.
+    Original verified positives now remain mechanical; real collection positives
+    are separately asserted by _t_c2c_collection, never counted as authorization.
+    """
     from . import goals, policy
     out = {}
     old_root = goals._TOOL_ROOT
@@ -351,12 +371,13 @@ def _t_verified(_ok):
             goals.run_checks(a, by="test")
             p = goals.progress(a)
             r1 = next(i for i in p["items"] if i["id"] == "R1")
+            stored_binding = json.loads((a.wf / "goals_state.json").read_text())["R1"]["verified"]["binding"]
             out["pos"] = (r1["layer"], r1["ok"], p["counts"]["verified"], p["reached"],
-                          sorted(k for k in (r1.get("binding") or {}) if k in (
+                          sorted(k for k in stored_binding if k in (
                               "project", "segments", "tool_digest", "tool_dirty", "project_fp", "goals_sha", "evidence_sha256")))
-            ev = a.root / r1["binding"]["evidence"]
+            ev = a.root / stored_binding["evidence"]
             keep = ev.read_bytes()
-            ev.write_bytes(keep.replace(b'"passed": true', b'"passed": false'))
+            ev.write_bytes(keep + b" ")
             out["tamper"] = lay()["layer"]
             ev.write_bytes(keep)
             out["restored"] = lay()["layer"]
@@ -430,7 +451,7 @@ def _t_verified(_ok):
             out["mech_tamper"] = lay()["layer"]
             mev.write_bytes(mkeep)
             gsd = json.loads(gs_keep)
-            fake = a.root / items["R1"]["binding"]["evidence"]
+            fake = a.root / gsd["R1"]["verified"]["binding"]["evidence"]
             fake_keep = fake.read_bytes()
             fake.write_text("hello", encoding="utf-8")
             gsd["R1"]["verified"]["binding"]["evidence_sha256"] = hashlib.sha256(b"hello").hexdigest()
@@ -439,6 +460,14 @@ def _t_verified(_ok):
             fake.write_bytes(fake_keep)
             gsp.write_bytes(gs_keep)
             out["restored_final"] = lay()["layer"]
+            legacy = json.loads(gs_keep)
+            legacy["R1"]["verified"]["granted"] = True
+            legacy["R1"]["verified"]["binding"].pop("schema", None)
+            gsp.write_text(json.dumps(legacy))
+            old_item = lay()
+            out["old_self_report"] = (old_item["layer"], old_item["collection"]["state"],
+                                      goals.progress(a)["counts"]["verified"])
+            gsp.write_bytes(gs_keep)
             out["bad_spec"] = [bool(goals.validate({"goals": [dict(live_goal, live=v)]}))
                                for v in ({"rounds": 3, "segments": [0]}, {"rounds": 3, "segments": []}, {"segments": [1, 1]},
                                          {"rounds": "3", "segments": [1]}, "live", {"rounds": 3, "segments": [[1]]})]
@@ -447,26 +476,28 @@ def _t_verified(_ok):
             goals._TOOL_ROOT = old_root
             restore()
             fx.cleanup()
-    _ok("B1-C verified：只由直接调用 live.check 的实测授予并绑定项目、实景段、工具摘要与 dirty、项目指纹、goals_sha、证据 sha256；"
+    _ok("C2c IC 迁移原 B1 verified 组：保留机械、dirty、摘要、指纹、定义与证据场景；C5 unavailable 的旧正例只到机械层；"
         "任意 exit 0 与 evidence 字符串只到 mechanical_pass；证据篡改、工具 dirty 或改动、项目指纹、目标变化都使其失效；"
         "实景不达标、安装尝试失败、工具 dirty 或没有版本库时不授予；ok 与 reached 不变；"
         "r2：严格结果不通过时窄映射也不授予（F2）、同轮失败尝试不被成功遮掉（F1）、被 git 忽略的安装源码改变摘要（F3）、"
         "机械证据改动与非规范的伪造证据不授予、live 嵌套段配置返回校验问题",
         out.get("plain") == ("mechanical_pass", True)
-        and out.get("pos", (None,))[0] == "verified" and out["pos"][1] is True and out["pos"][2] == 1 and out["pos"][3] is True
+        and out.get("pos", (None,))[0] == "mechanical_pass" and out["pos"][1] is True and out["pos"][2] == 0 and out["pos"][3] is True
         and out["pos"][4] == ["evidence_sha256", "goals_sha", "project", "project_fp", "segments", "tool_digest", "tool_dirty"]
-        and out["tamper"] == "mechanical_pass" and out["restored"] == "verified"
-        and out["tool_dirty"] == "mechanical_pass" and out["tool_changed"] == "mechanical_pass" and out["rebound"] == "verified"
-        and out["project_changed"] == "mechanical_pass" and out["rebound2"] == "verified"
+        and out["tamper"] == "mechanical_pass" and out["restored"] == "mechanical_pass"
+        and out["tool_dirty"] == "mechanical_pass" and out["tool_changed"] == "mechanical_pass" and out["rebound"] == "mechanical_pass"
+        and out["project_changed"] == "mechanical_pass" and out["rebound2"] == "mechanical_pass"
         and out["goal_changed"] == "pending" and out["live_fail"] == ("mechanical_pass", True)
         and out["attempt_failed"] == "mechanical_pass" and out["grant_dirty"] == "mechanical_pass" and out["no_git"] == "mechanical_pass"
         and out["bad_spec"] == [True] * 6 and out["good_spec"] == []
-        and out["narrow_ok"] == "verified" and out["f2_cross"] == ("mechanical_pass", "mechanical_pass", True, False, False)
+        and out["narrow_ok"] == "mechanical_pass" and out["f2_cross"] == ("mechanical_pass", "mechanical_pass", True, False, False)
         and out["f1_same"] == ("mechanical_pass", "mechanical_pass", True, False, False)
-        and out["ignored"] == ("verified", [], True, "mechanical_pass") and out["skip_rule"] is True
-        and out["restored_after_ignored"] == "verified" and out["mech_tamper"] == "mechanical_pass"
-        and out["forged_text"] == "mechanical_pass" and out["restored_final"] == "verified",
+        and out["ignored"] == ("mechanical_pass", [], True, "mechanical_pass") and out["skip_rule"] is True
+        and out["restored_after_ignored"] == "mechanical_pass" and out["mech_tamper"] == "mechanical_pass"
+        and out["forged_text"] == "mechanical_pass" and out["restored_final"] == "mechanical_pass",
         json.dumps(out, ensure_ascii=False, default=str)[:1500])
+    _ok("C2c 原旧完整字段仍不能靠 granted 自报绕过严格输入消费",
+        out.get("old_self_report") == ("mechanical_pass", "unsupported", 0), repr(out.get("old_self_report")))
 
 
 def _t_manifest_rule(_ok):
@@ -1927,6 +1958,392 @@ def _t_mech_disabled_pth(_ok):
                 rec["ok"] and not current(a) and "CPython/site/os" in rec["binding"].get("unbound", ""))
 
 
+def _t_c2c_collection(_ok):
+    """C2c-1 positive collection is distinct from pending C5 authorization."""
+    from . import goals, live, policy, tasks
+    from .core import Instance, LOCAL
+    saved_transport = (LOCAL / "transport.json").read_bytes() if (LOCAL / "transport.json").exists() else None
+    old_tool = goals._TOOL_ROOT
+    with _canonical_fixture_local() as LOCAL, tempfile.TemporaryDirectory() as td:
+        td = str(Path(td).resolve())
+        a = _inst(td, "lc-c2c", {"state": "IDLE", "turn": 7, "seq": 0})
+        fx = _Live(td, a)
+        try:
+            fx.write()
+            # Retain the segment fixture, but create sequenced events through
+            # the real writer and real UUID tasks through the public A1 API.
+            rows = [json.loads(line) for line in a.events_path.read_text().splitlines()]
+            a.events_path.write_bytes(b"")
+            a.state["seq"] = 0
+            a.save()
+            for row in rows:
+                typ = row.pop("type")
+                a.event(typ, **row)
+            task = tasks.add(a, 7, {"1": "C2c real generation fixture"})[0]
+            tasks.done(a, task["id"], generation=task["generation"], note="collection fixture complete", by="driver")
+            for t in (5, 6):
+                (a.evidence / f"turn-{t:03d}" / "notes.jsonl").write_bytes(b"")
+            adapter = [json.loads(line) for line in fx.lp.read_text().splitlines()]
+            for row in adapter:
+                row["root"] = str(a.root)
+            fx.lp.write_text("".join(json.dumps(row) + "\n" for row in adapter))
+            (LOCAL / "transport.json").parent.mkdir(parents=True, exist_ok=True)
+            (LOCAL / "transport.json").write_text(json.dumps({"log": str(fx.lp)}))
+            goals._TOOL_ROOT = _tool_repo(td)
+            first = live._capture_inputs(a)
+            measurement = live._evaluate_snapshot(first)
+            repeat = live._evaluate_snapshot(first)
+            validation = live._revalidate_inputs(Instance(a.root), first.descriptor)
+            _ok("C2c P01 真实 UUID tasks API、严格冻结采集与同字节重复评价正例",
+                measurement == repeat and measurement["report"]["summary"]["passed_strict"] and validation["valid"]
+                and first.state["executor_tasks"][0]["generation"] == task["generation"]
+                and measurement["authorization"] == "unavailable" and first.descriptor["complete"] is False,
+                repr({"state": measurement["state"], "summary": measurement["report"]["summary"], "validation": validation,
+                      "before_inputs_sha": measurement["inputs_sha256"], "after_inputs_sha": validation["inputs_sha256"]}))
+            # A cached old Instance must not substitute its state for disk.
+            cached = Instance(a.root)
+            cached.state["executor_tasks"] = []
+            fresh_snap = live._capture_inputs(cached)
+            _ok("C2c P02 同对象过时 state 缓存不影响 fresh 磁盘任务采集",
+                fresh_snap.state["executor_tasks"][0]["generation"] == task["generation"]
+                and fresh_snap.descriptor == first.descriptor)
+            old_events = a.events_path.read_bytes()
+            try:
+                a.events_path.write_bytes(old_events + b'{"broken":\n')
+                still_frozen = live._evaluate_snapshot(first)
+                invalid = live._revalidate_inputs(a, first.descriptor)
+                _ok("C2c 冻结后磁盘变化不能混入原评价，重验独立拒绝",
+                    still_frozen == measurement and not invalid["valid"] and invalid["state"] == "corrupt",
+                    repr(invalid))
+            finally:
+                a.events_path.write_bytes(old_events)
+            state_keep = a.state_path.read_bytes()
+            try:
+                bad_state = json.loads(state_keep)
+                bad_state["executor_tasks"][0]["generation"] = "f" * 32
+                a.state_path.write_text(json.dumps(bad_state))
+                try:
+                    live._capture_inputs(a)
+                    mismatch = "unexpected_success"
+                except live._InputProblem as e:
+                    mismatch = e.state
+                _ok("C2c A1 旧代次关闭不能关闭新代次，保守 unknown", mismatch == "unknown", mismatch)
+            finally:
+                a.state_path.write_bytes(state_keep)
+            gl = [{"id": gid, "title": gid, "kind": "exec", "check": "true", "pass": {"exit": 0},
+                   "means": "fixture", "on_fail": "retry",
+                   "live": {"rounds": n, "segments": list(range(1, 11))}}
+                  for gid, n in (("LC1", 3), ("LC2", 2))]
+            (a.wf / "goals.json").write_text(json.dumps({"goals": gl}))
+            tool = goals._TOOL_ROOT
+            for rel, content in (("MANIFEST.json", "{}"), ("wflib/hidden.py", "HIDDEN = 1\n"),
+                                 ("local/input.txt", "local input"), ("wflib/__pycache__/fixture.pyc", "bytecode fixture")):
+                path = tool / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            (tool / ".gitignore").write_text("wflib/hidden.py\nlocal/\n__pycache__/\n")
+            _git(tool, "add", "-A")
+            _git(tool, "commit", "-qm", "complete closure fixture")
+            (a.root / "untracked-input.txt").write_text("untracked actual input")
+            (a.wf / "transcript.jsonl").write_text('{"role":"fixture"}\n')
+            (a.wf / "goals_state.json").write_text(json.dumps({"historical": {"payload": "actual input slot"}}))
+            policy.approve(a, "goals", "C2c isolated fixture", by="test")
+            p1 = goals.run_checks(a, by="test")
+            records = json.loads((a.wf / "goals_state.json").read_text())
+            p2, p3 = goals.progress(a), goals.progress(Instance(a.root))
+            collections = [records[g["id"]]["verified"]["collection"] for g in gl]
+            source_lists = [c["window_inputs"]["sources"] for c in collections]
+            descriptors_valid = [live._revalidate_inputs(Instance(a.root), c["window_inputs"]) for c in collections]
+            now_events = [json.loads(line) for line in a.events_path.read_text().splitlines()]
+            event_hash = hashlib.sha256(a.events_path.read_bytes()).hexdigest()
+            _ok("C2c C01 单批多 live 目标全部事件先于共同采集，立即/fresh progress 稳定",
+                p1 == p2 == p3 and all(c["state"] == "collected" for c in collections)
+                and all(i.get("collection", {}).get("valid") is True
+                        and i["collection"].get("complete") is True for i in p1["items"])
+                and source_lists[0] == source_lists[1] and all(v["valid"] for v in descriptors_valid)
+                and collections[0]["window_inputs"]["parameters"]["rounds"] == 3
+                and collections[1]["window_inputs"]["parameters"]["rounds"] == 2
+                and all(next(s["sha256"] for s in ss if s["path"] == str(a.events_path)) == event_hash for ss in source_lists)
+                and [e["goal"] for e in now_events if e["type"] == "goal_check"][-2:] == ["LC1", "LC2"]
+                and all(not records[g["id"]]["verified"]["granted"] for g in gl),
+                repr({"validations": descriptors_valid, "counts": p1["counts"],
+                      "inputs_sha256": [c["inputs_sha256"] for c in collections],
+                      "consumption": [i.get("collection") for i in p1["items"]]}))
+            closure = collections[0]["closure"]
+            tool_sources = {Path(s["path"]).relative_to(tool).as_posix() for s in closure["tool"]["sources"]}
+            project_sources = {Path(s["path"]).relative_to(a.root).as_posix() for s in closure["project"]["sources"]}
+            _ok("C2c-2 完整内容正例包含 ignored/MANIFEST/local/pycache、state/log/未跟踪文件及旧证据",
+                {"MANIFEST.json", "wflib/hidden.py", "local/input.txt", "wflib/__pycache__/fixture.pyc"} <= tool_sources
+                and {"workflow/state.json", "workflow/wf.json", "workflow/events.jsonl", "workflow/turns.jsonl",
+                     "workflow/transcript.jsonl", "workflow/approvals.json", "untracked-input.txt", "PROJECT.md"} <= project_sources
+                and closure["state_slots_read"] == ["historical"]
+                and closure["output_slots_replaced"] == ["LC1", "LC2"]
+                and any(name.endswith("-LC1.txt") for name in project_sources)
+                and not any(name.endswith("-live.json") for name in project_sources))
+
+            def consumption():
+                return [i["collection"] for i in goals.progress(Instance(a.root))["items"]]
+
+            def mutate_file(label, path, content, wanted="changed"):
+                keep = path.read_bytes()
+                try:
+                    path.write_bytes(content)
+                    invalid = consumption()
+                    _ok(f"C2c-2 输入漂移 {label} 正常 progress 拒绝",
+                        all(v["valid"] is False and v["state"] == wanted for v in invalid), repr(invalid))
+                finally:
+                    path.write_bytes(keep)
+                _ok(f"C2c-2 输入恢复 {label} 重新重验稳定",
+                    all(v["valid"] for v in consumption()))
+
+            for label, path in (("PROJECT", a.root / "PROJECT.md"), ("ignored-tool", tool / "wflib/hidden.py"),
+                                ("MANIFEST", tool / "MANIFEST.json"), ("tool-local", tool / "local/input.txt"),
+                                ("tool-pycache", tool / "wflib/__pycache__/fixture.pyc"),
+                                ("untracked-project", a.root / "untracked-input.txt"),
+                                ("transcript", a.wf / "transcript.jsonl"),
+                                ("historical-evidence", a.evidence / "turn-005/intake.json"),
+                                ("project-Git-config-same-HEAD", a.root / ".git/config"),
+                                ("tool-Git-config-same-HEAD", tool / ".git/config")):
+                mutate_file(label, path, path.read_bytes() + b" ")
+            new_member = a.root / "new-actual-input.txt"
+            try:
+                new_member.write_text("new member")
+                _ok("C2c-2 项目新成员重新枚举拒绝", all(v["state"] == "changed" for v in consumption()))
+            finally:
+                new_member.unlink()
+            _ok("C2c-2 删除本次新增成员后稳定恢复", all(v["valid"] for v in consumption()))
+            state_file = a.wf / "goals_state.json"
+            records_keep = state_file.read_bytes()
+            changed_slot = json.loads(records_keep)
+            changed_slot["historical"]["payload"] = "changed actual input"
+            mutate_file("untouched-result-slot", state_file, json.dumps(changed_slot).encode())
+            proof_path = a.root / records["LC1"]["verified"]["binding"]["evidence"]
+            mutate_file("live-evidence", proof_path, proof_path.read_bytes() + b" ", wanted="corrupt")
+            mechanical = a.root / records["LC1"]["evidence"]
+            mutate_file("mechanical-evidence", mechanical, mechanical.read_bytes() + b" ")
+
+            def bad_record(label, change, wanted="corrupt"):
+                changed_records = json.loads(records_keep)
+                change(changed_records)
+                try:
+                    state_file.write_text(json.dumps(changed_records))
+                    invalid = consumption()
+                    _ok(f"C2c-2 输出欺骗 {label} 拒绝",
+                        not invalid[0]["valid"] and invalid[0]["state"] == wanted
+                        and goals.progress(Instance(a.root))["counts"]["verified"] == 0, repr(invalid))
+                finally:
+                    state_file.write_bytes(records_keep)
+                _ok(f"C2c-2 输出恢复 {label} 稳定正例", all(v["valid"] for v in consumption()))
+
+            bad_record("granted-self-report", lambda r: r["LC1"]["verified"].update(granted=True))
+            bad_record("null-hash", lambda r: r["LC1"]["verified"]["binding"].update(closure_sha256=None))
+            bad_record("missing-closure", lambda r: r["LC1"]["verified"]["collection"].pop("closure"))
+            bad_record("arbitrary-output-payload", lambda r: r["LC1"].update(hidden_payload={"arbitrary": "not protocol"}))
+            bad_record("peer-slot", lambda r: r["LC2"].pop("verified"))
+            bad_record("output-path-injection", lambda r: r["LC1"]["verified"]["collection"]["window_inputs"]
+                       ["output_contract"]["evidence"].update(LC1="PROJECT.md"))
+
+            def legacy(r):
+                r["LC1"]["verified"]["binding"].pop("schema")
+                r["LC1"]["verified"]["granted"] = True
+            bad_record("legacy-complete-looking-self-report", legacy, wanted="unsupported")
+            # Rehash both the stored report and evidence: the normal consumer
+            # recomputes from frozen current inputs, so self-consistency alone
+            # cannot manufacture a successful measurement.
+            keep_proof = proof_path.read_bytes()
+            try:
+                forged = json.loads(records_keep)
+                v = forged["LC1"]["verified"]
+                v["collection"]["report"]["summary"]["passed_strict"] = False
+                digest = hashlib.sha256(live._canonical(v["collection"]["report"]).encode()).hexdigest()
+                v["collection"]["report_sha256"] = v["binding"]["report_sha256"] = digest
+                document = json.loads(keep_proof)
+                document["collection"] = v["collection"]
+                document["summary"] = v["collection"]["report"]["summary"]
+                proof_path.write_text(json.dumps(document))
+                v["binding"]["evidence_sha256"] = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+                state_file.write_text(json.dumps(forged))
+                invalid = consumption()[0]
+                _ok("C2c-2 自报 summary 与证据同时重hash仍被真实输入重新评价拒绝",
+                    not invalid["valid"] and invalid["state"] == "corrupt"
+                    and "重新评价" in " ".join(invalid["why"]), repr(invalid))
+            finally:
+                proof_path.write_bytes(keep_proof)
+                state_file.write_bytes(records_keep)
+            _ok("C2c-2 自报欺骗恢复后稳定正例", all(v["valid"] for v in consumption()))
+            # Unsupported file forms cannot disappear behind a closure exclusion.
+            linked = a.root / "linked-input"
+            try:
+                linked.symlink_to(a.root / "PROJECT.md")
+                _ok("C2c-2 项目符号链接具名 unsupported", all(v["state"] == "unsupported" for v in consumption()))
+            finally:
+                linked.unlink()
+            _ok("C2c-2 unsupported 来源移除后稳定恢复", all(v["valid"] for v in consumption()))
+            for label, path in (("goals-state-mode", state_file), ("live-proof-mode", proof_path)):
+                mode = path.stat().st_mode & 0o777
+                try:
+                    path.chmod(0o644)
+                    _ok(f"C2c-2 精确输出元数据 {label} 由协议单独校验",
+                        all(v["state"] == "corrupt" for v in consumption()))
+                finally:
+                    path.chmod(mode)
+                _ok(f"C2c-2 精确输出元数据 {label} 恢复稳定", all(v["valid"] for v in consumption()))
+            # A full-tree input changes in a real subprocess after its first
+            # closure read. This also exercises the normal progress consumer.
+            target = a.root / "untracked-input.txt"
+            target_keep = target.read_bytes()
+            original_read = live._file_source
+            helper = subprocess.Popen(
+                [sys.executable, "-c", "import sys,pathlib; p=pathlib.Path(sys.argv[1]); "
+                 "sys.stdin.readline(); p.write_bytes(p.read_bytes()+b' changed'); print('changed',flush=True)",
+                 str(target)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            signaled = []
+
+            def closure_barrier(path):
+                value = original_read(path)
+                if Path(path) == target and not signaled:
+                    signaled.append(True)
+                    helper.stdin.write("go\n")
+                    helper.stdin.flush()
+                    if helper.stdout.readline().strip() != "changed":
+                        raise RuntimeError("closure barrier failed")
+                return value
+            try:
+                live._file_source = closure_barrier
+                raced = consumption()
+                _ok("C2c-2 C02 子进程 barrier 完整项目扫描漂移由正常progress拒绝",
+                    all(not v["valid"] and v["state"] == "changed" for v in raced), repr(raced))
+            finally:
+                live._file_source = original_read
+                helper.communicate(timeout=10)
+                target.write_bytes(target_keep)
+            _ok("C2c-2 C02 并发写入恢复后的正常progress稳定", all(v["valid"] for v in consumption()))
+            for bad in (b'{"LC1":', b'{"LC1":{},"LC1":{}}', b'{"LC1":[]}', b'\xff'):
+                state_keep = state_file.read_bytes()
+                events_keep = a.events_path.read_bytes()
+                try:
+                    state_file.write_bytes(bad)
+                    broken = goals.progress(Instance(a.root))
+                    refused = goals.run_checks(Instance(a.root), by="test")
+                    _ok(f"C2c-2 损坏结果存储 {bad!r} 无traceback且拒绝覆盖历史",
+                        broken["counts"]["verified"] == 0 and refused["counts"]["verified"] == 0
+                        and any("corrupt" in issue for issue in broken["issues"])
+                        and state_file.read_bytes() == bad and a.events_path.read_bytes() == events_keep)
+                finally:
+                    state_file.write_bytes(state_keep)
+            _ok("C2c-2 损坏结果存储恢复后的正常progress稳定", all(v["valid"] for v in consumption()))
+            transport_path = LOCAL / "transport.json"
+            transport_target = LOCAL / "transport-symlink-fixture.json"
+            transport_path.rename(transport_target)
+            try:
+                transport_path.symlink_to(transport_target)
+                try:
+                    live._capture_inputs(a)
+                    transport_state = "unexpected_success"
+                except live._InputProblem as e:
+                    transport_state = e.state
+                _ok("C2c Mac 根路径规范化仍拒绝真正 transport 文件 symlink",
+                    transport_state == "unsupported", transport_state)
+            finally:
+                transport_path.unlink()
+                transport_target.rename(transport_path)
+            _ok("C2c transport 恢复原普通文件后严格消费稳定", all(v["valid"] for v in consumption()))
+            later = live._capture_inputs(a)
+            a.event("goal_check", goal="LC1", ok=True, by="test")
+            changed = live._revalidate_inputs(a, later.descriptor)
+            _ok("C2c 后续 goal_check 使旧采集闭包失效", not changed["valid"] and changed["state"] == "changed", repr(changed))
+            # Subprocess handshake: modify bytes after the initial read, before
+            # the freeze verification. No timing sleeps or summary injection.
+            original = live._file_source
+            helper = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import sys,pathlib,json; p=pathlib.Path(sys.argv[1]); "
+                 "sys.stdin.readline(); "
+                 "p.write_bytes(p.read_bytes()+json.dumps({'action':'noop','project':sys.argv[2],"
+                 "'root':sys.argv[3],'ts':'2026-10-15T00:00:00+00:00'}).encode()+b'\\n'); "
+                 "print('changed',flush=True)", str(fx.lp), a.name, str(a.root)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            mutated = []
+
+            def handshake(path):
+                result = original(path)
+                if Path(path) == fx.lp and not mutated:
+                    mutated.append(True)
+                    helper.stdin.write("go\n")
+                    helper.stdin.flush()
+                    if helper.stdout.readline().strip() != "changed":
+                        raise RuntimeError("C02 helper did not acknowledge")
+                return result
+            before = fx.lp.read_bytes()
+            try:
+                live._file_source = handshake
+                try:
+                    live._capture_inputs(a)
+                    race = "unexpected_success"
+                except live._InputProblem as e:
+                    race = e.state
+            finally:
+                live._file_source = original
+                helper.communicate(timeout=10)
+                fx.lp.write_bytes(before)
+            _ok("C2c C02 子进程 barrier 冻结中日志漂移拒绝，不混配旧报告与新 hash", race == "changed", race)
+            # Each log source is mutated independently from a passing capture.
+            for label, path in (("events", a.events_path), ("turns", a.turns_path), ("adapter", fx.lp),
+                                ("sync", fx.hp), ("notes", a.evidence / "turn-007" / "notes.jsonl")):
+                keep = path.read_bytes()
+                try:
+                    path.write_bytes(keep + b'{"broken":\n')
+                    try:
+                        live._capture_inputs(a)
+                        status, source = "unexpected_success", ""
+                    except live._InputProblem as e:
+                        status, source = e.state, e.source
+                    _ok(f"C2c 严读负例 {label} 坏 JSONL 定位 corrupt/来源",
+                        status == "corrupt" and str(path) in source, repr((status, source)))
+                finally:
+                    path.write_bytes(keep)
+            for bad in (b'[]\n', b'{"x":1,"x":2}\n', b'{"x":NaN}\n', b'{"x":1e999}\n', b'\xff\n', b'\n'):
+                try:
+                    live._strict_log(bad, "strict-fixture")
+                    status = "unexpected_success"
+                except live._InputProblem as e:
+                    status = e.state
+                _ok(f"C2c JSONL strict shape/encoding {bad!r}", status == "corrupt", status)
+            _ok("C2c 合法无尾 LF JSONL 正例", live._strict_log(b'{"ok":true}', "no-lf") == [{"ok": True}])
+            # Genuine permission failure, not an evaluator/summary stub.
+            mode = fx.lp.stat().st_mode & 0o777
+            try:
+                fx.lp.chmod(0)
+                try:
+                    live._capture_inputs(a)
+                    status = "unexpected_success"
+                except live._InputProblem as e:
+                    status = e.state
+                _ok("C2c 读取失败保守 unreadable", status == "unreadable", status)
+            finally:
+                fx.lp.chmod(mode)
+            # Ordinary repo success above, genuine Git nonzero below.
+            head_path = a.root / ".git" / "HEAD"
+            head_keep = head_path.read_bytes()
+            try:
+                head_path.write_text("ref: refs/heads/missing-fixture\n")
+                try:
+                    live._capture_inputs(a)
+                    status, detail = "unexpected_success", ""
+                except live._InputProblem as e:
+                    status, detail = e.state, e.detail
+                _ok("C2c Git 读取失败 rc 非零保守 unknown", status == "unknown" and "Git read failed" in detail, detail)
+            finally:
+                head_path.write_bytes(head_keep)
+        finally:
+            goals._TOOL_ROOT = old_tool
+            fx.cleanup()
+            if saved_transport is None:
+                (LOCAL / "transport.json").unlink(missing_ok=True)
+            else:
+                (LOCAL / "transport.json").write_bytes(saved_transport)
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
          ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals), ("指标 C3", _t_metrics),
          ("指标真实 API C3", _t_metrics_real_api),
@@ -1934,7 +2351,8 @@ TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景
          ("目标空集保护 C2a", _t_goals_empty_guard), ("逐目标机械绑定 C2b", _t_mech_v2),
          ("运行输入与 observer C2b FIX2", _t_mech_runtime_inputs),
          ("site 启动与中央缓存 C2b FIX3", _t_mech_startup_inputs),
-         ("禁用 distutils 模板 C2b FIX4", _t_mech_disabled_pth)]
+         ("禁用 distutils 模板 C2b FIX4", _t_mech_disabled_pth),
+         ("严格冻结采集与共同周期 C2c-1", _t_c2c_collection)]
 
 
 def run_lane_c(_ok) -> None:
@@ -1963,7 +2381,7 @@ def main() -> int:
     if os.environ.get(CHILD_FLAG) == "1":
         return _child_main()
     from .core import WF_HOME
-    tmp = Path(tempfile.mkdtemp(prefix="wf-lane-c-"))
+    tmp = Path(tempfile.mkdtemp(prefix="wf-lane-c-")).resolve()
     try:
         r = subprocess.run([sys.executable, "-m", "wflib.selftest_lane_c"], cwd=str(WF_HOME),
                            env=child_env(os.environ, tmp / "local"), timeout=600)
