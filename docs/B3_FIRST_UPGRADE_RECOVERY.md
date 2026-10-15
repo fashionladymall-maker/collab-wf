@@ -85,15 +85,32 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 
 ## 保护状态边界
 
-保护根包括：安装根、安装根下的 `local/`、WF_LOCAL_DIR，以及 registry 中每个已登记项目的 `workflow/`。
-快照目录（manifest、blobs、journal 都在其中）必须与每个保护根互不包含，两个方向都检查；比较时同时使用
-规范路径（realpath）和词法路径（abspath），因此软链接别名不能绕过。这项检查在 freeze、plan、apply 中各执行一次，
-都在任何创建、清理、代码写入或 journal 写入之前。registry 存在但不是普通文件或无法解析时，受控拒绝
-（`registry_not_regular`、`registry_unreadable`），以免项目 workflow 悄悄失去保护。
+**运行状态根**包括：
+- 安装根下的 `local/`；
+- WF_LOCAL_DIR，必须是非空的绝对路径，否则拒绝（`wf_local_not_absolute`），不借进程 cwd 推导；
+- registry 中每个已登记项目的 `workflow/`。
 
-此前的真实反例：快照指向合成 WF_LOCAL_DIR 的子目录时，freeze 正常退出并写入 69 个文件；合法 freeze 后把快照
-移入 WF_LOCAL_DIR，apply 报告 restored，在其中新增 journal/apply.json 与 completed.json，同时仍声称
-`never_written_by_runner`。
+每个运行状态根都按配置原样保留词法形式（normpath 与 abspath），比较时再生成规范形式（realpath）。两种形式都参与下面每一项检查，所以别名不会在比较之前被抹掉。
+
+在 freeze、plan、apply 中，以下检查都发生在任何 mkdir、清理、journal、代码写删、暂存和提交之前。apply 一开始就会先执行 plan。
+
+1. **运行状态根不得与安装代码冲突（`protected_state_overlaps_install_code`）。** 唯一的例外是词法上的 `安装根/local/`。除此之外，任何运行状态根的任一形式只要位于安装根之内、等于安装根、或包含安装根，都在前置阶段拒绝。
+   - 因此，freeze 也不会把已识别的运行状态当作普通的被跟踪代码去认证和冻结。
+   - 冲突一律拒绝，runner 不会移动或删除任何状态，也不会在写入之后再把结论改成"已变化"。
+   - 安装根本身只参与快照的不交叠规则；它不意味着禁止一切代码写入。
+2. **恢复写集不得触及运行状态根（`restore_writes_protected_state`）。** 从可信来源推导出 writes、deletes、登记的临时文件，以及需要新建的父目录，逐一与全部运行状态根做词法和规范两种形式的比对。在第 1 项成立时，这一项属于纵深防御；测试用真实推导出的写集直接验证了它。
+3. **快照不得与安装根或任一运行状态根互相包含（`snapshot_overlaps_protected_state`），两个方向都检查。** 快照包括目录本身、blobs 和 journal。
+
+**registry 协议**：顶层必须是对象，并且必须带有 `projects` 列表；每个条目都必须有非空的绝对路径 `root`。
+- 以下情况都拒绝（`registry_unreadable`）：`{}`、缺少 `projects`、`projects` 不是列表、root 为空、root 是相对路径、root 不是字符串、JSON 格式错误、文件不可读。
+- registry 不是普通文件时拒绝（`registry_not_regular`）。
+- `name`、`added` 等其他字段不作要求，因此 `core.register` 写出的正常 registry 保持兼容。
+
+**此前的真实反例**（真实旧安装器演练，候选树为替身 `3e72a969…`）：
+- **WF_LOCAL_DIR 指向安装根下的 `docs/`**：plan 和 apply 都 exit 0，结果为 restored，docs 下 5 个文件被改写或删除（BATCH2_CONTRACT.json、C5_HISTORY.md、DEVELOPMENT.md、DRILL.md、DRIVER_REVIEW.md），却仍报告 `never_written_by_runner`。
+- **registry 为 `{}`、root 为相对路径、root 为空串**：freeze、plan、apply 都 exit 0，其中 `{}` 实际完成了恢复。
+- **WF_LOCAL_DIR 配置为快照内部的一个别名**，它的规范目标是真实的外部 LOCAL：plan 和 apply 都 exit 0，并往快照里写入了 journal。在这个例子中，外部 LOCAL 本身并没有被 runner 写入。
+- **更早的反例**：快照指向合成 WF_LOCAL_DIR 的子目录时，freeze 写入了 69 个文件；合法快照被移入 WF_LOCAL_DIR 后，apply 在其中写入了 journal。
 
 ## 字节码缓存（不认证）
 
@@ -118,7 +135,7 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 | 结论 | 含义 |
 |---|---|
 | `code_recovery` | `restorable` / `resume_interrupted_apply` / `already_restored`；其余情况都是拒绝 |
-| `state_preservation` | `never_written_by_runner`：runner 不写 `local/`、WF_LOCAL_DIR、已登记项目的 workflow；演练中逐字节核对恢复前后相同 |
+| `state_preservation` | `never_written_by_runner`：runner 不写 `local/`、WF_LOCAL_DIR、已登记项目的 workflow；演练中逐字节核对恢复前后相同。这个结论以"保护状态边界"中的前置检查为前提：一旦运行状态根与安装代码冲突、恢复写集触及运行状态根，或快照与保护根交叠，plan 和 apply 都会在写入之前拒绝，根本不会给出这个结论 |
 | `schema_compat` | 比较冻结时与现在的运行状态清单。有新增或改动时为 `unverified`，并列出每个文件；不宣称旧代码能读新状态 |
 | `restart` | `auto_start=false`，runner 从不启动旧执行体。只有在 `blockers` 为空时才是 `operator_may_restart_old_code`，否则为 `not_established`。阻断项包括：代码未恢复、运行状态自冻结后有变化、安装根下存在任何未认证的字节码缓存（`unbound_bytecode_cache:N`） |
 
@@ -128,7 +145,10 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 
 - 路径不是绝对路径，或有别名、符号链接
 - 快照与安装根交叠，或快照目录已存在
-- 快照与任一保护根双向交叠（`snapshot_overlaps_protected_state`）；registry 不是普通文件或无法解析
+- 快照与任一保护根双向交叠（`snapshot_overlaps_protected_state`）
+- 运行状态根与安装代码冲突（`protected_state_overlaps_install_code`），或恢复写集触及运行状态根（`restore_writes_protected_state`）
+- WF_LOCAL_DIR 不是非空绝对路径（`wf_local_not_absolute`）
+- registry 不是普通文件（`registry_not_regular`），或违反协议、无法读取（`registry_unreadable`）
 - 不是普通 git 根，或有 shallow/alternates/commondir
 - 工作树有未知改动或未跟踪文件
 - 保护状态被跟踪
@@ -174,7 +194,7 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   B3-MAIN-UPGRADE-FIX-20261016-1 返工时，`7b3b6cef…` 不在远端任何引用中，复跑使用
   `B3_CANDIDATE_TREE=3e72a969241e4b095be5058615538a5f494753af`（PR33/d01192d 的 tree，同样含 `wflib/install_history.py`，VERSION 1.9.7）。
   `--skip-test` 只跳过旧安装器“先跑候选版本自检”这一步。本卡不分配版本号。
-- `tests`：`python3 -m unittest -v wflib.selftest_b3_first_upgrade_recovery`，共 13 项：
+- `tests`：`python3 -m unittest -v wflib.selftest_b3_first_upgrade_recovery`，共 16 项：
   - 真实首次升级 → 新 self-rollback 失败 → 冻结树恢复，恢复后旧 self-check 通过；
   - 真实 SIGKILL 中断后续做（并发修改在全量验证阶段被拒，零写）；
   - 九类拒绝；
@@ -191,7 +211,15 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   - 未认证的字节码缓存：用当前解释器真实编译 UNCHECKED_HASH 缓存，并真实 import（加与不加 `-B` 都会执行标记）；
     runner 报告并保留该缓存、不写入任何东西、阻断重启；删除缓存后标记不再执行、阻断项消失；
   - 续做预检的 mode 检查：VERSION 仅改为 0755，或计划内文件内容已是目标但可执行位不对，plan 与 apply 都拒绝，
-    完整字节、mode、HEAD 与 journal 均不变；复原后续做完成。
+    完整字节、mode、HEAD 与 journal 均不变；复原后续做完成；
+  - 运行状态根与安装代码冲突：WF_LOCAL_DIR 等于代码目录 `docs/`、等于安装根、包含安装根、或是规范目标落入
+    `wflib/` 的外部别名，以及经真实旧版 `wf init` 登记的项目其 `workflow` 指向 `docs/`；这些情况在 freeze、
+    plan、apply 中都前置拒绝，完整清单不变。另外用真实推导写集直接验证写集检查；正例中 WF_LOCAL_DIR 等于
+    `安装根/local` 与正常的外部 LOCAL 都能照常恢复；
+  - registry 协议：11 种坏形态（含 chmod 000 与符号链接）在 freeze、plan、apply 中都零写入拒绝；
+    由真实旧版 `wf init` 写出的正常 registry 能照常恢复；
+  - 词法别名：WF_LOCAL_DIR 或已登记项目 root 是快照内部的别名时，plan 与 apply 都拒绝，不写入 journal，
+    真实 LOCAL 也不被改动。
 - 未验证：
   - 正式发布包（尚未产生）；
   - 带 `--auto` 的旧审查路径；
