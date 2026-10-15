@@ -126,6 +126,9 @@ def _run_checks() -> int:
     print("  —— B1-C 车道检查（证据分层与不适用）——", flush=True)
     from .selftest_lane_c import run_lane_c
     run_lane_c(_ok)
+    print("  —— B1-B 车道检查（bootstrap 材料同源）——", flush=True)
+    from .selftest_lane_b import run_lane_b
+    run_lane_b(_ok)
     tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-"))
     env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local"), "WF_NOTIFY": "0"}   # 子进程里本来就是 0，这里照旧写明
     env.pop("VIRTUAL_ENV", None)
