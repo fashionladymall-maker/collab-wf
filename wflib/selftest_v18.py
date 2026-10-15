@@ -376,9 +376,10 @@ def _t_stage_hardlink(_ok):
 def _t_pause_between(_ok):
     import re as _re
     import shlex
-    from . import driver, ops
+    from unittest.mock import patch
+    from . import core, driver, ops, policy
     from .core import Instance
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory() as td, patch.object(core, "REGISTRY", Path(td) / "registry.json"):
         a = _inst(td, "v181-p", {"state": "EXECUTE", "turn": 3})
         (a.root / "pause_now.py").write_text(
             "import json\np='workflow/state.json'\nd=json.load(open(p,encoding='utf-8'))\n"
@@ -389,6 +390,9 @@ def _t_pause_between(_ok):
         a.turn_dir().mkdir(parents=True, exist_ok=True)
         (a.turn_dir() / "intake.json").write_text(json.dumps({"commands": cmds, "directives": {}}), encoding="utf-8")
         pol = {"allow": ["^" + _re.escape(py) + r" pause_now\.py$", r"^echo two$"]}
+        core.REGISTRY.write_text(json.dumps({"projects": []}), encoding="utf-8")
+        (a.wf / "policy.json").write_text(json.dumps(pol), encoding="utf-8")
+        policy.approve(a, "policy", "v18 pause fixture")
         r1 = driver.h_execute(driver.Ctx(a, pol, time.time() + 120))
         n1, nxt = len(ops.list_execs(a)), a.state.get("exec_next")
         s = Instance(a.root)
@@ -471,9 +475,10 @@ def _t_artifacts_pick(_ok):
 def _t_plan_stale(_ok):
     import re as _re
     import shlex
-    from . import driver, ops
+    from unittest.mock import patch
+    from . import core, driver, ops, policy
     from .core import Instance
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory() as td, patch.object(core, "REGISTRY", Path(td) / "registry.json"):
         a = _inst(td, "v184-s", {"state": "EXECUTE", "turn": 3})
         (a.root / "pause_now.py").write_text(
             "import json\np='workflow/state.json'\nd=json.load(open(p,encoding='utf-8'))\n"
@@ -484,6 +489,9 @@ def _t_plan_stale(_ok):
         (a.turn_dir() / "intake.json").write_text(json.dumps({"commands": [f"{py} pause_now.py", "echo two"], "directives": {}}),
                                                   encoding="utf-8")
         pol = {"allow": ["^" + _re.escape(py) + r" pause_now\.py$", r"^echo two$"]}
+        core.REGISTRY.write_text(json.dumps({"projects": []}), encoding="utf-8")
+        (a.wf / "policy.json").write_text(json.dumps(pol), encoding="utf-8")
+        policy.approve(a, "policy", "v18 stale fixture")
         a.state["exec_binding"] = driver._plan_binding(a, with_fp=False)
         a.save()
         r1 = driver.h_execute(driver.Ctx(a, pol, time.time() + 120))
@@ -495,6 +503,8 @@ def _t_plan_stale(_ok):
         n2, st2, fr = len(ops.list_execs(a)), a.state.get("state"), a.state.get("force_report")
         notes = (a.turn_dir() / "notes.jsonl").read_text(encoding="utf-8") if (a.turn_dir() / "notes.jsonl").exists() else ""
         b = _inst(td, "v184-t", {"state": "EXECUTE", "turn": 4, "exec_binding": {"turn": 4, "tool": "0.0.0", "fp": None}})
+        (b.wf / "policy.json").write_text(json.dumps(pol), encoding="utf-8")
+        policy.approve(b, "policy", "v18 stale tool fixture")
         b.turn_dir().mkdir(parents=True, exist_ok=True)
         (b.turn_dir() / "intake.json").write_text(json.dumps({"commands": ["echo two"], "directives": {}}), encoding="utf-8")
         r3 = driver.h_execute(driver.Ctx(b, pol, time.time() + 120))
