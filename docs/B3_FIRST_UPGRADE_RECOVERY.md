@@ -30,6 +30,10 @@
    - **旧源必须合格**：MANIFEST.json 与 VERSION 都被跟踪；清单列出的每个文件都存在且 sha256 一致；
      除 MANIFEST.json 外每个被跟踪文件都在清单里；清单 version 等于 VERSION。任一不符即
      `old_source_manifest_mismatch`，快照目录不会被创建（此前 VERSION 哈希为 64 个 0 仍被冻结）。
+   - **这项检查只证明旧源自洽，不证明它是官方或原生的旧树。** 冻结后由操作人另行保存的 manifest sha256
+     绑定的是"被冻结的这些字节"，不是它们的来源。L4 调用方仍需在 runner 之外绑定来源身份，例如核对冻结的
+     HEAD tree 是否等于原生树 `fafef7e6…`。本 runner 不扩大这项保证。
+   - 快照路径与全部保护根做双向边界检查（见下文"保护状态边界"），在创建快照目录之前完成。
    - **完整磁盘清单**必须与被跟踪文件一致，不受 ignore 规则影响；被忽略的代码残留即 `unexplained_code_residue`。
    - 在安装根之外、此前不存在的快照目录里写入：
      - manifest.json（路径、mode、大小、sha256、git blob，HEAD commit/tree，root 的 dev/ino，
@@ -40,6 +44,7 @@
 2. `plan`（默认动作，只读）
    - 核对 manifest 的 hash、schema、路径，以及每个 blob 的 sha256/大小/git blob。
    - 核对目标身份：路径与 dev/ino 都必须一致，且与快照不交叠。
+   - 在读取 journal、任何清理或写入之前，核对快照与全部保护根的双向边界。apply 以 plan 开头，因此同样受此约束。
    - 核对当前树干净（续做时除外，见下）。
    - 恢复计划只从可信来源推导：经 `--snapshot-sha256` 绑定的冻结 manifest，加上当前 HEAD tree 的
      git 内容寻址对象（`ls-tree` 与 `cat-file --batch`，不读索引、不读磁盘）。写入前 hash 取自这些对象。
@@ -78,6 +83,36 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   `stray-code.py`，都会得到 `restored_disk_drift`，而不是 `already_restored`。
 - 残留与漂移只报告、拒绝，从不自动删除；由操作人决定。
 
+## 保护状态边界
+
+保护根包括：安装根、安装根下的 `local/`、WF_LOCAL_DIR，以及 registry 中每个已登记项目的 `workflow/`。
+快照目录（manifest、blobs、journal 都在其中）必须与每个保护根互不包含，两个方向都检查；比较时同时使用
+规范路径（realpath）和词法路径（abspath），因此软链接别名不能绕过。这项检查在 freeze、plan、apply 中各执行一次，
+都在任何创建、清理、代码写入或 journal 写入之前。registry 存在但不是普通文件或无法解析时，受控拒绝
+（`registry_not_regular`、`registry_unreadable`），以免项目 workflow 悄悄失去保护。
+
+此前的真实反例：快照指向合成 WF_LOCAL_DIR 的子目录时，freeze 正常退出并写入 69 个文件；合法 freeze 后把快照
+移入 WF_LOCAL_DIR，apply 报告 restored，在其中新增 journal/apply.json 与 completed.json，同时仍声称
+`never_written_by_runner`。
+
+## 字节码缓存（不认证）
+
+`__pycache__` 下的 `*.pyc` 无法与冻结源码绑定：
+- unchecked-hash 格式的 pyc（flags=1）在导入时根本不读源码；
+- timestamp 格式的 pyc 只比较头部记录的 mtime 和 size，这两个字段可以伪造；
+- checked-hash 格式只校验源码哈希，不校验其中的字节码是否就是这份源码编译出来的；
+- `-B` 和 `PYTHONDONTWRITEBYTECODE` 只是不再写新缓存，仍会读取已有缓存，不能当作修复。
+
+因此 runner 对缓存的处理是：
+- 不认证：`code_recovery` 只覆盖源码文件的集合、字节和可执行位；
+- 逐个报告：`inventory.bytecode_cache_unverified` 列出每个缓存文件的路径与 sha256；
+- 不删除：未知字节一律保留，由操作人决定；
+- 只要存在任何缓存，`restart` 结论就是 `not_established`，阻断项为 `unbound_bytecode_cache:N`。
+
+真实反例：恢复完成后，放入用真实 `py_compile` 生成的 UNCHECKED_HASH 格式 driver 缓存，其中带有一个合成标记。
+此时源码与快照完全一致，旧 self-check 也返回 0，但新进程 import driver 会输出 `executed-unbound-bytecode`，
+加 `-B` 同样输出。现在 runner 报出这个缓存并阻断重启；只有在操作人删除缓存之后，标记才无法再执行，阻断项才会消失。
+
 ## 四项结论（互相独立）
 
 | 结论 | 含义 |
@@ -85,7 +120,7 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 | `code_recovery` | `restorable` / `resume_interrupted_apply` / `already_restored`；其余情况都是拒绝 |
 | `state_preservation` | `never_written_by_runner`：runner 不写 `local/`、WF_LOCAL_DIR、已登记项目的 workflow；演练中逐字节核对恢复前后相同 |
 | `schema_compat` | 比较冻结时与现在的运行状态清单。有新增或改动时为 `unverified`，并列出每个文件；不宣称旧代码能读新状态 |
-| `restart` | `auto_start=false`，runner 从不启动旧执行体。只有代码已恢复、且运行状态自冻结后完全没变时，才是 `operator_may_restart_old_code`；否则为 `not_established` |
+| `restart` | `auto_start=false`，runner 从不启动旧执行体。只有在 `blockers` 为空时才是 `operator_may_restart_old_code`，否则为 `not_established`。阻断项包括：代码未恢复、运行状态自冻结后有变化、安装根下存在任何未认证的字节码缓存（`unbound_bytecode_cache:N`） |
 
 演练中，旧安装器自己就会新建 `local/locks/self-update.lock`，所以 `schema_compat` 如实报 `unverified`。
 
@@ -93,6 +128,7 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
 
 - 路径不是绝对路径，或有别名、符号链接
 - 快照与安装根交叠，或快照目录已存在
+- 快照与任一保护根双向交叠（`snapshot_overlaps_protected_state`）；registry 不是普通文件或无法解析
 - 不是普通 git 根，或有 shallow/alternates/commondir
 - 工作树有未知改动或未跟踪文件
 - 保护状态被跟踪
@@ -116,7 +152,13 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   - 只清理登记过的临时文件：名称必须是为某个计划内写入推导出的那一个，内容必须是该文件目标 blob 的前缀；
     其他任何文件（包括匹配旧 glob `.b3-recovery-*` 的用户文件）都算残留，拒绝且不删除；
   - 清理发生在全部验证通过之后；
-  - 每个文件只接受“写入前 hash”或“目标 hash”两种状态，否则阻塞，人处理后再续。
+  - 对全部文件核对（内容，git mode）、类型与集合，只接受计划能够证明的状态：
+    - 计划内的写入：只能是（写入前 hash，基线 mode）或（目标 hash，目标 mode）；
+    - 计划内的删除：只能是（写入前 hash，基线 mode）或已不存在；
+    - 其余基线文件：必须与基线完全相同。
+
+    任何不符都在清理、写入、删除、暂存和提交之前拒绝。此前的反例是：只把不在 writes 中的 VERSION 改为 0755，
+    plan 仍判为可续做，apply 先把恢复提交写到了旧 tree，最后才因 `M VERSION` 失败。
 - 恢复提交已经写入、但 completed 记录缺失时，重入只补写 completed。
 
 ## 外部门控
@@ -132,7 +174,7 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   B3-MAIN-UPGRADE-FIX-20261016-1 返工时，`7b3b6cef…` 不在远端任何引用中，复跑使用
   `B3_CANDIDATE_TREE=3e72a969241e4b095be5058615538a5f494753af`（PR33/d01192d 的 tree，同样含 `wflib/install_history.py`，VERSION 1.9.7）。
   `--skip-test` 只跳过旧安装器“先跑候选版本自检”这一步。本卡不分配版本号。
-- `tests`：`python3 -m unittest -v wflib.selftest_b3_first_upgrade_recovery`，共 10 项：
+- `tests`：`python3 -m unittest -v wflib.selftest_b3_first_upgrade_recovery`，共 13 项：
   - 真实首次升级 → 新 self-rollback 失败 → 冻结树恢复，恢复后旧 self-check 通过；
   - 真实 SIGKILL 中断后续做（并发修改在全量验证阶段被拒，零写）；
   - 九类拒绝；
@@ -143,10 +185,16 @@ journal 是可变、不可信的恢复计划副本，不能凭它自己的 JSON 
   - 完成后被跟踪文件内容或可执行位漂移，不再报告已恢复；
   - 只清理登记过的临时文件（用户的 `.b3-recovery-*` 文件被保留）；
   - 真实 SIGKILL 落在临时文件写完与 rename 之间：登记临时文件被识别、篡改后被拒、复原后续做完成；
-  - freeze 只接受合格旧源（VERSION 哈希、未列出文件、版本不符、冻结时的被忽略残留都拒绝，且不创建快照）。
+  - freeze 只接受合格旧源（VERSION 哈希、未列出文件、版本不符、冻结时的被忽略残留都拒绝，且不创建快照）；
+  - 快照与保护状态的双向边界：freeze 到 WF_LOCAL 或项目 workflow 中、WF_LOCAL 位于快照之内、合法快照移入
+    WF_LOCAL 或项目 workflow，在 freeze、plan、apply 三处都受控拒绝，代码、HEAD、journal 与保护状态完全不变；
+  - 未认证的字节码缓存：用当前解释器真实编译 UNCHECKED_HASH 缓存，并真实 import（加与不加 `-B` 都会执行标记）；
+    runner 报告并保留该缓存、不写入任何东西、阻断重启；删除缓存后标记不再执行、阻断项消失；
+  - 续做预检的 mode 检查：VERSION 仅改为 0755，或计划内文件内容已是目标但可执行位不对，plan 与 apply 都拒绝，
+    完整字节、mode、HEAD 与 journal 均不变；复原后续做完成。
 - 未验证：
   - 正式发布包（尚未产生）；
   - 带 `--auto` 的旧审查路径；
   - 真实宿主上正在运行的新版看板或驱动器进程（runner 不检查进程）；
-  - macOS 路径别名，例如 `/var` 与 `/private/var`。runner 一律拒绝别名，请传入规范路径；
+  - macOS（m4）：本卡没有在 macOS 上运行任何测试。路径别名，例如 `/var` 与 `/private/var`，runner 一律拒绝，请传入规范路径；
   - 旧代码是否兼容新版写下的状态（只报告，不判定）。
