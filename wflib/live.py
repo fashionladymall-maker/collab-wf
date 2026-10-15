@@ -89,6 +89,9 @@ LEGACY_INSTALL_SCHEMA = "legacy-install-command/1"
 _LEGACY_ENTRIES = {"apply": "project", "self-update": "tool"}
 _WRAPPERS = {"env", "command", "exec", "nohup", "time", "nice", "timeout", "sudo"}
 _WRAPPER_VALUE_OPTIONS = {"-u", "-g", "-n", "-s", "-k", "-C", "-p"}
+_DRILL_VALUE_OPTIONS = {"--kind", "--dir", "--review", "--review-timeout-s"}
+INNER_REVIEW_DIAGNOSTIC = "inner_review_child_project_not_bound"
+INNER_REVIEW_RECEIPT_DIAGNOSTIC = "inner_review_receipt_not_grafted"
 
 
 def _legacy_install(cmd, _depth=0):
@@ -125,14 +128,14 @@ def _legacy_install(cmd, _depth=0):
         else:
             current.append(token)
     segments.append(current)
-    found = None
-    for argv in segments:
-        hit = _legacy_simple(argv, _depth)
-        if hit is not None and (found is None or (found["kind"] is None and hit["kind"] is not None)):
-            found = hit
-        if found is not None and found["kind"] is not None:
-            break
-    return found
+    # Precedence: an inner review anywhere wins (its child references must never
+    # reach the provider), then the first parsed install entry, then unknown.
+    hits = [hit for hit in (_legacy_simple(argv, _depth) for argv in segments) if hit is not None]
+    for wanted in (lambda h: h["kind"] == "inner_review", lambda h: h["kind"] is not None, lambda h: True):
+        found = next((hit for hit in hits if wanted(hit)), None)
+        if found is not None:
+            return found
+    return None
 
 
 def _legacy_simple(argv, depth):
@@ -180,6 +183,22 @@ def _legacy_simple(argv, depth):
             k += 2
         else:
             break
+    if k < len(rest) and rest[k] == "drill":
+        # ``wf drill review`` runs a full inner review/driver cycle in an
+        # isolated child project and LOCAL. Its references belong to that
+        # child project and are never grafted onto the parent invocation.
+        m = k + 1
+        while m < len(rest):
+            if rest[m] in _DRILL_VALUE_OPTIONS:
+                m += 2
+            elif rest[m].startswith("-"):
+                m += 1
+            else:
+                break
+        if m < len(rest) and rest[m] == "review":
+            return {"schema": LEGACY_INSTALL_SCHEMA, "entry": "drill review", "kind": "inner_review",
+                    "parsed": True, "argument": None}
+        return None
     if k >= len(rest) or rest[k] not in _LEGACY_ENTRIES:
         return None
     entry, argument, m = rest[k], None, k + 1
@@ -199,45 +218,87 @@ def _legacy_simple(argv, depth):
             "parsed": True, "argument": argument}
 
 
+def _history_required(events):
+    """Capture gate: structured receipts or any classified legacy/inner exec.
+
+    Pure legacy windows therefore go through ``_bound_histories`` too, so
+    receipt-less ``wf apply``/``self-update``/``drill review`` stay visible.
+    """
+    return any(event.get("type") == "exec"
+               and (event.get("install_exec") is not None or _legacy_install(event.get("cmd")) is not None)
+               for event in events)
+
+
+def _invocation_command(inst, event, reader):
+    """Full invocation command from its metadata, read through the frozen reader."""
+    invocation = event["install_exec"]
+    path = Path(inst.evidence) / f"turn-{invocation['turn']:03d}" / (invocation["exec"]["id"] + ".json")
+    raw = reader.bytes(path)
+    return _strict_json(raw, path).get("cmd") if raw is not None else None
+
+
 def _bound_histories(inst, events, reader, *, local, tool_root):
     """Provider-bound receipts plus explicit unknown rows for unreferenced tries.
 
-    Referenced rows come only from B's provider over the frozen reader. Rows
-    without a reference are rebuilt here so that legacy ``wf apply`` and
-    ``python3 '<path>/wf.py' self-update`` invocations without a receipt stay
-    visible as ``unknown`` while ordinary successful commands are not counted.
-    Modern rows are classified from the full invocation metadata command read
-    through the same reader (events keep only 300 characters).
+    Every structured invocation is first bound by ``exec_binding`` and
+    classified from its full metadata command (events keep 300 characters);
+    all reads go through the same strict capture/frozen reader. Inner review
+    invocations (``wf drill review``) are never handed to B's provider: their
+    child-project references are not grafted and the row stays ``unknown``
+    with ``reference=None``. Other referenced rows come only from the
+    provider. Receipt-less legacy ``wf apply`` and ``python3 '<path>/wf.py'
+    self-update`` stay ``unknown``; ordinary successful commands are not
+    counted.
     """
-    from .live_history import collect_bound_histories
-    provided = collect_bound_histories(inst, events, reader, local=local, tool_root=tool_root)
-    rows = [row for row in provided["entries"] if row.get("reference") is not None]
+    from .live_history import collect_bound_histories, exec_binding
+    classified, inner, identities = {}, set(), set()
     for event in events:
         if event.get("type") != "exec":
             continue
-        invocation = event.get("install_exec")
-        if invocation is None:
-            legacy = _legacy_install(event.get("cmd"))
+        if event.get("install_exec") is None:
+            classified[event["seq"]] = _legacy_install(event.get("cmd"))
+            continue
+        binding = exec_binding(inst, event, reader)
+        key = (binding["invocation"]["turn"], binding["invocation"]["exec"]["id"])
+        nonce = binding["invocation"]["exec"]["nonce"]
+        if key in identities or nonce in identities:
+            raise _InputProblem("corrupt", inst.events_path, "duplicate installation invocation identity")
+        identities.update((key, nonce))
+        classified[event["seq"]] = _legacy_install(_invocation_command(inst, event, reader))
+        if (classified[event["seq"]] or {}).get("kind") == "inner_review":
+            inner.add(event["seq"])
+    provided = collect_bound_histories(inst, [event for event in events if event.get("seq") not in inner],
+                                       reader, local=local, tool_root=tool_root)
+    rows = [row for row in provided["entries"] if row.get("reference") is not None]
+
+    def unknown(event, diagnostics, legacy, *, bound):
+        row = {"seq": event["seq"], "turn": event.get("turn"), "reference": None, "state": "unknown"}
+        if bound:
+            row.update(exit_code=event.get("exit_code"), interrupted=event.get("interrupted"))
+        row["diagnostics"] = diagnostics
+        if legacy:
+            row["legacy_command"] = {k: legacy[k] for k in ("schema", "entry", "kind", "parsed")}
+        rows.append(row)
+
+    for event in events:
+        if event.get("type") != "exec":
+            continue
+        legacy = classified.get(event["seq"])
+        is_inner = (legacy or {}).get("kind") == "inner_review"
+        if event.get("install_exec") is None:
             if legacy:
-                rows.append({"seq": event["seq"], "turn": event.get("turn"), "reference": None,
-                             "state": "unknown", "diagnostics": ["legacy_install_reference_unavailable"],
-                             "legacy_command": {k: legacy[k] for k in ("schema", "entry", "kind", "parsed")}})
+                unknown(event, [INNER_REVIEW_DIAGNOSTIC if is_inner else "legacy_install_reference_unavailable"],
+                        legacy, bound=False)
+            continue
+        if event["seq"] in inner:
+            unknown(event, [INNER_REVIEW_DIAGNOSTIC]
+                    + ([INNER_REVIEW_RECEIPT_DIAGNOSTIC] if event.get("install_refs") else []), legacy, bound=True)
             continue
         if event.get("install_refs"):
             continue   # every reference was bound by the provider above
-        meta_path = Path(inst.evidence) / f"turn-{invocation['turn']:03d}" / (invocation["exec"]["id"] + ".json")
-        raw = reader.bytes(meta_path)   # already validated by exec_binding; frozen read
-        command = _strict_json(raw, meta_path).get("cmd") if raw is not None else None
-        legacy = _legacy_install(command)
         if legacy or event.get("exit_code") != 0 or event.get("interrupted"):
-            row = {"seq": event["seq"], "turn": event.get("turn"), "reference": None,
-                   "state": "unknown", "exit_code": event.get("exit_code"),
-                   "interrupted": event.get("interrupted"),
-                   "diagnostics": ["installation_receipt_has_no_transaction" if legacy
-                                   else "unsuccessful_exec_has_no_transaction_reference"]}
-            if legacy:
-                row["legacy_command"] = {k: legacy[k] for k in ("schema", "entry", "kind", "parsed")}
-            rows.append(row)
+            unknown(event, ["installation_receipt_has_no_transaction" if legacy
+                            else "unsuccessful_exec_has_no_transaction_reference"], legacy, bound=True)
     rows.sort(key=lambda row: row["seq"])   # stable: same-seq references keep receipt order
     return {"schema": provided["schema"], "entries": rows}
 
@@ -1047,7 +1108,7 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
         git_inputs = _git_inputs(fresh.root, [h["ts"] for h in hist if h.get("status") in ("pushed", "unchanged")])
         history_reader = None
         review_inputs = {"state": "unavailable", "reason": "install_history_unavailable"}
-        if any(event.get("type") == "exec" and event.get("install_exec") is not None for event in events):
+        if _history_required(events):
             from .core import WF_HOME
             from .live_history import CaptureReader
 
@@ -1073,8 +1134,12 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
             source(registry, "bytes", required=False)
             trust_inputs = {"schema": TRUST_INPUTS_SCHEMA, "registry": str(registry),
                             "transport": str((Path(LOCAL) / "transport.json").absolute())}
+        # complete: structured receipts exist. A pure legacy window is still
+        # collected through the history protocol but stays incomplete.
         descriptor = {"schema": WINDOW_SCHEMA, "rule": WINDOW_RULE,
-                      "complete": review_inputs.get("schema") == "live-install-history/1",
+                      "complete": review_inputs.get("schema") == "live-install-history/1"
+                      and any(event.get("type") == "exec" and event.get("install_exec") is not None
+                              for event in events),
                       "subject": {"root": str(fresh.root), "project": fresh.name, "created": cfg.get("created"),
                                   "local": str(LOCAL.resolve())},
                       "parameters": {"rounds": rounds, "budget_s": budget_s},

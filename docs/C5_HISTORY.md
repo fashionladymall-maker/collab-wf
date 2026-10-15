@@ -206,8 +206,12 @@ is not evidence of any real platform verifier.
 
 ## Legacy installation entries without receipts
 
-`live._bound_histories` wraps B's provider. Referenced rows come only from the
-provider. Rows without a reference are rebuilt by C:
+`live._bound_histories` wraps B's provider. Every structured invocation is
+first bound with `exec_binding` and classified from its full metadata command;
+all of these reads go through the same strict capture reader and are replayed
+by the frozen reader, so capture and replay derive rows from the same frozen
+sources. Referenced rows come only from the provider. Rows without a reference
+are rebuilt by C:
 
 - an exec event without `install_exec` that is a legacy installation command
   becomes `unknown` with `legacy_install_reference_unavailable`;
@@ -217,13 +221,38 @@ provider. Rows without a reference are rebuilt by C:
   or `unsuccessful_exec_has_no_transaction_reference` when it failed or was
   interrupted;
 - an ordinary successful command is not an installation attempt, even if its
-  text contains `wf self-update` (for example inside `echo`).
+  text contains `wf self-update` (for example inside `echo`);
+- an inner review (`wf drill review`, any entry form) runs a complete inner
+  review/driver cycle in an isolated child project and LOCAL. It is never
+  handed to B's provider: the row is `unknown`, `reference=null`, with
+  `inner_review_child_project_not_bound`, plus
+  `inner_review_receipt_not_grafted` when the receipt nevertheless carries
+  references (for example a child-project reference). Child references are
+  never grafted onto the parent project or tool, and their presence does not
+  turn the whole window corrupt. The inner run's own exit status does not
+  matter; an outer exit 0 still yields the unknown row. An inner review
+  anywhere in a compound command takes precedence, so a parent `wf apply` in
+  the same command conservatively stays unknown rather than valid.
+
+History capture is gated by `live._history_required(events)`: any exec with a
+structured receipt (`install_exec`) or any exec whose recorded command is a
+legacy installation or inner review. A pure legacy window (no structured
+receipt at all) is therefore collected through `_bound_histories` as well
+(`review_inputs` uses `live-install-history/1`, trust inputs are frozen) and
+its legacy rows block authorization. Window `complete` is true only when
+structured receipts exist, so such a window is collected but explicitly
+incomplete. Pre-receipt events are classified from the event command, which
+ops truncates to 300 characters; structured invocations use the full metadata
+command. A direct `live.check` without structured receipts keeps the
+non-snapshot reporting path; its report is identical because criterion 4 and
+apply attribution do not depend on these unknown rows.
 
 `live._legacy_install` tokenizes with shell operators and recognizes direct
 `wf`/`wf.py` invocations (any path, including `python3 '<space path>/wf.py'`),
 leading assignments and `env`/`timeout`/`nohup`/`time`/`nice`/`sudo`/`command`/
 `exec` wrappers, `bash|sh|zsh -c` and `eval` nesting, global `--project`/`--json`
-options and the `apply` (project) and `self-update` (tool) entries. A command
+options and the `apply` (project), `self-update` (tool) and `drill review`
+(`inner_review`, never a tool attempt) entries. A command
 that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
 unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
 diagnostic only; no installation reference is derived from a basename or

@@ -241,6 +241,12 @@ class OutputSyntheticTests(MarkedSyntheticTests):
     trust_reason = "production_trust_history_synthetic"
 
 
+def live_history_reader(inst):
+    """Strict capture reader over current disk, as live._capture_inputs builds it."""
+    from .live_history import CaptureReader
+    return CaptureReader(lambda path: live._file_source(path)[1], live._directory_source)
+
+
 class LegacyEntryTests(_Fixture):
     def fake_entries(self):
         space = self.base / "space path"
@@ -254,6 +260,23 @@ class LegacyEntryTests(_Fixture):
         wf.chmod(0o755)
         return wf_py, wf
 
+    def drill_with_child_receipt(self):
+        """A wf.py drill entry whose inner run leaks a child-project receipt."""
+        folder = self.base / "drill entry"
+        folder.mkdir()
+        script = folder / "wf.py"
+        script.write_text(
+            "import json, os, sys\n"
+            "ctx = json.loads(os.environ['WF_INSTALL_EXEC_CONTEXT'])\n"
+            "child = sys.argv[sys.argv.index('--dir') + 1] + '/project'\n"
+            "ref = {'schema': 'install-ref/1', 'tx_id': 'tx-' + '1' * 32, 'request_id': 'rq-' + '1' * 32,\n"
+            "       'content_id': '1' * 64, 'package_sha256': '1' * 64,\n"
+            "       'target': {'kind': 'project', 'root': child}, 'prepared_sha256': '1' * 64}\n"
+            "row = {'schema': 'install-exec-receipt/1', 'exec': ctx, 'install_ref': ref}\n"
+            "os.write(int(os.environ['WF_INSTALL_RECEIPT_FD']), (json.dumps(row) + '\\n').encode())\n",
+            encoding="utf-8")
+        return script
+
     def test_real_legacy_execs_without_receipt_are_unknown(self):
         inst = self.fixture()
         wf_py, wf = self.fake_entries()
@@ -263,6 +286,11 @@ class LegacyEntryTests(_Fixture):
             "long": ": " + "x" * 320 + " && " + shlex.join([str(wf), "--project", inst.name, "apply", "l.zip"]),
             "echo": "echo 'wf self-update legacy.zip'",
             "plain": "true",
+            "drill": shlex.join([sys.executable, str(wf_py), "drill", "review", "--kind", "block",
+                                 "--dir", str(self.base / "drill-a"), "--review", str(self.env.runner)]),
+            "drill_receipt": shlex.join([sys.executable, str(self.drill_with_child_receipt()), "--json", "drill",
+                                         "review", "--kind", "timeout", "--dir", str(self.base / "drill-b"),
+                                         "--review", str(self.env.runner)]),
         }
         seqs = {}
         for name, command in commands.items():
@@ -278,16 +306,115 @@ class LegacyEntryTests(_Fixture):
             self.assertNotIn("install_ref", row)
         self.assertNotIn(seqs["echo"], rows)
         self.assertNotIn(seqs["plain"], rows)
+        # Inner review: the child-project ref really reached the parent receipt
+        # but is not grafted; the parent row stays unknown with reference=None.
+        events = {e["seq"]: e for e in live._strict_log(inst.events_path.read_bytes(), inst.events_path)}
+        self.assertEqual(events[seqs["drill"]]["install_refs"], [])
+        leaked = events[seqs["drill_receipt"]]["install_refs"]
+        self.assertEqual(leaked[0]["target"], {"kind": "project", "root": str(self.base / "drill-b" / "project")})
+        for name, diagnostics in (("drill", [live.INNER_REVIEW_DIAGNOSTIC]),
+                                  ("drill_receipt", [live.INNER_REVIEW_DIAGNOSTIC, live.INNER_REVIEW_RECEIPT_DIAGNOSTIC])):
+            row = rows[seqs[name]]
+            self.assertEqual((row["state"], row["reference"], row["diagnostics"], row["exit_code"]),
+                             ("unknown", None, diagnostics, 0), name)
+            self.assertEqual(row["legacy_command"]["kind"], "inner_review", name)
+            self.assertNotIn("history", row)
+        self.assertFalse(any(row.get("reference") == leaked[0] for row in rows.values()))
+        # Without the inner-review boundary B's provider would reject the foreign
+        # root for the whole window instead of keeping the attempt visible.
+        from .live_history import collect_bound_histories
+        with self.assertRaises(live._InputProblem) as error:
+            collect_bound_histories(inst, [events[seqs["drill_receipt"]]], live_history_reader(inst),
+                                    local=core.LOCAL, tool_root=self.env.tool)
+        self.assertEqual(error.exception.state, "corrupt")
         self.assertIn("install_history:unknown", result["history_authorization"]["why"])
         self.assertEqual(result["authorization"], "unavailable")
         criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
         self.assertFalse(criterion["ok"])
         self.assertIn("installation_receipt_has_no_transaction", criterion["why"])
-        self.assertEqual(criterion["attempts"]["total"], 2)   # protected tool install + legacy tool entry
+        self.assertEqual(criterion["attempts"]["total"], 2)   # protected tool install + legacy tool entry; drill is not a tool try
         # Frozen replay reproduces the same rows from the snapshot.
         snap = live._capture_inputs(inst, rounds=1)
         self.assertEqual(live._evaluate_snapshot(snap)["window_inputs"]["review_inputs"],
                          result["window_inputs"]["review_inputs"])
+
+    def legacy_only_fixture(self):
+        """Same live window as the C5 fixture but with no structured receipt."""
+        from datetime import timedelta
+        from .selftest_review import _git
+        inst = self.project("legacy only window")
+        inst.state.update(state="EXECUTE", turn=1)
+        inst.save()
+        at = core.now()
+        sent, done = at - timedelta(minutes=1), at + timedelta(seconds=2)
+        for kind, fields in (("reply_binding", {"receipt": "ok", "deliveries": "ok"}),
+                             ("reply_checked", {}), ("round_result", {"ok": True})):
+            inst.event(kind, by="driver", **fields)
+        legacy = {
+            "project": "wf apply legacy.zip",
+            "tool_failed": shlex.join([sys.executable, "/space path/wf.py", "self-update", "legacy.zip"]),
+            "drill": shlex.join([sys.executable, "/space path/wf.py", "drill", "review", "--kind", "block",
+                                 "--dir", "/d", "--review", "/r"]),
+            "echo": "echo 'wf self-update legacy.zip'",
+        }
+        for name, command in legacy.items():
+            inst.event("exec", cid=f"c{len(name):02d}", cmd=command, exit_code=1 if name == "tool_failed" else 0,
+                       duration_s=0.1, by="driver")
+        inst.turns_path.write_text(
+            json.dumps({"turn": 1, "status": "sent", "from": "driver", "ts_sent": sent.isoformat()}) + "\n"
+            + json.dumps({"turn": 1, "status": "done", "ts_done": done.isoformat()}) + "\n", encoding="utf-8")
+        td = inst.turn_dir()
+        for name, doc in (("intake.json", {"commands": list(legacy.values())}),
+                          ("send_meta.json", {"message_uuid": "c5-parent"}),
+                          ("reply_meta.json", {"parent": "c5-parent", "ended_at": done.isoformat()})):
+            (td / name).write_text(json.dumps(doc), encoding="utf-8")
+        (td / "notes.jsonl").write_bytes(b"")
+        adapter = self.base / "legacy-adapter.jsonl"
+        adapter.write_text(json.dumps({"action": "send", "turn": 1, "ts": sent.isoformat(),
+                                       "project": inst.name, "root": str(inst.root)}) + "\n", encoding="utf-8")
+        cfg = json.loads(self.env.transport.read_bytes())
+        cfg["log"] = str(adapter)
+        self.env.transport.write_text(json.dumps(cfg), encoding="utf-8")
+        head = _git(inst.root, "rev-parse", "HEAD")
+        sync = core.LOCAL / "sync" / (inst.name + ".history.jsonl")
+        sync.parent.mkdir(parents=True, exist_ok=True)
+        sync.write_text(json.dumps({"turn": 1, "status": "pushed", "commit": head, "head": head,
+                                    "ts": done.isoformat(), "project": inst.name, "root": str(inst.root)}) + "\n",
+                        encoding="utf-8")
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        self.assertFalse(any("install_exec" in e for e in events))
+        return inst, {name: next(e["seq"] for e in events if e.get("cmd") == command)
+                      for name, command in legacy.items()}
+
+    def test_pure_legacy_window_goes_through_history_capture(self):
+        inst, seqs = self.legacy_only_fixture()
+        snap = live._capture_inputs(inst, rounds=1)
+        descriptor = snap.descriptor
+        self.assertEqual(descriptor["review_inputs"]["schema"], "live-install-history/1")
+        self.assertIs(descriptor["complete"], False)   # collected, but no structured receipts
+        self.assertEqual(descriptor["trust_inputs"]["schema"], live.TRUST_INPUTS_SCHEMA)
+        rows = {row["seq"]: row for row in descriptor["review_inputs"]["entries"]}
+        self.assertEqual({name: (rows[seq]["state"], rows[seq]["reference"], rows[seq]["diagnostics"],
+                                 rows[seq]["legacy_command"]["kind"])
+                          for name, seq in seqs.items() if name != "echo"},
+                         {"project": ("unknown", None, ["legacy_install_reference_unavailable"], "project"),
+                          "tool_failed": ("unknown", None, ["legacy_install_reference_unavailable"], "tool"),
+                          "drill": ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review")})
+        self.assertNotIn(seqs["echo"], rows)
+        result = live._evaluate_snapshot(snap)
+        self.assertIn("install_history:unknown", result["history_authorization"]["why"])
+        self.assertEqual(result["authorization"], "unavailable")
+        # Capture and replay share the source: frozen replay rebuilds the same
+        # rows without disk, and fresh capture reproduces the same descriptor.
+        from unittest.mock import patch
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertTrue(live._revalidate_inputs(inst, descriptor)["valid"])
+        # The report itself is unchanged by collecting the history rows.
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+        verified = self.run_goal(inst)
+        self.assertIs(verified["granted"], False)
+        self.assertIn("install_history:unknown", verified["why"])
 
     def test_pre_receipt_events_and_classifier(self):
         reader = SimpleNamespace(bytes=lambda path: None)
@@ -298,13 +425,20 @@ class LegacyEntryTests(_Fixture):
              "exit_code": 0},
             {"type": "exec", "seq": 3, "turn": 1, "cmd": "echo 'wf self-update legacy.zip'", "exit_code": 0},
             {"type": "exec", "seq": 4, "turn": 1, "cmd": "pytest -q", "exit_code": 0},
+            {"type": "exec", "seq": 5, "turn": 1, "exit_code": 0,
+             "cmd": "python3 '/space path/wf.py' drill review --kind timeout --dir /d --review /r"},
+            {"type": "exec", "seq": 6, "turn": 1, "cmd": "echo 'wf drill review'", "exit_code": 0},
         ]
         bound = live._bound_histories(inst, events, reader, local="/l", tool_root="/t")
         self.assertEqual([(row["seq"], row["state"], row["legacy_command"]["kind"], row["diagnostics"])
                           for row in bound["entries"]],
                          [(1, "unknown", "project", ["legacy_install_reference_unavailable"]),
-                          (2, "unknown", "tool", ["legacy_install_reference_unavailable"])])
-        self.assertEqual([live._install_try(e, None, []) for e in events], [False, True, False, False])
+                          (2, "unknown", "tool", ["legacy_install_reference_unavailable"]),
+                          (5, "unknown", "inner_review", [live.INNER_REVIEW_DIAGNOSTIC])])
+        self.assertEqual([live._install_try(e, None, []) for e in events], [False, True, False, False, False, False])
+        self.assertTrue(live._history_required(events[:1]))
+        self.assertTrue(live._history_required(events[4:5]))
+        self.assertFalse(live._history_required([events[2], events[3], events[5]]))
         positives = {
             "wf apply x.zip": ("project", "x.zip"),
             "cd sub && wf self-update --auto workflow/outbox/c.zip": ("tool", "workflow/outbox/c.zip"),
@@ -313,12 +447,17 @@ class LegacyEntryTests(_Fixture):
             "bash -lc 'wf apply nested.zip'": ("project", "nested.zip"),
             "make build\nwf apply n.zip": ("project", "n.zip"),
             "wf self-update": ("tool", None),
+            "wf --json drill review --kind block --dir /d --review /r": ("inner_review", None),
+            "cd /x && python3 '/a b/wf.py' drill --kind timeout review --dir /d --review /r": ("inner_review", None),
+            "wf apply x.zip && wf drill review --kind block --dir /d --review /r": ("inner_review", None),
+            "wf apply x.zip; wf self-update y.zip": ("project", "x.zip"),
         }
         for command, (kind, argument) in positives.items():
             got = live._legacy_install(command)
             self.assertEqual((got["kind"], got["argument"], got["parsed"]), (kind, argument, True), command)
         for command in ("echo 'wf apply x.zip'", "grep 'wf self-update' log", "python3 -c 'print(1)'",
-                        "python3 wf.py selftest", "wf status", "make apply", "exit 124", "echo 'oops"):
+                        "python3 wf.py selftest", "wf status", "make apply", "exit 124", "echo 'oops",
+                        "echo 'wf drill review'", "wf drill", "wf drill other --kind block"):
             self.assertIsNone(live._legacy_install(command), command)
         unparsable = live._legacy_install("wf apply 'x.zip")
         self.assertEqual((unparsable["parsed"], unparsable["kind"], unparsable["argument"]), (False, None, None))
