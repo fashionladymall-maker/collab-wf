@@ -318,7 +318,7 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snap
         collection["report_sha256"] = hashlib.sha256(live._canonical(collection["report"]).encode()).hexdigest()
         r = collection["report"]
         if collection.get("authorization") != "available":
-            why.extend((collection.get("history_authorization") or {}).get("why")
+            why.extend(live._authorization_reasons(collection)
                        or ["install_history_unavailable（历史安装关联尚未完成）"])
     except live._InputProblem as e:
         r = {}
@@ -370,6 +370,9 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str, *, snap
                "goal_sha256": _goal_def_sha(x), "dependency_definitions": dependencies,
                "content_complete": isinstance(closure, dict) and closure.get("complete") is True,
                "authorization_complete": modern and authorization == "available"}
+    if modern:
+        # C5-G1: name the host registration (or its absence) behind the decision.
+        binding["production_trust"] = live._trust_binding(collection.get("production_trust"))
     granted = bool(modern and not why and _live_grant_ready(inst, x, st, collection, binding))
     return {"granted": granted, "why": why, "ts": now_iso(), "binding": binding,
             "collection": collection}
@@ -1452,15 +1455,25 @@ def _na_valid(na, r: dict, x: dict, st: dict) -> tuple:
 
 
 def _live_grant_ready(inst, x, st, collection, binding):
-    """Compute eligibility from re-evaluated inputs, never the stored granted bit."""
+    """Compute eligibility from re-evaluated inputs, never the stored granted bit.
+
+    C5-G1: historical eligibility alone is not enough; the frozen host registry
+    must positively register the verifier and identity (production class)."""
+    from . import live
     summary = collection.get("report", {}).get("summary", {})
     history = collection.get("history_authorization", {})
+    trust = collection.get("production_trust")
     spec = x.get("live", {})
     segments = spec.get("segments")
     tool = _tool_state(git_inputs=collection.get("closure", {}).get("git_tool"))
     fingerprint = _project_fp(inst)
     return (st.get("approved") is True and collection.get("authorization") == "available"
             and history.get("eligible") is True and history.get("complete") is True and history.get("synthetic") is False
+            and isinstance(trust, dict) and trust.get("schema") == live.TRUST_CHECK_SCHEMA
+            and trust.get("state") == "trusted" and trust.get("granted") is True
+            and isinstance(trust.get("registration"), dict) and trust["registration"].get("class") == "production"
+            and not live._authorization_reasons(collection)
+            and binding.get("production_trust") == live._trust_binding(trust)
             and collection.get("closure", {}).get("complete") is True
             and summary.get("schema") == "live-summary/1" and summary.get("project") == inst.name
             and summary.get("passed") is True and summary.get("passed_strict") is True
@@ -1578,7 +1591,9 @@ def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict)
                     psnapshot = live._FrozenInputs(snapshot.root, snapshot.project, dict(snapshot.raw), pdescriptor)
                     pevaluated = live._evaluate_snapshot(psnapshot)
                     if any(pc.get(field) != pevaluated.get(field) for field in
-                           ("report", "history_authorization", "authorization", "reason", "inputs_sha256")):
+                           ("report", "history_authorization", "production_trust", "authorization", "reason",
+                            "inputs_sha256")) \
+                            or pb.get("production_trust") != live._trust_binding(pevaluated.get("production_trust")):
                         raise live._InputProblem("corrupt", gid, "同批历史报告与冻结来源重新评价不一致")
                     pevaluated["closure"] = closure
                     if peer["granted"] != bool(_live_grant_ready(inst, definition, st, pevaluated, pb)) \
@@ -1591,14 +1606,17 @@ def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict)
             granted, authorization, why = False, "unavailable", ["install_history_unavailable"]
             if modern:
                 if c.get("history_authorization") != evaluated.get("history_authorization") \
+                        or c.get("production_trust") != evaluated.get("production_trust") \
                         or c.get("authorization") != evaluated.get("authorization") or c.get("reason") != evaluated.get("reason"):
                     raise live._InputProblem("corrupt", "history", "历史授权事实与冻结来源重新评价不一致")
+                if b.get("production_trust") != live._trust_binding(evaluated.get("production_trust")):
+                    raise live._InputProblem("corrupt", "production_trust", "生产信任登记绑定与冻结来源重新评价不一致")
                 evaluated["closure"] = closure
                 granted = bool(_live_grant_ready(inst, x, st, evaluated, b))
                 if v["granted"] != granted:
                     raise live._InputProblem("corrupt", "binding", "granted 与当前完整事实重新评价不一致")
                 authorization = evaluated["authorization"]
-                why = [] if granted else evaluated["history_authorization"]["why"] or ["严格实景判据或工具状态未达到授权条件"]
+                why = [] if granted else live._authorization_reasons(evaluated) or ["严格实景判据或工具状态未达到授权条件"]
         result = {"valid": True, "state": "stable", "why": why, "granted": granted,
                   "authorization": authorization, "complete": True,
                   "inputs_sha256": b["window_inputs_sha256"], "closure_sha256": b["closure_sha256"]}

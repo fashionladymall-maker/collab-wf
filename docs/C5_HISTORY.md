@@ -120,7 +120,8 @@ checks goal/dependency definitions and verifies each replaced output's evidence.
 The selected candidate rounds must contain both tool and project transaction
 histories, and all ten strict live criteria must pass even for a narrow segment
 mapping. A grant also requires approved goals, a clean matching tool, a matching
-project fingerprint and non-synthetic provenance. `live-collection/2` remains a
+project fingerprint, non-synthetic provenance and a positive production trust
+registration (below). `live-collection/2` remains a
 collection-only protocol.
 
 Tool cleanliness uses controlled Git status with repository fsmonitor and the
@@ -128,6 +129,110 @@ untracked cache disabled. Its envelope binds the index and local ignore and
 attribute files as well as status output. External filters, submodule settings,
 and external attribute/exclude configuration are unsupported. A changed ignore
 dependency invalidates reuse even when status still reports a clean checkout.
+
+## Production trust registry (C5-G1)
+
+Historical validity is not a production grant. B's provenance marks a history
+synthetic only when the verifier configuration or output says so; a fixture
+verifier whose transport entry and output both omit `synthetic` and whose bytes
+are re-pinned is reported as `platform_verified` with `synthetic=false`. The
+host trust root is therefore completed by an explicit, positive, versioned
+registration. Nothing grants by default.
+
+`LOCAL/production_trust.json`, schema `production-trust/1`:
+
+```json
+{
+  "schema": "production-trust/1",
+  "registrations": [
+    {
+      "id": "<[A-Za-z0-9][A-Za-z0-9._-]{0,63}>",
+      "class": "production",
+      "verifier": {"path": "<canonical absolute path>", "sha256": "<sha256>"},
+      "identity": {"platform": "<reviewer_identity.platform>", "models": ["<model_verified>"]}
+    }
+  ]
+}
+```
+
+Every object has exactly these keys. `class` is `production` or `synthetic`;
+ids, verifier paths and verifier digests are unique, so one byte sequence
+cannot be both production and synthetic. A grant (`authorization=available`)
+requires, in addition to every historical and closure condition:
+
+- the registry is present, strict JSON and schema-valid;
+- the current transport `review_verifier.path` equals one registration's path,
+  its pinned sha256 equals the registered sha256, and transport does not mark
+  it synthetic;
+- the registration class is `production`;
+- the frozen verifier bytes hash to the registered sha256;
+- every valid window history has `synthetic=false` (fact and provenance),
+  `level=platform_verified`, `verifier_sha256` equal to the registration,
+  `reviewer_identity.platform` equal to `identity.platform` and
+  `model_verified` in `identity.models`.
+
+The result is `production_trust` (`production-trust-check/1`) with `state`
+`absent|corrupt|unsupported|unregistered|mismatch|synthetic|changed|unavailable|trusted`
+and one denial reason, e.g. `production_trust_registry_absent`,
+`production_trust_registry_invalid:<field>`,
+`production_trust_verifier_unregistered`,
+`production_trust_verifier_sha256_mismatch`,
+`production_trust_registration_synthetic`,
+`production_trust_transport_synthetic`,
+`production_trust_history_synthetic`,
+`production_trust_platform_mismatch`, `production_trust_model_mismatch`.
+Reasons are ordered: historical reasons first, then trust reasons, so an
+explicitly synthetic history still reports `synthetic_install_history`.
+
+The registry is a frozen input of every modern window
+(`descriptor.trust_inputs`, `production-trust-inputs/1`) and is bound through
+`window_inputs_sha256`. Creating, editing or deleting it changes the
+descriptor, so earlier collections and grants become `changed`; a registration
+added after a denial never upgrades the stored denial, a fresh collection is
+required. A recreated file is a new identity and stays invalid until
+recollected. Frozen replay reads the registry and verifier bytes only from the
+snapshot. Goal bindings record `binding.production_trust` (state, registry
+digest, registration id and class); progress re-evaluates and compares it.
+Records written before this registry existed fail revalidation as `changed`.
+
+Like `transport.json` and `lanes.json`, the registry is host configuration that
+the same OS user can edit. It prevents misconfiguration and self-claims from
+becoming production grants; it does not defend against a malicious host owner.
+
+The selftest positive cases register a local fixture verifier as `production`
+under the id `selftest-registry-contract` in an isolated temporary host. They
+exercise the registry contract; the grant names that selftest registration and
+is not evidence of any real platform verifier.
+
+## Legacy installation entries without receipts
+
+`live._bound_histories` wraps B's provider. Referenced rows come only from the
+provider. Rows without a reference are rebuilt by C:
+
+- an exec event without `install_exec` that is a legacy installation command
+  becomes `unknown` with `legacy_install_reference_unavailable`;
+- an exec with `install_exec` and no receipt becomes `unknown` with
+  `installation_receipt_has_no_transaction` when its full invocation metadata
+  command (events keep only 300 characters) is a legacy installation command,
+  or `unsuccessful_exec_has_no_transaction_reference` when it failed or was
+  interrupted;
+- an ordinary successful command is not an installation attempt, even if its
+  text contains `wf self-update` (for example inside `echo`).
+
+`live._legacy_install` tokenizes with shell operators and recognizes direct
+`wf`/`wf.py` invocations (any path, including `python3 '<space path>/wf.py'`),
+leading assignments and `env`/`timeout`/`nohup`/`time`/`nice`/`sudo`/`command`/
+`exec` wrappers, `bash|sh|zsh -c` and `eval` nesting, global `--project`/`--json`
+options and the `apply` (project) and `self-update` (tool) entries. A command
+that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
+unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
+diagnostic only; no installation reference is derived from a basename or
+command string. Scripts, aliases, functions, variables and backticks are not
+classified; quoted operator characters and comments may conservatively count as
+unknown. Criterion 4 counts tool references and legacy tool entries; the legacy
+report path reads the parsed first package operand and reports
+`旧版安装命令无法解析（unknown）` when none exists. Project legacy entries are
+visible as unknown history rows and block authorization.
 
 Synthetic histories can be complete and historically valid while authorization
 remains unavailable. The real-install integration tests always use explicitly
@@ -139,3 +244,6 @@ invalidate reuse.
 The reader probes run in `wflib.selftest_live_history`; the actual exec,
 protected installation, frozen replay and goals tests run in
 `wflib.selftest_c5_integration`. Both are included in the isolated C lane.
+The production-trust registry and legacy-entry tests run in
+`wflib.selftest_c5_trust` (`python3 -m unittest wflib.selftest_c5_trust`);
+they are not wired into an existing aggregator.

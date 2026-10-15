@@ -84,6 +84,182 @@ def _mine(x: dict, name: str) -> bool:
     return x.get("project", name) == name
 
 
+# ---- C5-G1: legacy installation entries (reporting only, never a reference) ----
+LEGACY_INSTALL_SCHEMA = "legacy-install-command/1"
+_LEGACY_ENTRIES = {"apply": "project", "self-update": "tool"}
+_WRAPPERS = {"env", "command", "exec", "nohup", "time", "nice", "timeout", "sudo"}
+_WRAPPER_VALUE_OPTIONS = {"-u", "-g", "-n", "-s", "-k", "-C", "-p"}
+
+
+def _legacy_install(cmd, _depth=0):
+    """Classify a shell command as a direct legacy ``wf apply``/``wf self-update``.
+
+    Returns ``None`` for ordinary commands, else ``{schema, entry, kind, parsed,
+    argument}``. ``argument`` is only the first positional package operand used
+    by the legacy report path; it is never an installation reference and never
+    authorizes anything. Commands that mention a wf entry point but cannot be
+    tokenized are returned with ``parsed=False`` and ``kind=None`` (explicitly
+    unknown). Indirection through scripts, aliases, functions or variables is
+    outside this reporting classifier.
+    """
+    import re
+    import shlex
+    if not isinstance(cmd, str) or not cmd.strip() or _depth > 3:
+        return None
+    try:
+        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""   # conservative: a comment never hides an invocation
+        tokens = list(lexer)
+    except ValueError:
+        mentions = re.search(r"(?:^|[\s/'\"`;&|(])wf(?:\.py)?(?=['\"\s`]|$)", cmd) \
+            and re.search(r"(?<![\w-])(?:apply|self-update)(?![\w-])", cmd)
+        return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False,
+                "argument": None} if mentions else None
+    segments, current = [], []
+    for token in tokens:
+        if token and all(ch in ";&|()<>\n" for ch in token):
+            segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    segments.append(current)
+    found = None
+    for argv in segments:
+        hit = _legacy_simple(argv, _depth)
+        if hit is not None and (found is None or (found["kind"] is None and hit["kind"] is not None)):
+            found = hit
+        if found is not None and found["kind"] is not None:
+            break
+    return found
+
+
+def _legacy_simple(argv, depth):
+    import re
+    i, n = 0, len(argv)
+    assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
+    while i < n and assignment.fullmatch(argv[i]):
+        i += 1
+    while i < n and argv[i].rsplit("/", 1)[-1] in _WRAPPERS:
+        wrapper = argv[i].rsplit("/", 1)[-1]
+        i += 1
+        while i < n and (argv[i].startswith("-") or assignment.fullmatch(argv[i])):
+            i += 2 if argv[i] in _WRAPPER_VALUE_OPTIONS else 1
+        if wrapper == "timeout" and i < n:
+            i += 1   # duration operand
+    if i >= n:
+        return None
+    name = argv[i].rsplit("/", 1)[-1]
+    if name in ("bash", "sh", "zsh", "dash", "ksh"):
+        j, inline = i + 1, False
+        while j < n and argv[j].startswith("-") and argv[j] not in ("-", "--"):
+            inline = inline or (not argv[j].startswith("--") and "c" in argv[j][1:])
+            j += 1
+        return _legacy_install(argv[j], depth + 1) if inline and j < n else None
+    if name == "eval":
+        return _legacy_install(" ".join(argv[i + 1:]), depth + 1)
+    rest = None
+    if name in ("wf", "wf.py"):
+        rest = argv[i + 1:]
+    elif re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", name):
+        j = i + 1
+        while j < n and argv[j].startswith("-") and argv[j] != "-":
+            if argv[j] in ("-c", "-m"):
+                return None
+            j += 2 if argv[j] in ("-X", "-W") else 1
+        if j < n and argv[j].rsplit("/", 1)[-1] == "wf.py":
+            rest = argv[j + 1:]
+    if rest is None:
+        return None
+    k = 0
+    while k < len(rest):
+        if rest[k] == "--json" or rest[k].startswith("--project="):
+            k += 1
+        elif rest[k] == "--project":
+            k += 2
+        else:
+            break
+    if k >= len(rest) or rest[k] not in _LEGACY_ENTRIES:
+        return None
+    entry, argument, m = rest[k], None, k + 1
+    while m < len(rest):
+        token = rest[m]
+        if token == "--review-id":
+            m += 2
+            continue
+        if token == "--":
+            argument = rest[m + 1] if m + 1 < len(rest) else None
+            break
+        if not token.startswith("-"):
+            argument = token
+            break
+        m += 1
+    return {"schema": LEGACY_INSTALL_SCHEMA, "entry": entry, "kind": _LEGACY_ENTRIES[entry],
+            "parsed": True, "argument": argument}
+
+
+def _bound_histories(inst, events, reader, *, local, tool_root):
+    """Provider-bound receipts plus explicit unknown rows for unreferenced tries.
+
+    Referenced rows come only from B's provider over the frozen reader. Rows
+    without a reference are rebuilt here so that legacy ``wf apply`` and
+    ``python3 '<path>/wf.py' self-update`` invocations without a receipt stay
+    visible as ``unknown`` while ordinary successful commands are not counted.
+    Modern rows are classified from the full invocation metadata command read
+    through the same reader (events keep only 300 characters).
+    """
+    from .live_history import collect_bound_histories
+    provided = collect_bound_histories(inst, events, reader, local=local, tool_root=tool_root)
+    rows = [row for row in provided["entries"] if row.get("reference") is not None]
+    for event in events:
+        if event.get("type") != "exec":
+            continue
+        invocation = event.get("install_exec")
+        if invocation is None:
+            legacy = _legacy_install(event.get("cmd"))
+            if legacy:
+                rows.append({"seq": event["seq"], "turn": event.get("turn"), "reference": None,
+                             "state": "unknown", "diagnostics": ["legacy_install_reference_unavailable"],
+                             "legacy_command": {k: legacy[k] for k in ("schema", "entry", "kind", "parsed")}})
+            continue
+        if event.get("install_refs"):
+            continue   # every reference was bound by the provider above
+        meta_path = Path(inst.evidence) / f"turn-{invocation['turn']:03d}" / (invocation["exec"]["id"] + ".json")
+        raw = reader.bytes(meta_path)   # already validated by exec_binding; frozen read
+        command = _strict_json(raw, meta_path).get("cmd") if raw is not None else None
+        legacy = _legacy_install(command)
+        if legacy or event.get("exit_code") != 0 or event.get("interrupted"):
+            row = {"seq": event["seq"], "turn": event.get("turn"), "reference": None,
+                   "state": "unknown", "exit_code": event.get("exit_code"),
+                   "interrupted": event.get("interrupted"),
+                   "diagnostics": ["installation_receipt_has_no_transaction" if legacy
+                                   else "unsuccessful_exec_has_no_transaction_reference"]}
+            if legacy:
+                row["legacy_command"] = {k: legacy[k] for k in ("schema", "entry", "kind", "parsed")}
+            rows.append(row)
+    rows.sort(key=lambda row: row["seq"])   # stable: same-seq references keep receipt order
+    return {"schema": provided["schema"], "entries": rows}
+
+
+def _install_try(event, histories, history_entries):
+    """Criterion-4 tool attempt: structured tool reference or legacy tool entry."""
+    if event.get("type") != "exec":
+        return False
+    if event.get("install_exec") is None or histories is None:
+        legacy = _legacy_install(event.get("cmd"))
+        return bool(legacy) and legacy["kind"] in ("tool", None)
+    for row in history_entries:
+        if row.get("seq") != event.get("seq"):
+            continue
+        if (row.get("reference") or {}).get("target", {}).get("kind") == "tool":
+            return True
+        if row.get("reference") is None and isinstance(row.get("legacy_command"), dict) \
+                and row["legacy_command"].get("kind") in ("tool", None):
+            return True
+    return False
+
+
 def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
     # 1.9.3：按执行端第 123 轮的复核再修——不跳过失败的轮次（按轮号连续计）；日志条目必须带项目字段；回复要核父子 uuid；
     # 审查核版本包哈希与先后；待办按事件核关闭时刻；发现延迟不得为负；同步要带当时的 HEAD；
@@ -178,11 +354,7 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
         bad3 = [e.get("rule") for e in tev if e.get("type") == "auto" and e.get("rule") in ("RELEASE_MISSING", "FP_MISMATCH")]
         add(3, last.get("deliveries") in ("ok", "none") and not bad3,
             "交付核对：" + (last.get("deliveries") or "没有记录") + (("；" + "、".join(bad3)) if bad3 else ""))
-        tries = [e for e in tev if e.get("type") == "exec"
-                 and ("wf self-update" in str(e.get("cmd") or "")
-                      or any(row.get("seq") == e.get("seq")
-                             and (row.get("reference") or {}).get("target", {}).get("kind") == "tool"
-                             for row in history_entries))]
+        tries = [e for e in tev if _install_try(e, histories, history_entries)]
         ups = [e for e in tries if e.get("exit_code") == 0]
         # B1-C r2（F1）：任何失败、超时或结果未知的安装尝试都留在结构化状态里，不被同轮的成功安装遮掉
         att = {"total": len(tries), "ok": len(ups),
@@ -202,13 +374,21 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
             for e in ups:
                 if e.get("install_exec") is not None and histories is not None:
                     from .live_history import entry_problem
-                    entries = [row for row in history_entries if row.get("seq") == e.get("seq")
-                               and (row.get("reference") or {}).get("target", {}).get("kind") == "tool"]
+                    rows = [row for row in history_entries if row.get("seq") == e.get("seq")]
+                    entries = [row for row in rows
+                               if (row.get("reference") or {}).get("target", {}).get("kind") == "tool"]
                     problems = [entry_problem(row) for row in entries]
-                    vs.append("pass" if entries and not any(problems)
-                              else "历史安装无法核对（" + "、".join([p for p in problems if p] or ["missing_receipt"]) + "）")
+                    unknown = [d for row in rows if row.get("reference") is None for d in row.get("diagnostics") or []]
+                    vs.append("pass" if entries and not any(problems) and not unknown
+                              else "历史安装无法核对（" + "、".join([p for p in problems if p] + unknown
+                                                                    or ["missing_receipt"]) + "）")
                     continue
-                zp = inst.root / str(e.get("cmd")).split()[-1]
+                legacy = _legacy_install(e.get("cmd")) or {}
+                if not legacy.get("argument"):
+                    # Explicitly unknown: no package operand can be parsed.
+                    vs.append("旧版安装命令无法解析（unknown）")
+                    continue
+                zp = inst.root / legacy["argument"]
                 rr = read_doc(LOCAL / "reviews" / f"{zp.stem}.result.json", {}) or {}
                 v = rr.get("verdict") or "没有记录"
                 if v in ("pass", "concerns"):
@@ -317,6 +497,17 @@ WINDOW_SCHEMA = "window-inputs/1"
 WINDOW_RULE = "live-read-set/1"
 CLOSURE_SCHEMA = "live-closure/1"
 CLOSURE_RULE = "all-content/1"
+
+
+# C5-G1 production trust. A grant needs a positive, versioned host registration
+# of the exact platform-evidence verifier (canonical path + sha256) and the
+# platform/model identity it attests. No registry, any doubt, a synthetic
+# registration or a configuration that merely omits ``synthetic`` all deny.
+TRUST_REGISTRY_NAME = "production_trust.json"
+TRUST_SCHEMA = "production-trust/1"
+TRUST_INPUTS_SCHEMA = "production-trust-inputs/1"
+TRUST_CHECK_SCHEMA = "production-trust-check/1"
+TRUST_CLASSES = ("production", "synthetic")
 
 
 class _InputProblem(Exception):
@@ -647,12 +838,12 @@ class _FrozenInputs:
         return dict(self.descriptor["git"]["heads"]).get(ts, "")
 
     def install_histories(self, inst, events):
-        from .live_history import FrozenReader, collect_bound_histories
+        from .live_history import FrozenReader
         inputs = self.descriptor["review_inputs"]
         if inputs.get("schema") != "live-install-history/1":
             return None
-        replay = collect_bound_histories(inst, events, FrozenReader(self, inputs["reader"]),
-                                        local=inputs["host"]["local"], tool_root=inputs["host"]["tool_root"])
+        replay = _bound_histories(inst, events, FrozenReader(self, inputs["reader"]),
+                                  local=inputs["host"]["local"], tool_root=inputs["host"]["tool_root"])
         if replay != {"schema": inputs["schema"], "entries": inputs["entries"]}:
             raise _InputProblem("corrupt", "install_history", "stored history differs from frozen replay")
         return replay
@@ -804,21 +995,15 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
             if not isinstance(meta.get("parent"), str) or not isinstance(smeta.get("message_uuid"), str):
                 raise _InputProblem("unknown", td, "message identity unavailable")
             log(td / "notes.jsonl")
-        # Legacy report reads remain explicit. Structural receipts never fall
-        # back to parsing a command's final token.
-        import shlex
+        # Legacy report reads remain explicit and use the same classifier as
+        # the report. Structural receipts never fall back to command parsing.
         for event in events:
-            if event.get("type") == "exec" and event.get("install_exec") is None \
-                    and "wf self-update" in str(event.get("cmd") or "") and event.get("exit_code") == 0:
-                try:
-                    tokens = shlex.split(event["cmd"])
-                except ValueError as e:
-                    raise _InputProblem("corrupt", fresh.events_path, str(e)) from e
-                if not tokens or " " in tokens[-1]:
-                    raise _InputProblem("unsupported", fresh.events_path, "legacy install path parser")
-                zp = fresh.root / tokens[-1]
-                source(zp, "bytes")
-                doc(LOCAL / "reviews" / f"{zp.stem}.result.json")
+            if event.get("type") == "exec" and event.get("install_exec") is None and event.get("exit_code") == 0:
+                legacy = _legacy_install(event.get("cmd"))
+                if legacy and legacy["kind"] in ("tool", None) and legacy.get("argument"):
+                    zp = fresh.root / legacy["argument"]
+                    source(zp, "bytes")
+                    doc(LOCAL / "reviews" / f"{zp.stem}.result.json")
         task_rows = state.get("executor_tasks", [])
         if not isinstance(task_rows, list) or any(not isinstance(x, dict) for x in task_rows):
             raise _InputProblem("corrupt", fresh.state_path, "executor_tasks must be object list")
@@ -864,7 +1049,7 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
         review_inputs = {"state": "unavailable", "reason": "install_history_unavailable"}
         if any(event.get("type") == "exec" and event.get("install_exec") is not None for event in events):
             from .core import WF_HOME
-            from .live_history import CaptureReader, collect_bound_histories
+            from .live_history import CaptureReader
 
             def history_directory(path):
                 desc = _directory_source(path)
@@ -876,9 +1061,18 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
                 return desc
 
             history_reader = CaptureReader(lambda path: source(path, "bytes", required=False), history_directory)
-            review_inputs = collect_bound_histories(fresh, events, history_reader, local=LOCAL, tool_root=WF_HOME)
+            review_inputs = _bound_histories(fresh, events, history_reader, local=LOCAL, tool_root=WF_HOME)
             review_inputs.update(host={"local": str(Path(LOCAL).absolute()), "tool_root": str(Path(WF_HOME).absolute())},
                                  reader=history_reader.descriptor)
+        trust_inputs = None
+        if review_inputs.get("schema") == "live-install-history/1":
+            # The host trust registry is a frozen input of every modern window:
+            # creating, editing or deleting it changes the descriptor and so
+            # invalidates every earlier collection and grant.
+            registry = Path(LOCAL).absolute() / TRUST_REGISTRY_NAME
+            source(registry, "bytes", required=False)
+            trust_inputs = {"schema": TRUST_INPUTS_SCHEMA, "registry": str(registry),
+                            "transport": str((Path(LOCAL) / "transport.json").absolute())}
         descriptor = {"schema": WINDOW_SCHEMA, "rule": WINDOW_RULE,
                       "complete": review_inputs.get("schema") == "live-install-history/1",
                       "subject": {"root": str(fresh.root), "project": fresh.name, "created": cfg.get("created"),
@@ -889,6 +1083,8 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
                       "adapter": str(adapter.absolute()), "selection": selection, "git": git_inputs,
                       "output_contract": contract, "task_protocol": "A1-uuid/1",
                       "review_inputs": review_inputs}
+        if trust_inputs is not None:
+            descriptor["trust_inputs"] = trust_inputs
         # Re-read bytes and member boundaries; no after-the-fact hash can be
         # paired with data evaluated earlier. No global ACID/ABA claim is made.
         if history_reader is not None:
@@ -924,9 +1120,157 @@ def _evaluate_snapshot(snapshot):
         from .live_history import window_authorization
         authorization = window_authorization(history, snapshot.jsonl(inst.events_path), report)
         result.update(history_authorization=authorization,
-                      authorization="available" if authorization["eligible"] else "unavailable",
-                      reason=None if authorization["eligible"] else "；".join(authorization["why"]))
+                      production_trust=_production_trust(snapshot, history, report))
+        reasons = _authorization_reasons(result)
+        result.update(authorization="unavailable" if reasons else "available",
+                      reason="；".join(reasons) if reasons else None)
     return result
+
+
+def _authorization_reasons(result):
+    """Ordered denial reasons: historical facts first, then production trust."""
+    history = result.get("history_authorization") if isinstance(result, dict) else None
+    if not isinstance(history, dict):
+        return ["install_history_unavailable"]
+    if history.get("eligible") is not True:
+        return list(history.get("why") or ["install_history_unavailable"])
+    trust = result.get("production_trust")
+    if not isinstance(trust, dict) or trust.get("schema") != TRUST_CHECK_SCHEMA \
+            or trust.get("granted") is not True or trust.get("state") != "trusted":
+        return list((trust or {}).get("why") or ["production_trust_unavailable"])
+    return []
+
+
+def _trust_binding(trust):
+    """Compact, display-stable identity of the registration behind a decision."""
+    if not isinstance(trust, dict):
+        return None
+    registration = trust.get("registration") if isinstance(trust.get("registration"), dict) else {}
+    return {"schema": trust.get("schema"), "state": trust.get("state"), "granted": trust.get("granted") is True,
+            "registry": trust.get("registry"), "registry_sha256": trust.get("registry_sha256"),
+            "registration": registration.get("id"), "class": registration.get("class")}
+
+
+def _trust_registrations(doc):
+    """Strict production-trust/1 document; raises ValueError(field) on any doubt."""
+    import re
+    if set(doc) != {"schema", "registrations"} or doc["schema"] != TRUST_SCHEMA:
+        raise ValueError("schema")
+    rows = doc["registrations"]
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("registrations")
+    hexdigest = re.compile(r"[0-9a-f]{64}")
+    ident = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+    seen = {"id": set(), "path": set(), "sha256": set()}
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"id", "class", "verifier", "identity"}:
+            raise ValueError("registration")
+        if not isinstance(row["id"], str) or not ident.fullmatch(row["id"]):
+            raise ValueError("id")
+        if row["class"] not in TRUST_CLASSES:
+            raise ValueError("class")
+        verifier, identity = row["verifier"], row["identity"]
+        if not isinstance(verifier, dict) or set(verifier) != {"path", "sha256"} \
+                or not isinstance(verifier["path"], str) or not Path(verifier["path"]).is_absolute() \
+                or str(Path(verifier["path"])) != verifier["path"] or ".." in Path(verifier["path"]).parts \
+                or not isinstance(verifier["sha256"], str) or not hexdigest.fullmatch(verifier["sha256"]):
+            raise ValueError("verifier")
+        models = identity.get("models") if isinstance(identity, dict) else None
+        if not isinstance(identity, dict) or set(identity) != {"platform", "models"} \
+                or not isinstance(identity["platform"], str) or not identity["platform"].strip() \
+                or not isinstance(models, list) or not models \
+                or any(not isinstance(m, str) or not m.strip() for m in models) or len(set(models)) != len(models):
+            raise ValueError("identity")
+        for key, value in (("id", row["id"]), ("path", verifier["path"]), ("sha256", verifier["sha256"])):
+            if value in seen[key]:
+                raise ValueError("duplicate_" + key)
+            seen[key].add(value)
+    return rows
+
+
+def _production_trust(snapshot, history, report):
+    """Evaluate the frozen host registry against the frozen verifier and facts.
+
+    Only frozen bytes are read. The registry is host-controlled configuration:
+    like transport.json it can be edited by the same OS user; it guards against
+    misconfiguration (e.g. a test verifier whose config forgot ``synthetic``)
+    and self-claims, not against a malicious host owner.
+    """
+    out = {"schema": TRUST_CHECK_SCHEMA, "state": "unavailable", "granted": False,
+           "registry": None, "registry_sha256": None, "registration": None, "why": []}
+
+    def deny(state, why):
+        out.update(state=state, granted=False, why=[why])
+        return out
+
+    inputs = snapshot.descriptor.get("trust_inputs")
+    if not isinstance(inputs, dict) or inputs.get("schema") != TRUST_INPUTS_SCHEMA \
+            or not isinstance(inputs.get("registry"), str) or not isinstance(inputs.get("transport"), str):
+        return deny("unavailable", "production_trust_inputs_unavailable")
+    out["registry"] = inputs["registry"]
+    try:
+        raw = snapshot.bytes(inputs["registry"])
+    except _InputProblem:
+        return deny("unavailable", "production_trust_registry_not_frozen")
+    if raw is None:
+        return deny("absent", "production_trust_registry_absent")
+    out["registry_sha256"] = hashlib.sha256(raw).hexdigest()
+    try:
+        document = _strict_json(raw, inputs["registry"])
+    except _InputProblem:
+        return deny("corrupt", "production_trust_registry_corrupt")
+    if document.get("schema") != TRUST_SCHEMA:
+        return deny("unsupported", "production_trust_registry_schema_unsupported")
+    try:
+        registrations = _trust_registrations(document)
+    except (ValueError, TypeError) as exc:
+        return deny("corrupt", f"production_trust_registry_invalid:{exc}")
+    try:
+        transport = snapshot.json(inputs["transport"], {}) or {}
+    except _InputProblem:
+        return deny("unavailable", "production_trust_transport_unavailable")
+    cfg = transport.get("review_verifier")
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("path"), str) or not isinstance(cfg.get("sha256"), str):
+        return deny("unavailable", "production_trust_verifier_unconfigured")
+    matches = [row for row in registrations if row["verifier"]["path"] == cfg["path"]]
+    if not matches:
+        return deny("unregistered", "production_trust_verifier_unregistered")
+    registration = matches[0]
+    out["registration"] = registration
+    if registration["verifier"]["sha256"] != cfg["sha256"]:
+        return deny("mismatch", "production_trust_verifier_sha256_mismatch")
+    if registration["class"] != "production":
+        return deny("synthetic", "production_trust_registration_synthetic")
+    if bool(cfg.get("synthetic")):
+        return deny("synthetic", "production_trust_transport_synthetic")
+    try:
+        program = snapshot.bytes(registration["verifier"]["path"])
+    except _InputProblem:
+        return deny("unavailable", "production_trust_verifier_not_frozen")
+    if program is None or hashlib.sha256(program).hexdigest() != registration["verifier"]["sha256"]:
+        return deny("changed", "production_trust_verifier_bytes_mismatch")
+    window = {row.get("turn") for row in report.get("rounds", [])}
+    rows = [row for row in history.get("entries", []) if row.get("turn") in window
+            and row.get("reference") is not None and row.get("state") == "valid"]
+    if not rows:
+        return deny("unavailable", "production_trust_no_verified_history")
+    identity = registration["identity"]
+    for row in rows:
+        facts = (row.get("history") or {}).get("facts") or {}
+        provenance = facts.get("provenance") if isinstance(facts.get("provenance"), dict) else {}
+        reviewer = provenance.get("reviewer_identity")
+        if facts.get("synthetic") is not False or provenance.get("synthetic") is not False:
+            return deny("synthetic", "production_trust_history_synthetic")
+        if provenance.get("level") != "platform_verified":
+            return deny("mismatch", "production_trust_level_mismatch")
+        if provenance.get("verifier_sha256") != registration["verifier"]["sha256"]:
+            return deny("mismatch", "production_trust_verifier_identity_mismatch")
+        if not isinstance(reviewer, dict) or reviewer.get("platform") != identity["platform"]:
+            return deny("mismatch", "production_trust_platform_mismatch")
+        if provenance.get("model_verified") not in identity["models"]:
+            return deny("mismatch", "production_trust_model_mismatch")
+    out.update(state="trusted", granted=True, why=[])
+    return out
 
 
 def _revalidate_inputs(inst, descriptor):
