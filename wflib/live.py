@@ -2,9 +2,14 @@
 
 逐轮核对 LIVE.md 第 1 节的 10 段判据，证据都来自真实记录：事件流、轮次记录、证据目录、审查结论留档、同步历史、
 适配器动作日志（transport.json 的 log）。拿不到证据的一段按“不达标（无法核对）”算——实景验收只认证据。
-连续达标的轮数达到 --rounds（默认 3）才算通过；1.9.0 之前的轮次缺少新记录，会如实显示无法核对。"""
+连续达标的轮数达到 --rounds（默认 3）才算通过；1.9.0 之前的轮次缺少新记录，会如实显示无法核对。
+
+B1-C：每段新增 status（passed | failed | not_applicable | attempt_failed），第 4 段不适用时带 na 四项；返回结构新增 summary
+（机器摘要，经现有 wf --json live-check 输出）。ok、why、streak、passed 与人工输出都不变。summary 是测量报告，不是凭证：
+goals 只在本进程内直接调用 check() 时采用它，从不读取文件里的摘要。"""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -109,8 +114,11 @@ def check(inst, rounds: int = 3, budget_s: int = 300) -> dict:
     for t in allt:
         crit = []
 
-        def add(n, ok, why):
-            crit.append({"n": n, "ok": bool(ok), "why": why})
+        def add(n, ok, why, status=None, na=None):
+            c = {"n": n, "ok": bool(ok), "why": why, "status": status or ("passed" if ok else "failed")}
+            if na:
+                c["na"] = na
+            crit.append(c)
         tdir = inst.evidence / f"turn-{int(t):03d}"
         if t not in done or not (tdir / "intake.json").exists():
             add(0, False, "这一轮没有回复或没有解析记录（失败的轮次也计入，不跳过）")
@@ -141,9 +149,21 @@ def check(inst, rounds: int = 3, budget_s: int = 300) -> dict:
         bad3 = [e.get("rule") for e in tev if e.get("type") == "auto" and e.get("rule") in ("RELEASE_MISSING", "FP_MISMATCH")]
         add(3, last.get("deliveries") in ("ok", "none") and not bad3,
             "交付核对：" + (last.get("deliveries") or "没有记录") + (("；" + "、".join(bad3)) if bad3 else ""))
-        ups = [e for e in tev if e.get("type") == "exec" and "wf self-update" in str(e.get("cmd") or "") and e.get("exit_code") == 0]
-        if not ups:
-            add(4, True, "本轮没有安装工具版本（不适用）")
+        tries = [e for e in tev if e.get("type") == "exec" and "wf self-update" in str(e.get("cmd") or "")]
+        ups = [e for e in tries if e.get("exit_code") == 0]
+        # B1-C r2（F1）：任何失败、超时或结果未知的安装尝试都留在结构化状态里，不被同轮的成功安装遮掉
+        att = {"total": len(tries), "ok": len(ups),
+               "timeout": sum(1 for e in tries if e.get("exit_code") == 124),
+               "unknown": sum(1 for e in tries if not isinstance(e.get("exit_code"), int))}
+        att["failed"] = att["total"] - att["ok"] - att["timeout"] - att["unknown"]
+        bad_try = att["total"] > att["ok"]
+        if not ups and tries:
+            # B1-C：安装尝试失败或超时不是“没有安装”，不能记为不适用；ok 与说明保持原样，结构化状态如实区分
+            add(4, True, "本轮没有安装工具版本（不适用）", status="attempt_failed")
+        elif not ups:
+            add(4, True, "本轮没有安装工具版本（不适用）", status="not_applicable",
+                na={"condition": "本轮没有 wf self-update 命令", "scope": "第 4 段（审查在先）",
+                    "reason": "没有安装工具版本，审查在先无从核对", "by": "live.check"})
         else:
             vs = []
             for e in ups:
@@ -156,7 +176,10 @@ def check(inst, rounds: int = 3, budget_s: int = 300) -> dict:
                     else:
                         v += _review_timing(rr, e)   # 1.9.4：按安装开始的时刻比，空时刻不放过
                 vs.append(v)
-            add(4, all(v in ("pass", "concerns") for v in vs), "安装前审查：" + "、".join(vs))
+            ok4 = all(v in ("pass", "concerns") for v in vs)
+            add(4, ok4, "安装前审查：" + "、".join(vs), status="attempt_failed" if (ok4 and bad_try) else None)
+        if tries:
+            crit[-1]["attempts"] = att
         man = [f"{e.get('type')}（{e.get('by')}/{e.get('actor') or '?'}）" for e in tev if _manual(e)]
         add(5, not man, "人工改动：" + ("、".join(man[:5]) if man else "无"))
         cmds = (read_json(tdir / "intake.json", {}) or {}).get("commands") or []
@@ -210,7 +233,26 @@ def check(inst, rounds: int = 3, budget_s: int = 300) -> dict:
             missing.append("连续达标的轮次里没有一次工具安装")
         if not any(r["applies"] for r in win):
             missing.append("连续达标的轮次里没有一次项目落地")
-    return {"rounds": results, "streak": streak, "need": rounds, "missing": missing,
-            "passed": bool(results) and streak >= rounds and not missing}
+    passed = bool(results) and streak >= rounds and not missing
+    return {"rounds": results, "streak": streak, "need": rounds, "missing": missing, "passed": passed,
+            "summary": _summary(inst, results, win, rounds, streak, missing, passed)}
+
+
+def _summary(inst, results: list, win: list, rounds: int, streak: int, missing: list, passed: bool) -> dict:
+    """B1-C：机器摘要。segments 按连续达标窗口逐段计：窗口里每一轮该段都 ok 且状态是 passed 或 not_applicable 才为真
+    （attempt_failed 不算）。rounds_sha256 是本次逐轮结果的规范 JSON 摘要。"""
+    segs = {}
+    for n in range(1, 11):
+        segs[str(n)] = bool(win) and all(
+            any(c.get("n") == n and c.get("ok") and c.get("status") in ("passed", "not_applicable") for c in r["criteria"])
+            for r in win)
+    canon = json.dumps(results, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    strict_issues = [f"第 {r['turn']} 轮第 {c.get('n')} 段：{c.get('status')}" for r in win for c in r["criteria"]
+                     if not (c.get("ok") and c.get("status") in ("passed", "not_applicable"))]
+    return {"schema": "live-summary/1", "project": inst.name, "need": rounds, "streak": streak,
+            "window": [r["turn"] for r in win], "segments": segs, "installs": any(r["installs"] for r in win),
+            "applies": any(r["applies"] for r in win), "missing": list(missing), "passed": passed,
+            "passed_strict": passed and all(segs.values()) and not strict_issues, "strict_issues": strict_issues,
+            "rounds_sha256": hashlib.sha256(canon.encode("utf-8")).hexdigest()}
 
 
