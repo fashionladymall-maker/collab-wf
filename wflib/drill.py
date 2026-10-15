@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import LOCAL, WF_HOME, WfError, now_iso
-from . import anomaly
+from . import anomaly, review as review_api
 
 KINDS = ("block", "timeout")
 ACTIVE = ("COMPOSE", "SEND", "WAIT_REPLY", "INTAKE", "REVIEW", "APPLY", "EXECUTE", "VERIFY")
@@ -65,6 +65,7 @@ def run(kind: str, base, review: str, review_timeout_s: int = 900, max_wait_s: i
         w.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(ft))} {op} \"$@\"\n", encoding="utf-8")
         w.chmod(0o755)
     host_cfg = anomaly.transport_cfg()
+    verifier_before = review_api._verifier_now()
     transport = {
         "send": str(base / "t-send"), "poll": str(base / "t-poll"), "model": "drill", "timeout_s": 60,
         "review": str(rv), "review_timeout_s": int(review_timeout_s), "env": {"FAKE_DIR": str(fake)},
@@ -154,11 +155,22 @@ def run(kind: str, base, review: str, review_timeout_s: int = 900, max_wait_s: i
     attempt_records = [json.loads(p.read_text(encoding="utf-8")) for p in attempts]
     decision_paths = sorted((ev / "install" / "driver-review").glob("*-decision.json"))
     decisions = [json.loads(p.read_text(encoding="utf-8")).get("decision", {}) for p in decision_paths]
+    verifier_after = review_api._verifier_now()
+    chk("宿主核验器有效且演练期间未改变", not verifier_before.get("why")
+        and verifier_before == verifier_after, {"before": verifier_before, "after": verifier_after})
+    bound = len(attempt_records) == len(decisions) == 1 and all(
+        attempt_records[0].get(key) and attempt_records[0].get(key) == decisions[0].get(key)
+        for key in ("request_id", "content_id", "attempt_id"))
+    chk("决定与实际审查尝试精确绑定", bound, decisions)
     chk("驱动器停在 BLOCKED", state.get("state") == "BLOCKED", state.get("state"))
     chk("真实审查尝试恰好一次", len(attempt_records) == 1, attempt_records)
     chk("安装审查决定拒绝落地", len(decisions) == 1 and decisions[0].get("allowed") is False, decisions)
     if kind == "block":
-        chk("审查程序明确返回 block", len(decisions) == 1 and decisions[0].get("verdict") == "block", decisions)
+        chk("审查程序明确返回且来源核验通过的 block", bound
+            and attempt_records[0].get("state") == "completed"
+            and decisions[0].get("verdict") == "block"
+            and decisions[0].get("provenance", {}).get("level") == "platform_verified"
+            and decisions[0].get("provenance", {}).get("verifier_sha256") == verifier_before.get("sha256"), decisions)
     else:
         chk("真实审查尝试超时", len(attempt_records) == 1 and attempt_records[0].get("state") == "timeout"
             and attempt_records[0].get("runner", {}).get("timed_out") is True, attempt_records)
