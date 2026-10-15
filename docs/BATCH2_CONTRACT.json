@@ -1,0 +1,110 @@
+{
+  "schema": "b2-shared-contract/1",
+  "authority": "Claude MAIN B2-ARCH-FINAL-20261015-1",
+  "required_categories": {
+    "1": [
+      "1-init-files",
+      "1-init-gates-real",
+      "1-empty-guard"
+    ],
+    "2S": [
+      "2S-credential",
+      "2S-widening",
+      "2S-destructive-or-crossproject",
+      "2S-wrong-project",
+      "2S-unverified-install"
+    ],
+    "2R": [
+      "2R-busy",
+      "2R-network",
+      "2R-quota",
+      "2R-send-unknown",
+      "2R-executor-absent"
+    ],
+    "3": [
+      "3-layers"
+    ],
+    "4": [
+      "4-na"
+    ],
+    "5": [
+      "5-binding-impact",
+      "5-window-inputs"
+    ],
+    "6": [
+      "6a-install-review",
+      "6a-live-timing",
+      "6b-task-generation",
+      "6b-interrupted"
+    ]
+  },
+  "provider_api": {
+    "export": "C1_PROVIDERS = {category: fn}",
+    "return": {
+      "category": "required label",
+      "provider": "lane id",
+      "schema": "c1-provider/1",
+      "cases": [
+        {
+          "name": "label",
+          "polarity": "pos|neg",
+          "ran": "bool",
+          "ok": "bool",
+          "detail": "text"
+        }
+      ],
+      "error": "None or diagnostic"
+    },
+    "aggregator": "C sole owner; require actual pos+neg success for each required category; no missing provider counted as pass"
+  },
+  "file_owners": {
+    "A": [
+      "wf.py",
+      "wflib/tasks.py",
+      "wflib/driver.py",
+      "wflib/arbiter.py",
+      "wflib/recovery.py",
+      "wflib/selftest_lane_a.py"
+    ],
+    "B": [
+      "wflib/admin.py",
+      "wflib/policy.py",
+      "wflib/release.py",
+      "wflib/anomaly.py",
+      "wflib/fidelity.py",
+      "wflib/review.py",
+      "wflib/selftest_lane_b.py"
+    ],
+    "C": [
+      "wflib/goals.py",
+      "wflib/live.py",
+      "wflib/ledger.py",
+      "wflib/metrics.py",
+      "wflib/selftest_lane_c.py",
+      "wflib/selftest.py",
+      "wflib/selftest_v15.py",
+      "wflib/selftest_v18.py",
+      "wflib/selftest_driver.py"
+    ]
+  },
+  "frozen": [
+    "wflib/core.py",
+    "wflib/ops.py",
+    "wflib/floor.py",
+    "VERSION"
+  ],
+  "stable_apis": {
+    "default_goals": "default_goals(project, *, today=None)",
+    "metrics": "compute(inst, *, first=None, last=None)"
+  },
+  "protected_install": "host external verifier + platform_verified provenance + independent identity + exact frozen package/base/install-semantics/rules; unknown refuses; fixtures are synthetic",
+  "clarifications": {
+    "generation": "random UUID >=122 random bits acceptable, withdraw unsafe repair from surviving maximum after history pruning; seq corruption must refuse or invalidate all old scope",
+    "adopt": "no default backfill, preserve legacy scope",
+    "queue_share": "unknown absent actual ready/picked protocol, ordinary progress is not T3 pickup",
+    "manual_ready": "default skeleton not permanently excluded; approved exec successes permit acceptance ready; empty exec set never reached"
+  },
+  "status": "design contract; completion requires independent evidence, not this declaration",
+  "source": "DEVELOPMENT.md",
+  "production_changed": false
+}
