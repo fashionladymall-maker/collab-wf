@@ -181,7 +181,8 @@ and one denial reason, e.g. `production_trust_registry_absent`,
 `production_trust_transport_synthetic`,
 `production_trust_history_synthetic`,
 `production_trust_platform_mismatch`, `production_trust_model_mismatch`.
-Reasons are ordered: historical reasons first, then trust reasons, so an
+Reasons are ordered: historical reasons first, then exec-less transaction
+reasons (`install_transaction_time_unknown`), then trust reasons, so an
 explicitly synthetic history still reports `synthetic_install_history`.
 
 The registry is a frozen input of every modern window
@@ -247,20 +248,65 @@ command. A direct `live.check` without structured receipts keeps the
 non-snapshot reporting path; its report is identical because criterion 4 and
 apply attribution do not depend on these unknown rows.
 
-`live._legacy_install` tokenizes with shell operators and recognizes direct
+## Install transactions without exec receipts
+
+An installation attempt can exist only in a target-owned transaction store,
+for example a driver's in-process `release.apply_zip` that writes `prepared`
+and then fails on a real review block, with no exec and no event. Whenever the
+history protocol runs, `_bound_histories` therefore also enumerates both
+stores through the same strict capture/frozen reader: the project's
+`workflow/evidence/install` and the tool's `<tool_root>/local/install`. Every
+`tx-*` or `restore-*` that no provider row references becomes its own row:
+
+- `seq=null`, `reference=null`, diagnostic
+  `install_transaction_without_exec_receipt`, plus a `transaction` object
+  (`install-transaction/1`: store, id, job `install|restore`, sealed record
+  states, `attempt_at`, `attribution`);
+- state `failed` when a `failed`/`partial` record exists, `corrupt` when a
+  `*.json` record is unreadable, not a file, or fails the same `body_sha256`
+  seal check B applies, otherwise `unknown` (a `completed` transaction without
+  a receipt is still unknown; no reference is derived from it);
+- the attempt is attributed by its own start time (`prepared.lock.acquired_at`
+  for `tx-*`, `prepared_at` for `restore-*`) to the round whose first send it
+  follows, rounds running until the next send (`turns.jsonl`, also frozen).
+
+Rows attributed to an evaluated round block authorization through the window
+rule (`install_history:failed|unknown|corrupt`) and count in criterion 4:
+`attempts.unbound_transactions`, `total`, and `failed`/`unknown`, with status
+`attempt_failed` and the transaction ids in the explanation. A transaction
+whose start time is missing or unparsable is `time_unknown` and always blocks
+(`install_transactions.why = ["install_transaction_time_unknown"]`,
+`install-transactions/1`). Transactions before the first round are listed but
+do not block. The tool store is shared by every project on the host, so a tool
+install performed through another project's exec during this window is
+unbound here and blocks this window conservatively. Goals re-evaluate and
+compare `install_transactions` like the other derived facts.
+
+Boundaries: the inventory runs whenever the history protocol runs (structured
+receipts or a classified legacy/inner exec). A window with neither stays
+collection-only with authorization unavailable, and its report does not list
+exec-less transactions. Capture uses the process `WF_HOME` as tool root, so a
+fixture that does not isolate `WF_HOME` sees that host's real tool store.
+
+`live._legacy_install` tokenizes with a quote-aware shell lexer and recognizes direct
 `wf`/`wf.py` invocations (any path, including `python3 '<space path>/wf.py'`),
 leading assignments and `env`/`timeout`/`nohup`/`time`/`nice`/`sudo`/`command`/
 `exec` wrappers, `bash|sh|zsh -c` and `eval` nesting, global `--project`/`--json`
 options and the `apply` (project), `self-update` (tool) and `drill review`
-(`inner_review`, never a tool attempt) entries. A command
+(`inner_review`, never a tool attempt) entries. The lexer keeps quoted text
+(including quoted `;`, `&&`, `|`, `(`) out of operators, treats redirection
+targets, numeric file-descriptor prefixes, comments and here-document bodies
+as non-commands, skips reserved words (`if`/`then`/`do`/`{`/`!` …), splits on
+unquoted newlines, and recursively checks `$(...)` and backquote bodies,
+including those inside double quotes and unquoted here-documents. A command
 that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
 unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
 diagnostic only; no installation reference is derived from a basename or
-command string. Scripts, aliases, functions, variables and backticks are not
-classified; quoted operator characters and comments may conservatively count as
-unknown. Criterion 4 counts tool references and legacy tool entries; the legacy
+command string. Scripts, aliases, functions and variables are not classified. Criterion 4 counts tool references and legacy tool entries; the legacy
 report path reads the parsed first package operand and reports
-`旧版安装命令无法解析（unknown）` when none exists. Project legacy entries are
+`旧版安装命令无法解析（unknown）` when none exists. A missing legacy package or
+review result is frozen as an absent source and reported (`没有记录` /
+`版本包哈希对不上或已不在`) instead of aborting the whole collection. Project legacy entries are
 visible as unknown history rows and block authorization.
 
 Synthetic histories can be complete and historically valid while authorization

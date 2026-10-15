@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import core, goals, live, ops, policy, review
+from . import core, goals, live, ops, policy, release, review
 from . import selftest_c5_integration as integration
 from .selftest import _project_md
 
@@ -241,6 +241,118 @@ class OutputSyntheticTests(MarkedSyntheticTests):
     trust_reason = "production_trust_history_synthetic"
 
 
+def sealed(path, body):
+    """Write a store record exactly as release._record_new seals it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(review._canon(dict(body, body_sha256=release._digest(body))))
+
+
+class TransactionInventoryTests(_Fixture):
+    def blocked_after_prepare(self, inst):
+        """Third real apply_zip(by=driver), no exec: prepared, then a real block."""
+        from unittest.mock import patch
+        package = self.env.pkg("v0.3", {"PROJECT.md": _project_md("v0.3").encode(),
+                                         "CHANGELOG.md": b"# CHANGELOG\n\n## v0.3 - t\n- blocked\n",
+                                         "app.py": b"v0.3"})
+        rid = review.prepare(inst, package, kind="project", author="B")["request_id"]
+        self.assertTrue(review.run(rid)["allowed"])
+        original = release._InstallTx.__init__
+
+        def prepared_then_block(tx, *args, **kwargs):
+            original(tx, *args, **kwargs)
+            self.env.behave(verdict="block")
+            review.run(rid)
+            self.env.behave(verdict="pass")
+
+        with patch.object(release._InstallTx, "__init__", prepared_then_block):
+            with self.assertRaises(core.WfError):
+                release.apply_zip(core.Instance(inst.root), review_id=rid, by="driver")
+
+    def test_execless_failed_transaction_blocks_and_counts(self):
+        inst = self.fixture()
+        self.write_registry(self.registration())
+        seqs = len(live._strict_log(inst.events_path.read_bytes(), inst.events_path))
+        self.assertEqual(self.evaluate(inst)["authorization"], "available")
+        self.blocked_after_prepare(inst)
+        self.assertEqual(len(live._strict_log(inst.events_path.read_bytes(), inst.events_path)), seqs)
+        store = inst.evidence / "install"
+        failed = [p.name for p in store.iterdir() if (p / "failed.json").exists()]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(sorted(x.name for x in (store / failed[0]).glob("*.json")),
+                         ["baseline.json", "failed.json", "prepared.json"])
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        rows = [r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction")]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["seq"], row["turn"], row["reference"], row["state"], row["diagnostics"]),
+                         (None, 1, None, "failed", [live.TRANSACTION_DIAGNOSTIC]))
+        self.assertEqual((row["transaction"]["store"], row["transaction"]["id"], row["transaction"]["attribution"]),
+                         ("project", failed[0], "turn"))
+        self.assertEqual({r["record"]: r["state"] for r in row["transaction"]["records"]},
+                         {"baseline.json": None, "failed.json": "failed", "prepared.json": "prepared"})
+        self.assertEqual((result["authorization"], result["reason"]), ("unavailable", "install_history:failed"))
+        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(criterion["status"], "attempt_failed")
+        self.assertEqual(criterion["attempts"], {"total": 2, "ok": 1, "timeout": 0, "unknown": 0,
+                                                 "unbound_transactions": 1, "failed": 1})
+        self.assertIn(failed[0], criterion["why"])
+        self.assertFalse(result["report"]["summary"]["passed_strict"])
+        from unittest.mock import patch
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")), \
+             patch.object(Path, "resolve", side_effect=AssertionError("replay resolved a path")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertTrue(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        (store / failed[0] / "failed.json").chmod(0o600)
+        (store / failed[0] / "failed.json").write_bytes(b"{}")
+        self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        self.assertEqual(self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"][-1]["state"], "corrupt")
+
+    def test_store_records_attribution_restore_and_corrupt(self):
+        inst = self.fixture()
+        self.write_registry(self.registration())
+        tool_store = self.env.tool / "local" / "install"
+        self.assertTrue(tool_store.is_dir())
+        # Time unknown (no prepared record): blocks even outside any round.
+        lost = tool_store / ("tx-" + "a" * 32)
+        sealed(lost / "failed.json", {"schema": "install_tx/1", "state": "failed", "tx_id": lost.name})
+        result = self.evaluate(inst)
+        row = next(r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction"))
+        self.assertEqual((row["turn"], row["state"], row["transaction"]["attribution"]), (None, "failed", "time_unknown"))
+        self.assertTrue(result["history_authorization"]["eligible"])
+        self.assertEqual(result["install_transactions"]["why"], ["install_transaction_time_unknown"])
+        self.assertEqual(result["reason"], "install_transaction_time_unknown")
+        for path in sorted(lost.iterdir()):
+            path.unlink()
+        lost.rmdir()
+        # Before the first round: listed, not blocking.
+        old = tool_store / ("tx-" + "b" * 32)
+        sealed(old / "prepared.json", {"schema": "install_tx/1", "state": "prepared", "tx_id": old.name,
+                                       "lock": {"acquired_at": "2020-01-01T00:00:00+00:00"}})
+        result = self.evaluate(inst)
+        row = next(r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction"))
+        self.assertEqual((row["turn"], row["state"], row["transaction"]["attribution"]),
+                         (None, "unknown", "before_first_turn"))
+        self.assertEqual(result["authorization"], "available")
+        # A restore job inside the round is an unbound target mutation.
+        restore = inst.evidence / "install" / ("restore-" + "c" * 32)
+        sealed(restore / "prepared.json", {"schema": "install_restore/1", "state": "prepared",
+                                           "restore_id": restore.name, "prepared_at": core.now().isoformat()})
+        result = self.evaluate(inst)
+        row = next(r for r in result["window_inputs"]["review_inputs"]["entries"]
+                   if (r.get("transaction") or {}).get("id") == restore.name)
+        self.assertEqual((row["turn"], row["state"], row["transaction"]["job"]), (1, "unknown", "restore"))
+        self.assertEqual((result["authorization"], result["reason"]), ("unavailable", "install_history:unknown"))
+        # An unsealed record is corrupt, never a bound or successful attempt.
+        bad = inst.evidence / "install" / ("tx-" + "d" * 32)
+        bad.mkdir()
+        (bad / "prepared.json").write_text(json.dumps({"state": "completed"}))
+        rows = {r["transaction"]["id"]: r for r in self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"]
+                if r.get("transaction")}
+        self.assertEqual((rows[bad.name]["state"], rows[bad.name]["diagnostics"]),
+                         ("corrupt", [live.TRANSACTION_DIAGNOSTIC, "transaction_record_corrupt:prepared.json"]))
+
+
 def live_history_reader(inst):
     """Strict capture reader over current disk, as live._capture_inputs builds it."""
     from .live_history import CaptureReader
@@ -338,6 +450,28 @@ class LegacyEntryTests(_Fixture):
         self.assertEqual(live._evaluate_snapshot(snap)["window_inputs"]["review_inputs"],
                          result["window_inputs"]["review_inputs"])
 
+    def test_real_drill_review_parent_exec_is_unknown(self):
+        """CT3: the actual wf.py drill review, outer exit 0, no parent entry before."""
+        inst = self.fixture()
+        wf_py = Path(live.__file__).resolve().parent.parent / "wf.py"
+        seqs = {}
+        for kind in ("block", "timeout"):
+            command = shlex.join([sys.executable, str(wf_py), "drill", "review", "--kind", kind,
+                                  "--dir", str(self.base / f"real drill {kind}"), "--review", str(self.env.runner),
+                                  "--review-timeout-s", "3"]) + " || true"
+            self.assertEqual(ops.run_exec(inst, command, by="driver", timeout=240), 0)
+            event = live._strict_log(inst.events_path.read_bytes(), inst.events_path)[-1]
+            self.assertEqual(event["install_refs"], [])
+            self.assertTrue((self.base / f"real drill {kind}" / "drill-result.json").exists())
+            seqs[kind] = event["seq"]
+        result = self.evaluate(inst)
+        rows = {r["seq"]: r for r in result["window_inputs"]["review_inputs"]["entries"]}
+        for kind, seq in seqs.items():
+            self.assertEqual((rows[seq]["state"], rows[seq]["reference"], rows[seq]["diagnostics"],
+                              rows[seq]["legacy_command"]["kind"]),
+                             ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review"), kind)
+        self.assertIn("install_history:unknown", result["history_authorization"]["why"])
+
     def legacy_only_fixture(self):
         """Same live window as the C5 fixture but with no structured receipt."""
         from datetime import timedelta
@@ -356,6 +490,7 @@ class LegacyEntryTests(_Fixture):
             "drill": shlex.join([sys.executable, "/space path/wf.py", "drill", "review", "--kind", "block",
                                  "--dir", "/d", "--review", "/r"]),
             "echo": "echo 'wf self-update legacy.zip'",
+            "tool_absent": "wf self-update --auto workflow/outbox/missing.zip",
         }
         for name, command in legacy.items():
             inst.event("exec", cid=f"c{len(name):02d}", cmd=command, exit_code=1 if name == "tool_failed" else 0,
@@ -399,9 +534,17 @@ class LegacyEntryTests(_Fixture):
                           for name, seq in seqs.items() if name != "echo"},
                          {"project": ("unknown", None, ["legacy_install_reference_unavailable"], "project"),
                           "tool_failed": ("unknown", None, ["legacy_install_reference_unavailable"], "tool"),
-                          "drill": ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review")})
+                          "drill": ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review"),
+                          "tool_absent": ("unknown", None, ["legacy_install_reference_unavailable"], "tool")})
         self.assertNotIn(seqs["echo"], rows)
+        # An exit-0 legacy self-update whose package is gone is frozen as
+        # absence and reported, instead of aborting the whole collection.
+        absent = {s["path"]: s["state"] for s in descriptor["sources"]}
+        self.assertEqual(absent[str(inst.root / "workflow/outbox/missing.zip")], "absent")
         result = live._evaluate_snapshot(snap)
+        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertFalse(criterion["ok"])
+        self.assertIn("没有记录", criterion["why"])
         self.assertIn("install_history:unknown", result["history_authorization"]["why"])
         self.assertEqual(result["authorization"], "unavailable")
         # Capture and replay share the source: frozen replay rebuilds the same
@@ -417,7 +560,8 @@ class LegacyEntryTests(_Fixture):
         self.assertIn("install_history:unknown", verified["why"])
 
     def test_pre_receipt_events_and_classifier(self):
-        reader = SimpleNamespace(bytes=lambda path: None)
+        reader = SimpleNamespace(bytes=lambda path: None,
+                                 directory=lambda path: {"state": "absent", "members": []})
         inst = SimpleNamespace(name="p", root=Path("/p"), evidence=Path("/p/workflow/evidence"))
         events = [
             {"type": "exec", "seq": 1, "turn": 1, "cmd": "wf apply legacy.zip", "exit_code": 0},
@@ -451,13 +595,25 @@ class LegacyEntryTests(_Fixture):
             "cd /x && python3 '/a b/wf.py' drill --kind timeout review --dir /d --review /r": ("inner_review", None),
             "wf apply x.zip && wf drill review --kind block --dir /d --review /r": ("inner_review", None),
             "wf apply x.zip; wf self-update y.zip": ("project", "x.zip"),
+            'echo "$(wf apply sub.zip)"': ("project", "sub.zip"),
+            "echo `wf self-update tick.zip`": ("tool", "tick.zip"),
+            "if true; then wf apply cond.zip; fi": ("project", "cond.zip"),
+            "{ wf apply group.zip; }": ("project", "group.zip"),
+            "2>/dev/null wf apply fd.zip": ("project", "fd.zip"),
+            "wf apply r.zip > log 2>&1": ("project", "r.zip"),
+            "cat <<EOF\n$(wf apply here.zip)\nEOF": ("project", "here.zip"),
+            "echo x # note\nwf apply after.zip": ("project", "after.zip"),
         }
         for command, (kind, argument) in positives.items():
             got = live._legacy_install(command)
             self.assertEqual((got["kind"], got["argument"], got["parsed"]), (kind, argument, True), command)
         for command in ("echo 'wf apply x.zip'", "grep 'wf self-update' log", "python3 -c 'print(1)'",
                         "python3 wf.py selftest", "wf status", "make apply", "exit 124", "echo 'oops",
-                        "echo 'wf drill review'", "wf drill", "wf drill other --kind block"):
+                        "echo 'wf drill review'", "wf drill", "wf drill other --kind block",
+                        "echo ';' wf apply x.zip", "echo '&&' wf self-update y.zip", "printf '%s\\n' '|' wf apply x",
+                        "echo hi > wf apply x.zip", "make # wf apply x.zip", "cat <<'EOF'\nwf apply x.zip\nEOF",
+                        "cat <<EOF\nwf apply x.zip\nEOF", 'echo "a; wf apply x.zip"', "echo a\\;wf apply x",
+                        "cat <<< wf apply x"):
             self.assertIsNone(live._legacy_install(command), command)
         unparsable = live._legacy_install("wf apply 'x.zip")
         self.assertEqual((unparsable["parsed"], unparsable["kind"], unparsable["argument"]), (False, None, None))
