@@ -717,7 +717,7 @@ def _t_arbiter(_ok):
     with tempfile.TemporaryDirectory() as td:
         a, b, c = (_inst(td, f"v188-{x}", {"state": "SEND", "turn": 1}) for x in "abc")
         g1, g2, g3 = arbiter.acquire(a, 1), arbiter.acquire(b, 1), arbiter.acquire(c, 1)
-        arbiter.release(a, "测试")
+        arbiter.release(a, "测试", lease_id=g1["lease_id"], turn=1)   # IC-3（B1-A 契约）：释放新授予必须带本次 lease_id 与轮号
         g4, g5 = arbiter.acquire(c, 1), arbiter.acquire(b, 1)
         bb = Instance(b.root)
         bb.state["state"] = "IDLE"
@@ -742,6 +742,32 @@ def _t_arbiter(_ok):
     _ok("1.8.8 共享仲裁（S4）：同一账号的发送槽先到先得；释放后队首先拿到，后来的不能插队；持有方已不在发送或等回复时被回收；"
         "wait、grant、release、reclaim 都留痕；槽被占用时 h_send 不调用适配器",
         ok, json.dumps([g1, g2, g3, g4, g5, g6, r, calls], ensure_ascii=False)[:800])
+    # IC-3：显式的旧记录夹具（升级前写下的、没有 lease_id 的持有记录）。不带 token 的旧式调用只能释放这种旧记录；
+    # 遇到带 lease_id 的新记录必须拒绝、记录保持不变；带上实际 token 才能释放新记录。
+    for n in ("arbiter.json", "arbiter.jsonl"):
+        if (shared / n).exists():
+            (shared / n).unlink()
+    with tempfile.TemporaryDirectory() as td:
+        e = _inst(td, "v188-e", {"state": "SEND", "turn": 3})
+        f2 = _inst(td, "v188-f", {"state": "SEND", "turn": 1})
+        shared.mkdir(parents=True, exist_ok=True)
+        legacy = {"project": e.name, "turn": 3, "root": str(e.root), "since": "2026-10-14T00:00:00+00:00"}
+        (shared / "arbiter.json").write_text(json.dumps({"holders": [legacy], "queue": []}, ensure_ascii=False), encoding="utf-8")
+        r_legacy = arbiter.release(e, "测试：旧记录")
+        held_after_legacy = [h.get("project") for h in json.loads((shared / "arbiter.json").read_text(encoding="utf-8"))["holders"]]
+        gf = arbiter.acquire(f2, 1)
+        r_notoken = arbiter.release(f2, "测试：旧式调用遇到新记录")
+        hs = json.loads((shared / "arbiter.json").read_text(encoding="utf-8"))["holders"]
+        still = [h for h in hs if h.get("project") == f2.name and h.get("lease_id") == gf.get("lease_id")]
+        r_token = arbiter.release(f2, "测试：带 token", lease_id=gf.get("lease_id"), turn=1)
+        after = [h for h in json.loads((shared / "arbiter.json").read_text(encoding="utf-8"))["holders"] if h.get("project") == f2.name]
+    _ok("IC-3 共享仲裁旧记录：不带 token 的旧式释放只能释放没有 lease_id 的旧记录",
+        isinstance(r_legacy, dict) and r_legacy.get("released") is True and e.name not in held_after_legacy,
+        json.dumps([r_legacy, held_after_legacy], ensure_ascii=False)[:600])
+    _ok("IC-3 共享仲裁新记录：不带 token 的旧式释放遇到带 lease_id 的新授予被拒绝、记录保持不变；带实际 token 才释放",
+        gf.get("granted") is True and bool(gf.get("lease_id")) and isinstance(r_notoken, dict) and r_notoken.get("released") is False
+        and len(still) == 1 and isinstance(r_token, dict) and r_token.get("released") is True and not after,
+        json.dumps([gf, r_notoken, still, r_token, after], ensure_ascii=False)[:800])
 
 
 def _t_review_gate(_ok):
