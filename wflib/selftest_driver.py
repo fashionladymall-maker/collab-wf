@@ -45,6 +45,27 @@ def _reply(cmds, checklist, directives, effort="medium"):
             f"【需要用户决定】\n无\n\n【下一轮建议档位】{effort}\n\n【驱动指令】\n{directives}\n")
 
 
+def _drill_requires_verifier(tmp, env, _wf, _ok, runners):
+    """真实 CLI：缺少宿主核验器时，block/timeout 拒绝不能冒充演练通过。"""
+    transport = Path(env["WF_LOCAL_DIR"]) / "transport.json"
+    saved = transport.read_bytes()
+    cfg = json.loads(saved)
+    cfg.pop("review_verifier", None)
+    transport.write_text(json.dumps(cfg), encoding="utf-8")
+    try:
+        for kind, runner in runners:
+            base = tmp / f"drill-no-verifier-{kind}"
+            rc, output = _wf(env, tmp, "drill", "review", "--kind", kind, "--dir", str(base),
+                             "--review", str(runner), "--review-timeout-s", "2")
+            result_path = base / "drill-result.json"
+            result = json.loads(result_path.read_text()) if result_path.exists() else {}
+            started = list((base / "project/workflow/evidence/install").glob("tx-*/started.json"))
+            _ok(f"演练 {kind}：缺少宿主核验器时拒绝，不把 BLOCKED 记为演练通过",
+                rc != 0 and result.get("ok") is not True and not started, output[-800:])
+    finally:
+        transport.write_bytes(saved)
+
+
 def run(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     print("  —— 驱动器 ——", flush=True)
     from .selftest_driver_review import run as run_review_consumer
@@ -802,6 +823,7 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
         rct == 0 and rest.get("ok") and rest.get("state") == "BLOCKED"
         and len(at) == len(dt) == 1 and at[0].get("state") == "timeout"
         and at[0].get("runner", {}).get("timed_out") and not dt[0].get("allowed") and unchanged_t, ot[-800:])
+    _drill_requires_verifier(tmp, env, _wf, _ok, (("block", rvb), ("timeout", rvt)))
     rcx, ox = _wf(env, tmp, "drill", "review", "--kind", "block", "--dir", str(tmp / "drill-b"), "--review", str(rvb))
     _ok("1.6.8 演练目录不空时拒绝运行（不覆盖、不删除已有证据）", rcx != 0 and "必须不存在或为空" in ox, ox[-300:])
 
