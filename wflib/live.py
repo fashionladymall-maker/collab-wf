@@ -94,43 +94,484 @@ INNER_REVIEW_DIAGNOSTIC = "inner_review_child_project_not_bound"
 INNER_REVIEW_RECEIPT_DIAGNOSTIC = "inner_review_receipt_not_grafted"
 
 
-def _legacy_install(cmd, _depth=0):
-    """Classify a shell command as a direct legacy ``wf apply``/``wf self-update``.
+_SHELL_SEPARATORS = {";", "&", "&&", "|", "||", "|&", ";;", "(", ")"}
+_SHELL_REDIRECTS = {"<", ">", ">>", "<<", "<<-", "<<<", "<&", ">&", "&>", "&>>", ">|", "<>"}
+_SHELL_OPERATORS = ("<<<", "<<-", "&>>", ";;", "&&", "||", "|&", ">>", "<<", "<&", ">&", "&>", ">|", "<>",
+                    ";", "&", "|", "(", ")", "<", ">")
+_SHELL_RESERVED = {"{", "}", "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"}
 
-    Returns ``None`` for ordinary commands, else ``{schema, entry, kind, parsed,
-    argument}``. ``argument`` is only the first positional package operand used
-    by the legacy report path; it is never an installation reference and never
-    authorizes anything. Commands that mention a wf entry point but cannot be
-    tokenized are returned with ``parsed=False`` and ``kind=None`` (explicitly
-    unknown). Indirection through scripts, aliases, functions or variables is
-    outside this reporting classifier.
+
+def _substitution_body(text, start, opener):
+    """Body of ``$(...)`` (start after ``$(``) or a backquote (start after it)."""
+    if opener == "`":
+        body, j = [], start
+        while j < len(text):
+            if text[j] == "\\" and j + 1 < len(text):
+                body.append(text[j + 1])
+                j += 2
+                continue
+            if text[j] == "`":
+                return "".join(body), j + 1
+            body.append(text[j])
+            j += 1
+        raise ValueError("unterminated backquote")
+    depth, j, quote = 1, start, None
+    while j < len(text):
+        c = text[j]
+        if quote == "'":
+            quote = None if c == "'" else quote
+        elif quote == '"':
+            if c == "\\":
+                j += 1
+            elif c == '"':
+                quote = None
+        elif c == "\\":
+            j += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:j], j + 1
+        j += 1
+    raise ValueError("unterminated command substitution")
+
+
+def _body_substitutions(text):
+    out, i = [], 0
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+        elif text.startswith("$(", i):
+            body, i = _substitution_body(text, i + 2, "(")
+            out.append(body)
+        elif text[i] == "`":
+            body, i = _substitution_body(text, i + 1, "`")
+            out.append(body)
+        else:
+            i += 1
+    return out
+
+
+def _shell_tokens(cmd):
+    """Minimal quote-aware POSIX shell lexer for classification only.
+
+    Returns ``("word", text, substitutions)``, ``("op", separator)`` and
+    ``("subs", bodies)`` tokens. Quoted text never becomes an operator;
+    comments, redirection targets, file-descriptor prefixes and here-document
+    bodies are not words; ``$(...)`` and backquote bodies (also inside double
+    quotes and unquoted here-documents) stay attached to the word or command
+    that would run them. Raises ValueError for unterminated constructs.
+    """
+    tokens, heredocs = [], []
+    word, in_word, quoted, subs = [], False, False, []
+    redirect_target, delimiter = False, None
+    i, n = 0, len(cmd)
+
+    def end_word():
+        nonlocal word, in_word, quoted, subs, redirect_target, delimiter
+        if not in_word:
+            return
+        text = "".join(word)
+        if delimiter is not None:
+            heredocs.append((text, delimiter, quoted))
+            delimiter = None
+        elif redirect_target:
+            redirect_target = False
+            if subs:
+                tokens.append(("subs", subs))
+        else:
+            tokens.append(("word", text, subs))
+        word, in_word, quoted, subs = [], False, False, []
+
+    while i < n:
+        c = cmd[i]
+        if c in " \t\r":
+            end_word()
+            i += 1
+        elif c == "\n":
+            end_word()
+            tokens.append(("op", "\n"))
+            i += 1
+            bodies = []
+            for delim, strip_tabs, was_quoted in heredocs:
+                body = []
+                while i < n:
+                    j = cmd.find("\n", i)
+                    line, i = (cmd[i:], n) if j < 0 else (cmd[i:j], j + 1)
+                    if (line.lstrip("\t") if strip_tabs else line) == delim:
+                        break
+                    body.append(line)
+                if not was_quoted:
+                    bodies.extend(_body_substitutions("\n".join(body)))
+            heredocs.clear()
+            if bodies:
+                tokens.insert(len(tokens) - 1, ("subs", bodies))
+        elif c == "#" and not in_word:
+            j = cmd.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "\\":
+            if i + 1 < n and cmd[i + 1] != "\n":
+                word.append(cmd[i + 1])
+                in_word = True
+            i += 2
+        elif c == "'" or (c == "$" and cmd.startswith("$'", i)):
+            j = i + (2 if c == "$" else 1)
+            buf = []
+            while j < n and cmd[j] != "'":
+                if c == "$" and cmd[j] == "\\" and j + 1 < n:
+                    buf.append(cmd[j + 1])
+                    j += 2
+                    continue
+                buf.append(cmd[j])
+                j += 1
+            if j >= n:
+                raise ValueError("unterminated single quote")
+            word.append("".join(buf))
+            in_word = quoted = True
+            i = j + 1
+        elif c == '"':
+            j, buf = i + 1, []
+            while True:
+                if j >= n:
+                    raise ValueError("unterminated double quote")
+                d = cmd[j]
+                if d == "\\" and j + 1 < n and cmd[j + 1] in '"\\$`\n':
+                    if cmd[j + 1] != "\n":
+                        buf.append(cmd[j + 1])
+                    j += 2
+                elif d == '"':
+                    break
+                elif cmd.startswith("$(", j) or d == "`":
+                    body, after = _substitution_body(cmd, j + 2, "(") if d == "$" else _substitution_body(cmd, j + 1, "`")
+                    subs.append(body)
+                    buf.append(cmd[j:after])
+                    j = after
+                else:
+                    buf.append(d)
+                    j += 1
+            word.append("".join(buf))
+            in_word = quoted = True
+            i = j + 1
+        elif cmd.startswith("$(", i) or c == "`":
+            body, after = _substitution_body(cmd, i + 2, "(") if c == "$" else _substitution_body(cmd, i + 1, "`")
+            subs.append(body)
+            word.append(cmd[i:after])
+            in_word = True
+            i = after
+        elif c in ";&|()<>":
+            op = next(o for o in _SHELL_OPERATORS if cmd.startswith(o, i))
+            i += len(op)
+            if op in _SHELL_REDIRECTS:
+                if in_word and not quoted and not subs and "".join(word).isdigit():
+                    word, in_word = [], False   # file-descriptor prefix such as 2>
+                else:
+                    end_word()
+                if op in ("<<", "<<-"):
+                    delimiter = op == "<<-"
+                else:
+                    redirect_target = True
+            else:
+                end_word()
+                tokens.append(("op", op))
+        else:
+            word.append(c)
+            in_word = True
+            i += 1
+    end_word()
+    return tokens
+
+
+def _function_body(tokens, j):
+    """Tokens of a ``{ ...; }`` or ``( ... )`` function body starting at j."""
+    if j < len(tokens) and tokens[j][0] == "word" and tokens[j][1] == "{":
+        depth, k = 1, j + 1
+        while k < len(tokens):
+            token = tokens[k]
+            at_command = k == j + 1 or tokens[k - 1][0] == "op"
+            if token[0] == "word" and at_command and token[1] in ("{", "}"):
+                depth += 1 if token[1] == "{" else -1
+                if depth == 0:
+                    return tokens[j + 1:k], k + 1, False
+            k += 1
+        raise ValueError("unterminated function body")
+    if j < len(tokens) and tokens[j] == ("op", "("):
+        depth, k = 1, j + 1
+        while k < len(tokens):
+            if tokens[k] in (("op", "("), ("op", ")")):
+                depth += 1 if tokens[k][1] == "(" else -1
+                if depth == 0:
+                    return tokens[j + 1:k], k + 1, True   # name() ( ... ) runs in a subshell
+            k += 1
+        raise ValueError("unterminated function body")
+    raise ValueError("unsupported function body")
+
+
+_COMPOUND_CLOSERS = {"{": "}", "if": "fi", "case": "esac", "for": "done", "while": "done", "until": "done",
+                     "select": "done"}
+_COMMAND_PREFIXES = {"!", "then", "do", "else", "elif", "time"}
+
+
+def _at_command(argv, subs):
+    """True when the next word starts a command (only prefix keywords so far)."""
+    if subs:
+        return False
+    k = 0
+    while k < len(argv):
+        if argv[k] == "time":
+            k += 1
+            while k < len(argv) and argv[k].startswith("-"):
+                k += 1
+        elif argv[k] in _COMMAND_PREFIXES:
+            k += 1
+        else:
+            return False
+    return True
+
+
+def _compound_end(tokens, i):
+    """Index of the closer matching the compound opener at i (nesting aware)."""
+    stack, k = [_COMPOUND_CLOSERS[tokens[i][1]]], i + 1
+    while k < len(tokens):
+        token = tokens[k]
+        previous = tokens[k - 1]
+        at_command = k == i + 1 or previous[0] == "op" \
+            or (previous[0] == "word" and previous[1] in _COMMAND_PREFIXES)
+        if token[0] == "word" and at_command:
+            if token[1] == stack[-1]:
+                stack.pop()
+                if not stack:
+                    return k
+            elif token[1] in _COMPOUND_CLOSERS:
+                stack.append(_COMPOUND_CLOSERS[token[1]])
+        k += 1
+    raise ValueError("unterminated compound command")
+
+
+def _scan_top(tokens):
+    """``(index, token, at_command)`` for tokens outside nested compounds and ``( )`` groups."""
+    out, k, n = [], 0, len(tokens)
+    while k < n:
+        token = tokens[k]
+        previous = tokens[k - 1] if k else None
+        at_command = k == 0 or previous[0] == "op" or (previous[0] == "word" and previous[1] in _COMMAND_PREFIXES)
+        if token[0] == "word" and at_command and token[1] in _COMPOUND_CLOSERS:
+            k = _compound_end(tokens, k) + 1
+            continue
+        if token == ("op", "("):
+            depth, k = 1, k + 1
+            while k < n and depth:
+                depth += 1 if tokens[k] == ("op", "(") else -1 if tokens[k] == ("op", ")") else 0
+                k += 1
+            if depth:
+                raise ValueError("unbalanced parenthesis")
+            continue
+        out.append((k, token, at_command))
+        k += 1
+    return out
+
+
+def _if_branches(tokens):
+    """Alternatives of ``if c0; then b0; [elif ci; then bi;]... [else be;]``: each runs c0..ci then bi."""
+    marks = [(k, t[1]) for k, t, at in _scan_top(tokens) if at and t[0] == "word" and t[1] in ("then", "elif", "else")]
+    words = [w for _, w in marks]
+    shape = ["then"] + ["elif", "then"] * ((len(words) - 1) // 2)
+    if words not in (shape, shape + ["else"]) or not words:
+        return None
+    conds, bodies, otherwise = [tokens[:marks[0][0]]], [], None
+    for i, (k, word) in enumerate(marks):
+        part = tokens[k + 1:marks[i + 1][0] if i + 1 < len(marks) else len(tokens)]
+        if word == "then":
+            bodies.append(part)
+        elif word == "elif":
+            conds.append(part)
+        else:
+            otherwise = part
+    branches = [conds[:i + 1] + [body] for i, body in enumerate(bodies)]
+    branches.append(conds + ([otherwise] if otherwise is not None else []))   # no branch taken / else
+    return branches
+
+
+def _is_word(token, text):
+    return token[0] == "word" and token[1] == text
+
+
+def _case_branches(tokens):
+    """Alternatives of ``case w in p) list ;; ... esac``: each clause list, plus no match. The lexer does not
+    keep quoting, so a ``*`` pattern cannot be told from a quoted ``'*'``: the no-match alternative is always
+    kept (may over-report, never hides). Fall-through (``;&``, ``;;&``) and substitutions in patterns are not
+    modelled (None: every inner item is then only possible)."""
+    n, k = len(tokens), 0
+    while k < n and not _is_word(tokens[k], "in"):
+        k += 1
+    if k == n:
+        return None
+    subject, k, clauses = tokens[:k], k + 1, []
+    while k < n:
+        while k < n and tokens[k] == ("op", "\n"):
+            k += 1
+        if k == n:
+            break
+        if tokens[k] == ("op", "("):
+            k += 1
+        while k < n and tokens[k] != ("op", ")"):
+            if not (tokens[k][0] == "word" and not tokens[k][2]) and tokens[k] != ("op", "|"):
+                return None
+            k += 1
+        if k == n:
+            return None
+        start, end = k + 1, None
+        for j, token, _ in _scan_top(tokens[start:]):
+            if token == ("op", ";;"):
+                end = start + j
+                break
+        end = n if end is None else end
+        if end + 1 < n and tokens[end + 1] == ("op", "&") \
+                or any(tokens[j] == ("op", ";") and tokens[j + 1] == ("op", "&") for j in range(start, end - 1)):
+            return None
+        clauses.append(tokens[start:end])
+        k = end + 1
+    return [[subject, clause] for clause in clauses] + [[subject]]
+
+
+def _compound_structure(kind, tokens):
+    """Branch/loop structure of a keyword compound (parsed items), or None when not recognised."""
+    if kind == "if":
+        branches = _if_branches(tokens)
+    elif kind == "case":
+        branches = _case_branches(tokens)
+    elif kind in ("for", "while", "until", "select"):
+        marks = [k for k, t, at in _scan_top(tokens) if at and _is_word(t, "do")]
+        if not marks:
+            return None
+        return {"loop": (_parse_items(tokens[:marks[0]])[0], _parse_items(tokens[marks[0] + 1:])[0])}
+    else:
+        return None
+    if branches is None:
+        return None
+    return {"branches": [[_parse_items(part)[0] for part in branch] for branch in branches]}
+
+
+_LEGACY_MAX_DEPTH = 6
+
+
+def _parse_items(tokens, i=0, nested=False):
+    """Items of one shell list: ``("seg", argv, subs, isolated, conditional)``,
+    ``("def", name, body_items, redirect_subs, subshell_body, isolated,
+    conditional)``, ``("group", items, redirect_subs, kind, structure, isolated,
+    conditional)`` for compound commands (``{ }``, ``if``, ``case``, loops) and
+    ``("sub", items)`` for ``( ... )``. ``isolated`` marks pipeline members and
+    background jobs, which run in a subshell with everything inside them;
+    ``conditional`` marks items after ``&&``/``||``. ``structure`` holds the
+    branch alternatives (``if``/``case``) or header/body (loops) of a keyword
+    compound, or None.
     """
     import re
-    import shlex
-    if not isinstance(cmd, str) or not cmd.strip() or _depth > 3:
-        return None
-    try:
-        lexer = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>\n")
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        lexer.commenters = ""   # conservative: a comment never hides an invocation
-        tokens = list(lexer)
-    except ValueError:
-        mentions = re.search(r"(?:^|[\s/'\"`;&|(])wf(?:\.py)?(?=['\"\s`]|$)", cmd) \
-            and re.search(r"(?<![\w-])(?:apply|self-update)(?![\w-])", cmd)
-        return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False,
-                "argument": None} if mentions else None
-    segments, current = [], []
-    for token in tokens:
-        if token and all(ch in ";&|()<>\n" for ch in token):
-            segments.append(current)
-            current = []
-        else:
-            current.append(token)
-    segments.append(current)
+    items, seps, argv, subs = [], [], [], []
+    n = len(tokens)
+
+    def flush():
+        nonlocal argv, subs
+        if argv or subs:
+            items.append(["seg", argv, subs])
+            seps.append(None)
+        argv, subs = [], []
+
+    def finish():
+        out = []
+        for k, item in enumerate(items):
+            # Every pipeline member and background job runs in a subshell; the
+            # flag applies to the whole item (segment, group or definition).
+            isolated = seps[k] in ("|", "|&", "&") or (k > 0 and seps[k - 1] in ("|", "|&"))
+            conditional = k > 0 and seps[k - 1] in ("&&", "||")
+            if item[0] == "sub":
+                out.append(("sub", item[1]))
+            elif item[0] == "group":
+                out.append(("group", item[1], item[2], item[3], item[4], isolated, conditional))
+            else:
+                out.append(tuple(item) + (isolated, conditional))
+        return out
+
+    def trailing_subs(j):
+        found = []
+        while j < n and tokens[j][0] == "subs":
+            found.extend(tokens[j][1])
+            j += 1
+        return found, j
+
+    while i < n:
+        token = tokens[i]
+        if token[0] == "op":
+            op = token[1]
+            if op == "(" and not argv and not subs:
+                inner, i = _parse_items(tokens, i + 1, nested=True)
+                items.append(["sub", inner])
+                seps.append(None)
+                continue
+            flush()
+            i += 1
+            if op == ")" and nested:
+                return finish(), i
+            if seps and seps[-1] is None and op not in ("(", ")"):
+                seps[-1] = op
+            continue
+        if token[0] == "subs":
+            subs = subs + list(token[1])
+            i += 1
+            continue
+        if token[1] in _COMPOUND_CLOSERS and _at_command(argv, subs):
+            # A compound command is one item: its own separators decide whether
+            # it runs in the current shell or in a subshell.
+            flush()
+            opener = i
+            end = _compound_end(tokens, opener)
+            redirect, i = trailing_subs(end + 1)
+            kind, inner = tokens[opener][1], tokens[opener + 1:end]
+            structure = None if kind == "{" else _compound_structure(kind, inner)
+            items.append(["group", _parse_items(inner)[0], redirect, kind, structure])
+            seps.append(None)
+            continue
+        if _at_command(argv, subs):
+            name, j = None, None
+            if i + 2 < n and tokens[i + 1] == ("op", "(") and tokens[i + 2] == ("op", ")") \
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", token[1]) and token[1] not in _SHELL_RESERVED:
+                name, j = token[1], i + 3
+            elif token[1] == "function" and i + 1 < n and tokens[i + 1][0] == "word":
+                name, j = tokens[i + 1][1], i + 2
+                if j + 1 < n and tokens[j] == ("op", "(") and tokens[j + 1] == ("op", ")"):
+                    j += 2
+            if name is not None:
+                flush()   # prefix keywords such as ``then`` are not part of it
+                while j < n and tokens[j] == ("op", "\n"):
+                    j += 1
+                body, i, subshell = _function_body(tokens, j)
+                # Redirections after the body (and their substitutions) belong
+                # to the definition and run only when the function is invoked.
+                redirect, i = trailing_subs(i)
+                items.append(["def", name, _parse_items(body)[0], redirect, subshell])
+                seps.append(None)
+                continue
+        argv.append(token[1])
+        subs = subs + list(token[2])
+        i += 1
+    flush()
+    return finish(), i
+
+
+def _shell_items(tokens):
+    return _parse_items(tokens)[0]
+
+
+def _unknown_legacy():
+    return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False, "argument": None}
+
+
+def _pick_legacy(hits):
     # Precedence: an inner review anywhere wins (its child references must never
     # reach the provider), then the first parsed install entry, then unknown.
-    hits = [hit for hit in (_legacy_simple(argv, _depth) for argv in segments) if hit is not None]
+    hits = [hit for hit in hits if hit is not None]
     for wanted in (lambda h: h["kind"] == "inner_review", lambda h: h["kind"] is not None, lambda h: True):
         found = next((hit for hit in hits if wanted(hit)), None)
         if found is not None:
@@ -138,17 +579,209 @@ def _legacy_install(cmd, _depth=0):
     return None
 
 
-def _legacy_simple(argv, depth):
+def _env_copy(env):
+    return dict(env)
+
+
+def _run_maybe(env, run):
+    """Run on a trial copy; merge every changed name back as a possibility."""
+    trial = _env_copy(env)
+    hits = run(trial)
+    for name, entry in trial.items():
+        if env.get(name) != entry:
+            before = env.get(name) or {"defs": [], "external": True}
+            env[name] = {"defs": before["defs"] + [d for d in entry["defs"] if d not in before["defs"]],
+                         "external": before["external"] or entry["external"]}
+    return hits
+
+
+def _merge_outcomes(env, outcomes):
+    """Merge the function tables of alternative executions into ``env``: a name defined identically in every
+    alternative stays definite; otherwise every definition is a possibility, plus the external command when
+    some alternative leaves the name undefined (or itself only possibly defined)."""
+    for name in set().union(*outcomes):
+        entries = [o.get(name) for o in outcomes]
+        if entries[0] is not None and all(e == entries[0] for e in entries):
+            env[name] = entries[0]
+            continue
+        defs, external = [], False
+        for entry in entries:
+            if entry is None:
+                external = True
+                continue
+            defs += [d for d in entry["defs"] if d not in defs]
+            external = external or entry["external"]
+        env[name] = {"defs": defs, "external": external}
+
+
+_LOOP_PASSES = 6
+
+
+def _classify_structure(structure, depth, env):
+    """Hits of a keyword compound whose conditions are not evaluated. ``if``/``case`` branches are alternatives,
+    each run in order on its own copy; a loop is the union of 0, 1, 2, ... iterations up to a fixpoint (so a
+    definition made in one iteration reaches calls in the next). The outcomes are merged into ``env``."""
+    hits, outcomes = [], []
+    if "branches" in structure:
+        for branch in structure["branches"]:
+            trial = _env_copy(env)
+            for items in branch:
+                hits.extend(_classify_items(items, depth, trial))
+            outcomes.append(trial)
+    else:
+        header, body = structure["loop"]
+        trial = _env_copy(env)
+        hits.extend(_classify_items(header, depth, trial))
+        outcomes.append(_env_copy(trial))
+        for _ in range(_LOOP_PASSES):
+            hits.extend(_classify_items(body, depth, trial))
+            hits.extend(_classify_items(header, depth, trial))
+            if trial == outcomes[-1]:
+                break
+            outcomes.append(_env_copy(trial))
+        else:
+            hits.append(_unknown_legacy())   # no fixpoint within the bound: explicitly unknown
+    _merge_outcomes(env, outcomes)
+    return hits
+
+
+def _classify_items(items, depth, env):
+    """Hits of the commands that actually (or possibly) run, in order.
+
+    ``env`` maps a function name to ``{"defs": [...], "external": bool}`` for
+    the current shell and is updated in place: a definition (also one made in
+    an invoked ``{ }`` function, a brace group or eval) persists. Subshells
+    (``( ... )``, ``name() ( ... )`` bodies, pipeline members, background
+    jobs, command substitutions) work on a copy. Conditions are not evaluated:
+    items after ``&&``/``||`` run on a trial copy whose definitions are merged
+    back as possibilities; ``if``/``case`` branches and loop iterations are
+    alternatives whose definitions form a set of possible definitions (see
+    ``_classify_structure``); a keyword compound whose shape is not recognised
+    treats each inner item as possible. A later call is the union of every
+    possible definition and the external command, so a conditional definition
+    can over-report but never hide a command.
+    """
+    hits = []
+    for item in items:
+        if item[0] == "sub":
+            hits.extend(_classify_items(item[1], depth, _env_copy(env)))
+            continue
+        isolated, conditional = item[-2], item[-1]
+
+        def run(scope, item=item):
+            if item[0] == "def":
+                _, name, body, redirect, subshell = item[:5]
+                scope[name] = {"defs": [(body, redirect, subshell)], "external": False}
+                return []
+            if item[0] == "group":
+                _, inner, redirect, kind, structure = item[:5]
+                found = [_legacy_install(text, depth + 1, _env_copy(scope)) for text in redirect]
+                if kind == "{":
+                    return found + _classify_items(inner, depth, scope)
+                if structure is not None:
+                    return found + _classify_structure(structure, depth, scope)
+                for one in inner:   # unrecognised keyword compound: every inner item is only possible
+                    found.extend(_run_maybe(scope, lambda trial, one=one: _classify_items([one], depth, trial)))
+                return found
+            _, argv, subs = item[:3]
+            found = [_legacy_install(text, depth + 1, _env_copy(scope)) for text in subs]
+            return found + [_legacy_simple(argv, depth, scope)]
+
+        if isolated:
+            hits.extend(run(_env_copy(env)))
+        elif conditional:
+            hits.extend(_run_maybe(env, run))
+        else:
+            hits.extend(run(env))
+    return hits
+
+
+def _legacy_install(cmd, _depth=0, _functions=None):
+    """Classify a shell command as a direct legacy ``wf apply``/``wf self-update``.
+
+    Returns ``None`` for ordinary commands, else ``{schema, entry, kind, parsed,
+    argument}``. ``argument`` is only the first positional package operand used
+    by the legacy report path; it is never an installation reference and never
+    authorizes anything. Commands that mention a wf entry point but cannot be
+    tokenized, and nesting beyond the supported depth, are explicitly unknown
+    (``parsed=False``, ``kind=None``). Function bodies count only where the
+    function is invoked. Indirection through scripts, aliases, variables or
+    functions defined outside the command is outside this reporting classifier.
+    """
+    import re
+    if not isinstance(cmd, str) or not cmd.strip():
+        return None
+    if _depth > _LEGACY_MAX_DEPTH:
+        return _unknown_legacy()
+    try:
+        items = _shell_items(_shell_tokens(cmd))
+    except ValueError:
+        mentions = re.search(r"(?:^|[\s/'\"`;&|(])wf(?:\.py)?(?=['\"\s`]|$)", cmd) \
+            and re.search(r"(?<![\w-])(?:apply|self-update|drill)(?![\w-])", cmd)
+        return _unknown_legacy() if mentions else None
+    return _pick_legacy(_classify_items(items, _depth, _functions if _functions is not None else {}))
+
+
+def _legacy_simple(argv, depth, functions=None):
     import re
     i, n = 0, len(argv)
     assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
-    while i < n and assignment.fullmatch(argv[i]):
-        i += 1
+    while i < n:
+        if assignment.fullmatch(argv[i]) or argv[i] in _SHELL_RESERVED:
+            i += 1
+        elif argv[i] == "time":
+            # The unqualified ``time`` is a shell keyword: the timed command can
+            # be a function. A path such as /usr/bin/time is an external wrapper.
+            i += 1
+            while i < n and argv[i].startswith("-") and argv[i] != "--":
+                i += 1
+            if i < n and argv[i] == "--":
+                i += 1
+        else:
+            break
+    entry = functions.get(argv[i]) if i < n and functions is not None else None
+    if entry is None:
+        return _legacy_command(argv, i, depth, functions)
+    # A shell function shadows any command of the same name (including wf).
+    if depth >= _LEGACY_MAX_DEPTH:
+        return _unknown_legacy()
+    hits = []
+    if len(entry["defs"]) == 1 and not entry["external"]:
+        hits.extend(_invoke_definition(entry["defs"][0], depth, functions))
+    else:
+        # Only possibly defined (or one of several definitions): every
+        # possibility counts and their effects persist as possibilities.
+        for definition in entry["defs"]:
+            hits.extend(_run_maybe(functions, lambda trial, d=definition: _invoke_definition(d, depth, trial)))
+        if entry["external"]:
+            hits.append(_legacy_command(argv, i, depth, functions))
+    return _pick_legacy(hits)
+
+
+def _invoke_definition(definition, depth, env):
+    """Hits of one function invocation: redirection substitutions, then body."""
+    body, redirect, subshell = definition
+    hits = [_legacy_install(text, depth + 1, _env_copy(env)) for text in redirect]
+    # A { ... } body runs in the caller's shell; a ( ... ) body in a subshell.
+    hits.extend(_classify_items(body, depth + 1, _env_copy(env) if subshell else env))
+    return hits
+
+
+def _legacy_command(argv, i, depth, functions=None):
+    """Resolve argv[i:] as a command that is not a shell function."""
+    import re
+    n = len(argv)
+    assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
     while i < n and argv[i].rsplit("/", 1)[-1] in _WRAPPERS:
         wrapper = argv[i].rsplit("/", 1)[-1]
         i += 1
+        options = []
         while i < n and (argv[i].startswith("-") or assignment.fullmatch(argv[i])):
+            options.append(argv[i])
             i += 2 if argv[i] in _WRAPPER_VALUE_OPTIONS else 1
+        if wrapper == "command" and any(o.startswith("-") and o != "--" and ("v" in o or "V" in o)
+                                        for o in options):
+            return None   # command -v/-V only reports how a name would resolve
         if wrapper == "timeout" and i < n:
             i += 1   # duration operand
     if i >= n:
@@ -161,7 +794,7 @@ def _legacy_simple(argv, depth):
             j += 1
         return _legacy_install(argv[j], depth + 1) if inline and j < n else None
     if name == "eval":
-        return _legacy_install(" ".join(argv[i + 1:]), depth + 1)
+        return _legacy_install(" ".join(argv[i + 1:]), depth + 1, functions)
     rest = None
     if name in ("wf", "wf.py"):
         rest = argv[i + 1:]
@@ -237,7 +870,237 @@ def _invocation_command(inst, event, reader):
     return _strict_json(raw, path).get("cmd") if raw is not None else None
 
 
-def _bound_histories(inst, events, reader, *, local, tool_root):
+TRANSACTION_SCHEMA = "install-transaction/1"
+TRANSACTION_DIAGNOSTIC = "install_transaction_without_exec_receipt"
+TRANSACTIONS_SCHEMA = "install-transactions/1"
+
+
+def _parse_stamp(value):
+    from datetime import datetime
+    if not isinstance(value, str):
+        return None
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None and at.utcoffset() is not None else None
+
+
+def _turn_starts(turns):
+    """[(first ts_sent, turn)] from the frozen turns log; a round runs until the next send."""
+    first = {}
+    for row in turns:
+        t = row.get("turn")
+        if row.get("status") == "sent" and type(t) is int and t not in first:
+            first[t] = row.get("ts_sent")
+    return sorted((at, t) for t, at in ((t, _parse_stamp(v)) for t, v in first.items()) if at is not None)
+
+
+_TX_RECORDS = {"baseline.json": ("baseline/1", None), "prepared.json": ("install_tx/1", "prepared"),
+               "started.json": ("install_tx/1", "started"), "completed.json": ("install_completed/1", "completed"),
+               "failed.json": ("install_tx/1", "failed"), "partial.json": ("install_tx/1", "partial"),
+               "recovered.json": ("install_recovered/1", "recovered")}
+_RESTORE_RECORDS = {"prepared.json": ("install_restore/1", "prepared"),
+                    "completed.json": ("install_restore/1", "completed"),
+                    "partial.json": ("install_restore/1", "partial")}
+_LINKED_RECORDS = {"started.json", "completed.json", "failed.json", "partial.json"}
+_STORE_PARTS = (("project", ("workflow", "evidence", "install")), ("tool", ("local", "install")))
+
+
+class _StoreReader:
+    """Transaction-store view over the strict history reader.
+
+    Capture: an ``unsupported`` or ``unreadable`` problem on a store path
+    (symlink, non-directory, special member, permission) becomes an explicit,
+    recorded fault instead of aborting the window. Replay: those faults come
+    from the frozen descriptor and every other read goes to the frozen reader
+    unchanged, so capture and replay see the same facts without disk access.
+    Any other problem (``changed``, ``corrupt``, ...) still propagates.
+    """
+
+    def __init__(self, reader, faults=None):
+        self._reader, self._replay = reader, faults is not None
+        self._faults = {(f["op"], f["path"]): dict(f) for f in (faults or [])}
+
+    def _read(self, op, path):
+        key = (op, str(Path(path).absolute()))
+        if key in self._faults:
+            return dict(self._faults[key])
+        try:
+            return getattr(self._reader, op)(path)
+        except _InputProblem as exc:
+            if self._replay or exc.state not in ("unsupported", "unreadable"):
+                raise
+            self._faults[key] = {"fault": True, "op": op, "path": key[1], "state": exc.state, "detail": exc.detail}
+            return dict(self._faults[key])
+
+    def directory(self, path):
+        return self._read("directory", path)
+
+    def bytes(self, path):
+        return self._read("bytes", path)
+
+    @property
+    def faults(self):
+        return [self._faults[key] for key in sorted(self._faults)]
+
+    def revalidate(self):
+        """Capture only: every recorded fault must still be the same fault."""
+        for (op, path), fault in self._faults.items():
+            try:
+                (_directory_source if op == "directory" else _file_source)(path)
+            except _InputProblem as exc:
+                if (exc.state, exc.detail) == (fault["state"], fault["detail"]):
+                    continue
+            raise _InputProblem("changed", path, "transaction store fault changed before freeze")
+
+
+def _is_fault(value):
+    return isinstance(value, dict) and value.get("fault") is True
+
+
+def _transaction_stores(inst, store_reader, *, tool_root):
+    """Explicit state of both target-owned stores; never a silent skip."""
+    stores = []
+    for kind, parts in _STORE_PARTS:
+        path = Path(str(inst.root if kind == "project" else tool_root)).joinpath(*parts)
+        listing = store_reader.directory(path)
+        if _is_fault(listing):
+            stores.append({"store": kind, "path": str(path), "state": "fault",
+                           "fault": {"state": listing["state"], "detail": listing["detail"]}, "members": []})
+        else:
+            stores.append({"store": kind, "path": str(path), "state": listing.get("state"),
+                           "members": [list(m) for m in listing.get("members", [])
+                                       if m[0].startswith(("tx-", "restore-"))]})
+    return stores
+
+
+def _transaction_record_problems(job, txid, name, doc, prepared):
+    """Shape of one sealed record against the writer's protocol."""
+    import re
+    table = _TX_RECORDS if job == "install" else _RESTORE_RECORDS
+    if name not in table:
+        return ["transaction_record_unknown:" + name]
+    schema, state = table[name]
+    id_field = "tx_id" if job == "install" else "restore_id"
+    problems = []
+    if doc.get("schema") != schema:
+        problems.append(f"transaction_record_schema:{name}")
+    if state is not None and doc.get("state") != state:
+        problems.append(f"transaction_record_field:{name}:state")
+    if doc.get(id_field) != txid:
+        problems.append(f"transaction_record_field:{name}:{id_field}")
+    if name == "prepared.json":
+        stamp = doc.get("lock") if job == "install" else doc.get("prepared_at")
+        stamp = stamp.get("acquired_at") if job == "install" and isinstance(stamp, dict) else \
+            (stamp if job == "restore" else None)
+        if _parse_stamp(stamp) is None:
+            problems.append("transaction_record_field:prepared.json:" + ("lock" if job == "install" else "prepared_at"))
+    elif name in _LINKED_RECORDS and prepared is not None and doc.get("prepared_sha256") != prepared.get("body_sha256"):
+        problems.append(f"transaction_record_field:{name}:prepared_sha256")
+    if job == "install" and not re.fullmatch(r"tx-[0-9a-f]{32}", txid) \
+            or job == "restore" and not re.fullmatch(r"restore-[0-9a-f]{32}", txid):
+        problems.append("transaction_id_invalid")
+    return problems
+
+
+def _transaction_rows(inst, store_reader, *, stores, turns, bound):
+    """Every target-owned install/restore transaction not covered by a provider row.
+
+    Rows never carry a reference. Records are read through the strict
+    capture/frozen reader, must be sealed (B's ``body_sha256`` check) and must
+    match the writer's protocol (schema, state, id, prepared link, start time).
+    Any problem makes the row ``corrupt``; otherwise ``failed`` for a
+    failed/partial record and ``unknown`` for everything else (a completed
+    transaction without an exec receipt is still unknown). The attempt is
+    attributed to a round by its validated start time; store and directory
+    faults become corrupt, time-unknown rows.
+    """
+    from .review import _canon, _sha
+    starts = _turn_starts(turns)
+    rows = []
+
+    def row(kind, txid, job, state, problems, records=(), anchor=None, at=None):
+        earlier = [(start, t) for start, t in starts if at is not None and start <= at]
+        attribution = "time_unknown" if at is None else ("turn" if earlier else "before_first_turn")
+        rows.append({"seq": None, "turn": max(earlier)[1] if earlier else None, "reference": None, "state": state,
+                     "diagnostics": [TRANSACTION_DIAGNOSTIC] + problems,
+                     "transaction": {"schema": TRANSACTION_SCHEMA, "store": kind, "id": txid, "job": job,
+                                     "records": list(records), "attempt_at": anchor, "attribution": attribution}})
+
+    for store in stores:
+        kind, path = store["store"], Path(store["path"])
+        if store["state"] == "fault":
+            row(kind, None, None, "corrupt",
+                [f"transaction_store_{store['fault']['state']}:{store['fault']['detail']}"])
+            continue
+        for name, member_type, _mode in store["members"]:
+            job = "install" if name.startswith("tx-") else "restore"
+            if job == "install" and (kind, name) in bound:
+                continue
+            if member_type != "dir":
+                row(kind, name, job, "corrupt", ["transaction_member_not_directory"])
+                continue
+            listing = store_reader.directory(path / name)
+            if _is_fault(listing):
+                row(kind, name, job, "corrupt", [f"transaction_directory_{listing['state']}:{listing['detail']}"])
+                continue
+            docs, problems = {}, []
+            for record, record_type, _rmode in listing.get("members", []):
+                if not record.endswith(".json"):
+                    continue
+                if record_type != "file":
+                    problems.append("transaction_record_not_file:" + record)
+                    continue
+                raw = store_reader.bytes(path / name / record)
+                if _is_fault(raw):
+                    problems.append(f"transaction_record_{raw['state']}:{record}")
+                    continue
+                try:
+                    doc = _strict_json(raw, path / name / record) if raw is not None else None
+                except _InputProblem:
+                    doc = None
+                if doc is None or doc.get("body_sha256") != _sha(_canon(
+                        {k: v for k, v in doc.items() if k != "body_sha256"})):
+                    problems.append("transaction_record_corrupt:" + record)
+                    continue
+                docs[record] = doc
+            prepared_problems = _transaction_record_problems(job, name, "prepared.json", docs["prepared.json"], None) \
+                if "prepared.json" in docs else None
+            if "prepared.json" not in docs and not any(p.endswith(":prepared.json") for p in problems):
+                problems.append("transaction_record_missing:prepared.json")
+            prepared = docs.get("prepared.json") if prepared_problems == [] else None
+            for record, doc in docs.items():
+                problems.extend(prepared_problems if record == "prepared.json"
+                                else _transaction_record_problems(job, name, record, doc, prepared))
+            anchor = None
+            if prepared is not None:
+                anchor = prepared["lock"]["acquired_at"] if job == "install" else prepared["prepared_at"]
+            records = [{"record": record, "state": doc.get("state")} for record, doc in docs.items()]
+            state = "corrupt" if problems else \
+                "failed" if any(r["state"] in ("failed", "partial") for r in records) else "unknown"
+            row(kind, name, job, state, problems, records, anchor, _parse_stamp(anchor))
+    return rows
+
+
+def _transaction_summary(history):
+    """Window-independent transaction facts: corrupt or time-unknown rows always block."""
+    rows = [row for row in (history or {}).get("entries", []) if isinstance(row.get("transaction"), dict)]
+    why = []
+    if any(row["state"] == "corrupt" for row in rows):
+        why.append("install_transaction_corrupt")
+    if any(row["transaction"].get("attribution") == "time_unknown" for row in rows):
+        why.append("install_transaction_time_unknown")
+    return {"schema": TRANSACTIONS_SCHEMA,
+            "stores": [{k: v for k, v in store.items() if k != "members"}
+                       for store in (history or {}).get("transaction_stores", [])],
+            "unbound": [{"store": row["transaction"]["store"], "id": row["transaction"]["id"],
+                         "state": row["state"], "turn": row["turn"],
+                         "attribution": row["transaction"]["attribution"]} for row in rows],
+            "why": why}
+
+
+def _bound_histories(inst, events, reader, *, local, tool_root, turns=(), store_reader=None):
     """Provider-bound receipts plus explicit unknown rows for unreferenced tries.
 
     Every structured invocation is first bound by ``exec_binding`` and
@@ -300,7 +1163,14 @@ def _bound_histories(inst, events, reader, *, local, tool_root):
             unknown(event, ["installation_receipt_has_no_transaction" if legacy
                             else "unsuccessful_exec_has_no_transaction_reference"], legacy, bound=True)
     rows.sort(key=lambda row: row["seq"])   # stable: same-seq references keep receipt order
-    return {"schema": provided["schema"], "entries": rows}
+    bound = {(row["reference"]["target"]["kind"], row["reference"]["tx_id"])
+             for row in rows if isinstance(row.get("reference"), dict)}
+    store_reader = store_reader if store_reader is not None else _StoreReader(reader)
+    stores = _transaction_stores(inst, store_reader, tool_root=tool_root)
+    rows.extend(_transaction_rows(inst, store_reader, stores=stores, turns=turns, bound=bound))
+    return {"schema": provided["schema"], "entries": rows,
+            "transaction_stores": [{k: v for k, v in store.items() if k != "members"} for store in stores],
+            "transaction_faults": store_reader.faults}
 
 
 def _install_try(event, histories, history_entries):
@@ -321,7 +1191,43 @@ def _install_try(event, histories, history_entries):
     return False
 
 
-def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
+REPORT_AUTHORIZATION_SCHEMA = "live-report-authorization/1"
+
+
+def _direct_history_route(inst, events):
+    """Route a direct ``live.check`` to the same frozen collection goals use.
+
+    ``strict``: structured receipts, or a transaction store that holds a
+    transaction or cannot be listed (a capture problem is then reported, never
+    replaced by a report that omits the transaction). ``legacy``: only
+    classified legacy/inner exec commands; if strict capture is impossible the
+    legacy report is returned with an explicit uncollected authorization.
+    ``None``: an ordinary window, reported as before. The store listing here
+    only routes; the evaluated facts are the frozen ones.
+    """
+    from .core import WF_HOME
+    if any(event.get("type") == "exec" and event.get("install_exec") is not None for event in events):
+        return "strict"
+    for kind, parts in _STORE_PARTS:
+        path = Path(str(inst.root if kind == "project" else WF_HOME)).joinpath(*parts)
+        try:
+            listing = _directory_source(path)
+        except _InputProblem:
+            return "strict"
+        if any(member[0].startswith(("tx-", "restore-")) for member in listing["members"]):
+            return "strict"
+    return "legacy" if _history_required(events) else None
+
+
+def _fresh_route(inst):
+    """Route from fresh events and store listings; any doubt means strict."""
+    try:
+        return _direct_history_route(inst, _jsonl(inst.events_path))
+    except (OSError, ValueError, TypeError, _InputProblem):
+        return "strict"
+
+
+def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None, _route=True) -> dict:
     # 1.9.3：按执行端第 123 轮的复核再修——不跳过失败的轮次（按轮号连续计）；日志条目必须带项目字段；回复要核父子 uuid；
     # 审查核版本包哈希与先后；待办按事件核关闭时刻；发现延迟不得为负；同步要带当时的 HEAD；
     # 连续达标的轮次里必须至少各有一次工具安装与项目落地；人工判定看事件身份（actor），驱动器进程里的 wf 内部转换不算人工
@@ -334,14 +1240,26 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
     head_at = _inputs.head_at if _inputs else _head_at
     state = _inputs.state if _inputs else inst.state
     ev = read_log(inst.events_path)
-    if _inputs is None and any(e.get("type") == "exec" and e.get("install_exec") is not None for e in ev):
+    route = _direct_history_route(inst, ev) if _inputs is None and _route else None
+    if route is not None:
         try:
             return _evaluate_snapshot(_capture_inputs(inst, rounds=rounds, budget_s=budget_s))["report"]
         except _InputProblem as exc:
+            problem = {"state": exc.state, "source": exc.source, "detail": exc.detail}
+            # The route was decided before capture. A legacy fallback is allowed
+            # only while fresh facts still show no receipt, no transaction and
+            # no store fault, both before and after the legacy report is built;
+            # otherwise the explicit capture failure is reported.
+            if route == "legacy" and _fresh_route(inst) == "legacy":
+                report = check(inst, rounds, budget_s, _route=False)
+                if _fresh_route(inst) == "legacy":
+                    report["authorization"] = {"schema": REPORT_AUTHORIZATION_SCHEMA, "state": "unavailable",
+                                               "why": ["install_history_uncollected"], "input_problem": problem}
+                    return report
             missing = [f"实景输入 {exc.state}：{exc.source}：{exc.detail}"]
             return {"rounds": [], "streak": 0, "need": rounds, "missing": missing, "passed": False,
                     "summary": _summary(inst, [], [], rounds, 0, missing, False),
-                    "input_problem": {"state": exc.state, "source": exc.source, "detail": exc.detail}}
+                    "input_problem": problem}
     histories = _inputs.install_histories(inst, ev) if _inputs else None
     history_entries = (histories or {}).get("entries", [])
     turns = read_log(inst.turns_path)
@@ -417,15 +1335,26 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
             "交付核对：" + (last.get("deliveries") or "没有记录") + (("；" + "、".join(bad3)) if bad3 else ""))
         tries = [e for e in tev if _install_try(e, histories, history_entries)]
         ups = [e for e in tries if e.get("exit_code") == 0]
+        # C5-G1: install/restore transactions of this round without an exec
+        # receipt are attempts too (attributed by their own start time).
+        unbound = [row for row in history_entries
+                   if isinstance(row.get("transaction"), dict) and row.get("turn") == t]
         # B1-C r2（F1）：任何失败、超时或结果未知的安装尝试都留在结构化状态里，不被同轮的成功安装遮掉
         att = {"total": len(tries), "ok": len(ups),
                "timeout": sum(1 for e in tries if e.get("exit_code") == 124),
                "unknown": sum(1 for e in tries if not isinstance(e.get("exit_code"), int))}
+        if unbound:
+            att["unbound_transactions"] = len(unbound)
+            att["total"] += len(unbound)
+            att["unknown"] += sum(1 for row in unbound if row.get("state") != "failed")
         att["failed"] = att["total"] - att["ok"] - att["timeout"] - att["unknown"]
         bad_try = att["total"] > att["ok"]
-        if not ups and tries:
+        txnote = ("；无执行回执的安装事务：" + "、".join(
+            f"{row['transaction']['store']}/{row['transaction']['id']}（{row['state']}）" for row in unbound)) \
+            if unbound else ""
+        if not ups and att["total"]:
             # B1-C：安装尝试失败或超时不是“没有安装”，不能记为不适用；ok 与说明保持原样，结构化状态如实区分
-            add(4, True, "本轮没有安装工具版本（不适用）", status="attempt_failed")
+            add(4, True, "本轮没有安装工具版本（不适用）" + txnote, status="attempt_failed")
         elif not ups:
             add(4, True, "本轮没有安装工具版本（不适用）", status="not_applicable",
                 na={"condition": "本轮没有 wf self-update 命令", "scope": "第 4 段（审查在先）",
@@ -459,8 +1388,8 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
                         v += _review_timing(rr, e)   # 1.9.4：按安装开始的时刻比，空时刻不放过
                 vs.append(v)
             ok4 = all(v in ("pass", "concerns") for v in vs)
-            add(4, ok4, "安装前审查：" + "、".join(vs), status="attempt_failed" if (ok4 and bad_try) else None)
-        if tries:
+            add(4, ok4, "安装前审查：" + "、".join(vs) + txnote, status="attempt_failed" if (ok4 and bad_try) else None)
+        if att["total"]:
             crit[-1]["attempts"] = att
         man = [f"{e.get('type')}（{e.get('by')}/{e.get('actor') or '?'}）"
                for e in tev if _manual(e) and not bound_auto_apply(e)]
@@ -903,9 +1832,12 @@ class _FrozenInputs:
         inputs = self.descriptor["review_inputs"]
         if inputs.get("schema") != "live-install-history/1":
             return None
-        replay = _bound_histories(inst, events, FrozenReader(self, inputs["reader"]),
-                                  local=inputs["host"]["local"], tool_root=inputs["host"]["tool_root"])
-        if replay != {"schema": inputs["schema"], "entries": inputs["entries"]}:
+        frozen = FrozenReader(self, inputs["reader"])
+        replay = _bound_histories(inst, events, frozen,
+                                  local=inputs["host"]["local"], tool_root=inputs["host"]["tool_root"],
+                                  turns=self.jsonl(inst.turns_path),
+                                  store_reader=_StoreReader(frozen, faults=inputs.get("transaction_faults", [])))
+        if replay != {k: inputs.get(k) for k in ("schema", "entries", "transaction_stores", "transaction_faults")}:
             raise _InputProblem("corrupt", "install_history", "stored history differs from frozen replay")
         return replay
 
@@ -1062,9 +1994,11 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
             if event.get("type") == "exec" and event.get("install_exec") is None and event.get("exit_code") == 0:
                 legacy = _legacy_install(event.get("cmd"))
                 if legacy and legacy["kind"] in ("tool", None) and legacy.get("argument"):
+                    # Absence is a frozen fact the report shows; it does not
+                    # abort collection of the remaining window.
                     zp = fresh.root / legacy["argument"]
-                    source(zp, "bytes")
-                    doc(LOCAL / "reviews" / f"{zp.stem}.result.json")
+                    source(zp, "bytes", required=False)
+                    source(LOCAL / "reviews" / f"{zp.stem}.result.json", "json", required=False)
         task_rows = state.get("executor_tasks", [])
         if not isinstance(task_rows, list) or any(not isinstance(x, dict) for x in task_rows):
             raise _InputProblem("corrupt", fresh.state_path, "executor_tasks must be object list")
@@ -1106,23 +2040,30 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
                       "excluded": "latest_pending" if t == max(sent) and t not in done else None}
                      for t in sorted(sent)]
         git_inputs = _git_inputs(fresh.root, [h["ts"] for h in hist if h.get("status") in ("pushed", "unchanged")])
-        history_reader = None
-        review_inputs = {"state": "unavailable", "reason": "install_history_unavailable"}
-        if _history_required(events):
-            from .core import WF_HOME
-            from .live_history import CaptureReader
+        from .core import WF_HOME
+        from .live_history import CaptureReader
 
-            def history_directory(path):
-                desc = _directory_source(path)
-                previous = next((row for row in directories if row["path"] == desc["path"]), None)
-                if previous is not None and previous != desc:
-                    raise _InputProblem("changed", path, "history selector changed during collection")
-                if previous is None:
-                    directories.append(desc)
-                return desc
+        def history_directory(path):
+            desc = _directory_source(path)
+            previous = next((row for row in directories if row["path"] == desc["path"]), None)
+            if previous is not None and previous != desc:
+                raise _InputProblem("changed", path, "history selector changed during collection")
+            if previous is None:
+                directories.append(desc)
+            return desc
 
-            history_reader = CaptureReader(lambda path: source(path, "bytes", required=False), history_directory)
-            review_inputs = _bound_histories(fresh, events, history_reader, local=LOCAL, tool_root=WF_HOME)
+        history_reader = CaptureReader(lambda path: source(path, "bytes", required=False), history_directory)
+        store_reader = _StoreReader(history_reader)
+        # Both transaction stores are always listed through the strict reader;
+        # their frozen listings (or recorded faults) decide the history gate,
+        # so an exec-less transaction opens history even without any exec.
+        stores = _transaction_stores(fresh, store_reader, tool_root=WF_HOME)
+        review_inputs = {"state": "unavailable", "reason": "install_history_unavailable",
+                         "transaction_stores": [{k: v for k, v in store.items() if k != "members"}
+                                                for store in stores]}
+        if _history_required(events) or any(store["state"] == "fault" or store["members"] for store in stores):
+            review_inputs = _bound_histories(fresh, events, history_reader, local=LOCAL, tool_root=WF_HOME,
+                                             turns=turns, store_reader=store_reader)
             review_inputs.update(host={"local": str(Path(LOCAL).absolute()), "tool_root": str(Path(WF_HOME).absolute())},
                                  reader=history_reader.descriptor)
         trust_inputs = None
@@ -1152,8 +2093,8 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
             descriptor["trust_inputs"] = trust_inputs
         # Re-read bytes and member boundaries; no after-the-fact hash can be
         # paired with data evaluated earlier. No global ACID/ABA claim is made.
-        if history_reader is not None:
-            history_reader.revalidate()
+        history_reader.revalidate()
+        store_reader.revalidate()
         for desc in sources:
             current, data = _file_source(desc["path"])
             current["format"] = desc["format"]
@@ -1185,10 +2126,15 @@ def _evaluate_snapshot(snapshot):
         from .live_history import window_authorization
         authorization = window_authorization(history, snapshot.jsonl(inst.events_path), report)
         result.update(history_authorization=authorization,
+                      install_transactions=_transaction_summary(history),
                       production_trust=_production_trust(snapshot, history, report))
         reasons = _authorization_reasons(result)
         result.update(authorization="unavailable" if reasons else "available",
                       reason="；".join(reasons) if reasons else None)
+        # The report carries the decision too, so a direct live.check routed
+        # here shows the same refusal and unbound transactions.
+        report["authorization"] = {"schema": REPORT_AUTHORIZATION_SCHEMA, "state": result["authorization"],
+                                   "why": reasons, "unbound_transactions": result["install_transactions"]["unbound"]}
     return result
 
 
@@ -1199,6 +2145,11 @@ def _authorization_reasons(result):
         return ["install_history_unavailable"]
     if history.get("eligible") is not True:
         return list(history.get("why") or ["install_history_unavailable"])
+    transactions = result.get("install_transactions")
+    if not isinstance(transactions, dict) or transactions.get("schema") != TRANSACTIONS_SCHEMA:
+        return ["install_transactions_unavailable"]
+    if transactions.get("why"):
+        return list(transactions["why"])
     trust = result.get("production_trust")
     if not isinstance(trust, dict) or trust.get("schema") != TRUST_CHECK_SCHEMA \
             or trust.get("granted") is not True or trust.get("state") != "trusted":

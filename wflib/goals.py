@@ -1591,8 +1591,8 @@ def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict)
                     psnapshot = live._FrozenInputs(snapshot.root, snapshot.project, dict(snapshot.raw), pdescriptor)
                     pevaluated = live._evaluate_snapshot(psnapshot)
                     if any(pc.get(field) != pevaluated.get(field) for field in
-                           ("report", "history_authorization", "production_trust", "authorization", "reason",
-                            "inputs_sha256")) \
+                           ("report", "history_authorization", "install_transactions", "production_trust",
+                            "authorization", "reason", "inputs_sha256")) \
                             or pb.get("production_trust") != live._trust_binding(pevaluated.get("production_trust")):
                         raise live._InputProblem("corrupt", gid, "同批历史报告与冻结来源重新评价不一致")
                     pevaluated["closure"] = closure
@@ -1607,6 +1607,7 @@ def _live_binding_valid(inst: Instance, r: dict, x: dict, st: dict, cache: dict)
             if modern:
                 if c.get("history_authorization") != evaluated.get("history_authorization") \
                         or c.get("production_trust") != evaluated.get("production_trust") \
+                        or c.get("install_transactions") != evaluated.get("install_transactions") \
                         or c.get("authorization") != evaluated.get("authorization") or c.get("reason") != evaluated.get("reason"):
                     raise live._InputProblem("corrupt", "history", "历史授权事实与冻结来源重新评价不一致")
                 if b.get("production_trust") != live._trust_binding(evaluated.get("production_trust")):

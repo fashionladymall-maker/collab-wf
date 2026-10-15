@@ -181,7 +181,9 @@ and one denial reason, e.g. `production_trust_registry_absent`,
 `production_trust_transport_synthetic`,
 `production_trust_history_synthetic`,
 `production_trust_platform_mismatch`, `production_trust_model_mismatch`.
-Reasons are ordered: historical reasons first, then trust reasons, so an
+Reasons are ordered: historical reasons first, then exec-less transaction
+reasons (`install_transaction_corrupt`, `install_transaction_time_unknown`),
+then trust reasons, so an
 explicitly synthetic history still reports `synthetic_install_history`.
 
 The registry is a frozen input of every modern window
@@ -243,24 +245,163 @@ its legacy rows block authorization. Window `complete` is true only when
 structured receipts exist, so such a window is collected but explicitly
 incomplete. Pre-receipt events are classified from the event command, which
 ops truncates to 300 characters; structured invocations use the full metadata
-command. A direct `live.check` without structured receipts keeps the
-non-snapshot reporting path; its report is identical because criterion 4 and
-apply attribution do not depend on these unknown rows.
+command. Direct `live.check` routing is described under install transactions
+below.
 
-`live._legacy_install` tokenizes with shell operators and recognizes direct
+## Install transactions without exec receipts
+
+An installation attempt can exist only in a target-owned transaction store,
+for example a driver's in-process `release.apply_zip` that writes `prepared`
+and then fails on a real review block, with no exec and no event. Every
+capture therefore lists both stores through the strict capture reader: the
+project's `workflow/evidence/install` and the tool's `<tool_root>/local/install`.
+The frozen listings decide the history gate together with the exec gate: a
+store containing any `tx-*`/`restore-*` member, or a store fault, opens the
+history protocol even in a window with no exec at all. Without either,
+`review_inputs` stays `unavailable` but records `transaction_stores` (each
+`present`/`absent`), and the frozen listings make a later transaction
+invalidate that window.
+
+Every transaction no provider row references becomes its own row: `seq=null`,
+`reference=null`, diagnostic `install_transaction_without_exec_receipt`, and a
+`transaction` object (`install-transaction/1`: store, id, job
+`install|restore`, record states, `attempt_at`, `attribution`). No reference is
+derived from it. Each `*.json` record must be a regular file, strict JSON,
+sealed with B's `body_sha256`, and match the writer's protocol:
+
+| job | record | schema | state | id |
+|---|---|---|---|---|
+| install | `baseline.json` | `baseline/1` | — | `tx_id` |
+| install | `prepared.json` | `install_tx/1` | `prepared` | `tx_id`, `lock.acquired_at` timezone-aware |
+| install | `started`/`failed`/`partial.json` | `install_tx/1` | same as name | `tx_id`, `prepared_sha256` |
+| install | `completed.json` | `install_completed/1` | `completed` | `tx_id`, `prepared_sha256` |
+| install | `recovered.json` | `install_recovered/1` | `recovered` | `tx_id` |
+| restore | `prepared.json` | `install_restore/1` | `prepared` | `restore_id`, `prepared_at` timezone-aware |
+| restore | `completed`/`partial.json` | `install_restore/1` | same as name | `restore_id`, `prepared_sha256` |
+
+Directory names must be `tx-<32 hex>` or `restore-<32 hex>`. Any deviation is
+explicit and makes the row `corrupt`: `transaction_record_unknown:<name>`,
+`transaction_record_schema:<name>`, `transaction_record_field:<name>:<field>`
+(state, id, lock/prepared_at, prepared_sha256), `transaction_record_missing:
+prepared.json`, `transaction_record_corrupt:<name>` (JSON or seal),
+`transaction_record_not_file:<name>`, `transaction_id_invalid`,
+`transaction_member_not_directory`. A bad start field is never treated as an
+ordinary unknown time. Otherwise the row is `failed` for a failed/partial
+record and `unknown` for everything else (a completed transaction without an
+exec receipt is still unknown).
+
+Store paths are read through `live._StoreReader`. At capture, an
+`unsupported` or `unreadable` problem (symlinked store, a store that is not a
+directory, a symlinked or special member, permission errors) is recorded as a
+fault in `review_inputs.transaction_faults` and becomes a corrupt row:
+`transaction_store_<state>:<detail>` (for example `symlink directory`,
+`NotADirectoryError`), `transaction_directory_<state>:<detail>`, or
+`transaction_record_<state>:<name>`. Frozen replay reproduces these faults
+from the descriptor and reads everything else through the frozen reader, so
+it opens no file; fresh revalidation and the freeze check re-probe each fault
+and report `changed` when it no longer holds. Other problems still abort the
+collection. A symlinked member makes its whole store a fault.
+
+The attempt is attributed by its validated start time to the round whose first
+send it follows, rounds running until the next send (`turns.jsonl`, frozen).
+Rows attributed to an evaluated round block authorization through the window
+rule (`install_history:failed|unknown|corrupt`) and count in criterion 4:
+`attempts.unbound_transactions`, `total`, and `failed`/`unknown`, with status
+`attempt_failed` and the transaction ids in the explanation. Independent of the
+window, any corrupt row (`install_transaction_corrupt`) or time-unknown row
+(`install_transaction_time_unknown`) blocks (`install_transactions`,
+`install-transactions/1`, which also lists the store states). Transactions
+before the first round are listed but do not block. The tool store is shared
+by every project on the host, so a tool install performed through another
+project's exec during this window is unbound here and blocks this window
+conservatively. Goals re-evaluate and compare `install_transactions` like the
+other derived facts.
+
+### Direct `live.check`
+
+A direct `live.check` uses the same frozen collection as goals
+(`_capture_inputs` → `_evaluate_snapshot`) whenever the window has history
+facts, so it lists the same unbound transactions, criterion-4 counts and
+decision (`live._direct_history_route`):
+
+- `strict`: a structured receipt exists, or a transaction store holds a
+  `tx-*`/`restore-*` member or cannot be listed. A capture problem returns the
+  explicit `input_problem` report; it never falls back to a report that omits
+  the transaction.
+- `legacy`: only classified legacy/inner exec commands. If strict capture is
+  impossible, the route decided before capture is not trusted: the legacy
+  report is returned (with `authorization = {state: unavailable, why:
+  [install_history_uncollected], input_problem}`) only if a fresh route probe
+  both before and after building it still finds no receipt, no transaction and
+  no store fault. Otherwise, or if that probe cannot complete, the explicit
+  `input_problem` report is returned, so a transaction that appeared after the
+  first routing decision is never hidden by the fallback.
+- otherwise (an ordinary window without transactions) the report is
+  unchanged.
+
+The store listing used for routing is not evaluated; the frozen listing is.
+On the frozen path with history, the report carries
+`authorization` (`live-report-authorization/1`: `state`, ordered `why`,
+`unbound_transactions`), identical for direct and snapshot use and bound into
+`report_sha256`.
+
+Boundaries: when B's provider already reads a store for a bound history, it
+reads it strictly, so a store fault there still aborts that collection as
+before. Capture and routing use the process `WF_HOME` as tool root, so a
+fixture that does not isolate `WF_HOME` sees that host's real tool store.
+
+`live._legacy_install` tokenizes with a quote-aware shell lexer and recognizes direct
 `wf`/`wf.py` invocations (any path, including `python3 '<space path>/wf.py'`),
 leading assignments and `env`/`timeout`/`nohup`/`time`/`nice`/`sudo`/`command`/
 `exec` wrappers, `bash|sh|zsh -c` and `eval` nesting, global `--project`/`--json`
 options and the `apply` (project), `self-update` (tool) and `drill review`
-(`inner_review`, never a tool attempt) entries. A command
+(`inner_review`, never a tool attempt) entries. The lexer keeps quoted text
+(including quoted `;`, `&&`, `|`, `(`) out of operators, treats redirection
+targets, numeric file-descriptor prefixes, comments and here-document bodies
+as non-commands, skips reserved words (`if`/`then`/`do`/`{`/`!` …), splits on
+unquoted newlines, and recursively checks `$(...)` and backquote bodies,
+including those inside double quotes and unquoted here-documents. Function
+definitions (`name() {...}`, `name() (...)`, `function name {...}`) do not run:
+their bodies and the substitutions of redirections written after the body
+count only where the function is invoked later in the same command (also
+through `$(name)`, `eval` or another function). A function shadows a command
+of the same name, including `wf`. Compound commands (`{ }`, `if`, `case`,
+`for`/`while`/`until`/`select`) are parsed as one item, so the scope of a
+pipeline member or background job covers everything inside it.
+
+| syntax | can a definition or redefinition affect the parent shell |
+|---|---|
+| top level, invoked `{ ... }` function body, `{ ...; }` brace group, `eval` | yes |
+| `( ... )` group, invoked `name() ( ... )` body, command substitution | no |
+| any pipeline member or background job, including a brace group or function call there | no (default Bash, `lastpipe` off) |
+| `time f` (unqualified keyword, optional `-p`) | as the scope of `f`'s body |
+| external `time` path, `command`, `env`, `exec` and other wrappers | they bypass shell functions; `command f`/`env f` never call the function |
+| right side of `&&`/`\|\|` | possibly: the condition is not evaluated, so a later call is the union of every possible definition and the external command (may over-report, never hides) |
+| `if`/`elif`/`else` branches, `case` clauses, `for`/`while`/`until`/`select` iterations | each branch (plus "no branch taken" without `else`, "no match" for `case`) and each iteration count 0, 1, 2, ... up to a fixpoint is an alternative run in order on its own copy; a later call is the union of the definitions of all alternatives, plus the external command where an alternative leaves the name undefined (may over-report, never hides). A `*` pattern is not taken as catch-all (the lexer does not keep quoting); `;&`/`;;&` fall-through and substitutions in patterns fall back to treating every inner item as possible; no loop fixpoint within six passes is explicitly unknown |
+| uncalled body, definition-trailing redirection | not run; evaluated on each invocation |
+
+`command -v`/`-V` (also combined, e.g. `-pv`) only query and do not execute.
+Nesting beyond six levels (deep recursion) is explicitly unknown. The
+selftests compare these rows, each with definition and shadow/redefinition
+contrasts, and the earlier 31-case matrix with real Bash, using a stand-in
+`wf` that only records its arguments; only the conditional row may
+over-report (four recorded cases). A separate branch table (if/elif/else,
+case, loop-carried definitions, isolation) must agree with real Bash 5.2
+exactly. The classifier still reports a single entry: the first parsed install
+among the possible hits, which with several possible kinds may differ from the
+first command Bash ran (the kind Bash ran is always among the hits). A command
 that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
 unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
 diagnostic only; no installation reference is derived from a basename or
-command string. Scripts, aliases, functions, variables and backticks are not
-classified; quoted operator characters and comments may conservatively count as
-unknown. Criterion 4 counts tool references and legacy tool entries; the legacy
+command string. Conditions are not evaluated: commands in `if`/`case`/loop
+branches and after `&&`/`||` are counted as if they run, and definitions there
+form a set of possible definitions (conservative). Scripts, aliases, variables, `lastpipe`,
+functions defined outside the command (for example in a sourced file) and
+other indirection are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
 report path reads the parsed first package operand and reports
-`旧版安装命令无法解析（unknown）` when none exists. Project legacy entries are
+`旧版安装命令无法解析（unknown）` when none exists. A missing legacy package or
+review result is frozen as an absent source and reported (`没有记录` /
+`版本包哈希对不上或已不在`) instead of aborting the whole collection. Project legacy entries are
 visible as unknown history rows and block authorization.
 
 Synthetic histories can be complete and historically valid while authorization

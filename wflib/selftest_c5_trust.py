@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import core, goals, live, ops, policy, review
+from . import core, goals, live, ops, policy, release, review
 from . import selftest_c5_integration as integration
 from .selftest import _project_md
 
@@ -28,6 +28,154 @@ MODEL = "selftest-contract-model"
 GOAL = {"id": "C5T", "title": "C5-G1 trust contract", "kind": "exec", "check": "true",
         "pass": {"exit": 0}, "means": "selftest fixture", "on_fail": "inspect",
         "live": {"rounds": 1, "segments": list(range(1, 11))}}
+
+
+BASH_ORACLE = [
+    "setup() { wf() { :; }; }; setup; wf self-update unused.zip",
+    'f() { :; } >"$(wf self-update unused.zip)"',
+    "command -v wf self-update", "command -V wf", "command -pv wf self-update x.zip",
+    "f() { wf self-update used.zip; }; time f", "f() { wf self-update used.zip; }; time -p f",
+    "setup() { f() { wf self-update used.zip; }; }; setup; f",
+    "f() { :; }; setup() { f() { wf self-update used.zip; }; }; setup; f",
+    'f() { :; } >"$(wf self-update used.zip)"; f',
+    "(wf() { :; }); wf self-update leak.zip", 'echo "$(wf() { :; })"; wf self-update leak.zip',
+    "setup() { wf() { :; }; }; setup | cat; wf self-update leak.zip",
+    "setup() { wf() { :; }; }; setup & wait; wf self-update leak.zip",
+    "setup() { wf() { :; }; }; setup && wf self-update shadowed.zip",
+    "f() { wf apply x.zip; }; command f", "f() { wf apply x.zip; }; env f",
+    "f() { wf apply x.zip; }; EXT_TIME f", "EXT_TIME wf self-update ext.zip",
+    "wf() { :; }; command wf self-update real.zip", "wf() { :; }; env wf self-update real.zip",
+    "helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary", "helper() { wf self-update used.zip; }; helper",
+    "wf() { echo shadow; }; wf apply x.zip", "g() { f; }; f() { wf apply late.zip; }; g",
+    "eval 'f() { wf apply ev.zip; }'; f", "echo ';' wf apply x.zip", 'echo "$(wf apply sub.zip)"',
+    "if true; then wf apply cond.zip; fi", "cat <<'EOF'\nwf apply x.zip\nEOF", "true | wf self-update pipe.zip",
+]
+
+
+# Scope of function definitions per supported syntax, compared with real Bash.
+# Rows marked CONSERVATIVE: conditions are not evaluated, so a definition
+# reached only conditionally must never hide a command Bash runs; reporting a
+# command Bash skipped there is an accepted over-report.
+SCOPE_TABLE = {
+ "parent: top-level / { } function / brace group / eval": [
+  "wf() { :; }; wf self-update x.zip",
+  "setup() { wf() { :; }; }; setup; wf self-update x.zip",
+  "{ wf() { :; }; }; wf self-update x.zip",
+  "eval 'wf() { :; }'; wf self-update x.zip",
+  "f() { :; }; setup() { f() { wf self-update used.zip; }; }; setup; f",
+  "{ f() { wf self-update used.zip; }; }; f",
+  "f() { :; }; eval 'f() { wf apply ev.zip; }'; f",
+ ],
+ "no leak: ( ) group / name() ( ) body / command substitution": [
+  "(wf() { :; }); wf self-update leak.zip",
+  "setup() ( wf() { :; }; ); setup; wf self-update used.zip",
+  "setup() ( f() { wf self-update unused.zip; }; ); setup; f",
+  'echo "$(wf() { :; })"; wf self-update leak.zip',
+  "f() { wf apply keep.zip; }; (f() { :; }); f",
+  "f() { wf apply keep.zip; }; setup() ( f() { :; }; ); setup; f",
+  'f() { wf apply keep.zip; }; echo "$(f() { :; })"; f',
+  "(wf() { :; }; wf self-update inner.zip)",
+  "setup() ( wf() { :; }; wf self-update inner.zip ); setup",
+ ],
+ "no leak: pipeline member / background job (incl. brace group, call)": [
+  "setup() { wf() { :; }; }; setup | cat; wf self-update leak.zip",
+  "setup() { wf() { :; }; }; { setup; } | cat; wf self-update used.zip",
+  "setup() { wf() { :; }; }; { setup; } & wait; wf self-update used.zip",
+  "setup() { wf() { :; }; }; setup & wait; wf self-update leak.zip",
+  "{ wf() { :; }; } | cat; wf self-update leak.zip",
+  "true | { wf() { :; }; }; wf self-update leak.zip",
+  "f() { wf apply keep.zip; }; { f() { :; }; } | cat; f",
+  "{ wf() { :; }; wf self-update inner.zip; } | cat",
+  "if true; then wf() { :; }; fi | cat; wf self-update leak.zip",
+  "setup() { wf() { :; }; }; setup && wf self-update shadowed.zip",
+ ],
+ "time keyword follows the timed function's scope": [
+  "f() { wf self-update used.zip; }; time f",
+  "setup() { wf() { :; }; }; time setup; wf self-update x.zip",
+  "setup() ( wf() { :; }; ); time setup; wf self-update used.zip",
+  "time { wf() { :; }; }; wf self-update x.zip",
+ ],
+ "external time/command/env/exec bypass shell functions": [
+  "f() { wf apply x.zip; }; command f", "f() { wf apply x.zip; }; env f", "f() { wf apply x.zip; }; EXT_TIME f",
+  "EXT_TIME wf self-update ext.zip", "wf() { :; }; command wf self-update real.zip",
+  "wf() { :; }; env wf self-update real.zip", "wf() { :; }; exec wf self-update real.zip",
+  "setup() { wf() { :; }; }; env setup; wf self-update x.zip", "command -v wf self-update",
+ ],
+ "CONSERVATIVE conditional (&&, ||, if/case/loops not evaluated): never hide": [
+  "if true; then wf() { :; }; fi; wf self-update x.zip",
+  "if false; then wf() { :; }; fi; wf self-update x.zip",
+  "true && wf() { :; }; wf self-update x.zip",
+  "false && wf() { :; }; wf self-update x.zip",
+  "true || wf() { :; }; wf self-update x.zip",
+  "false || setup() { g() { wf apply x.zip; }; }; setup; g",
+  "while false; do wf() { :; }; done; wf self-update x.zip",
+  "for i in 1; do f() { wf apply loop.zip; }; done; f",
+  "case a in a) wf() { :; };; esac; wf self-update x.zip",
+  "if true; then f() { wf apply x.zip; }; fi; f",
+  "f() { wf apply keep.zip; }; if true; then f() { :; }; fi; f",
+ ],
+ "uncalled body / definition redirection: not run; run on call": [
+  "helper() { wf self-update unused.zip; }; printf ordinary", "helper() { wf self-update used.zip; }; helper",
+  'f() { :; } >"$(wf self-update unused.zip)"', 'f() { :; } >"$(wf self-update used.zip)"; f',
+  'f() ( : ) >"$(wf self-update unused.zip)"', 'f() ( : ) >"$(wf self-update used.zip)"; f',
+  '{ :; } >"$(wf self-update used.zip)"',
+ ],
+}
+
+
+# C-SCOPE-FIX2: branches of if/elif/else and case, and loop iterations, are alternatives whose
+# definitions form a set of possible definitions; a later call is their union. Every row here must agree
+# exactly with real Bash (no over-report allowed in this table). The first three are the reviewed misses.
+BRANCH_MISSES = {
+ "if true; then f(){ wf apply then.zip; }; else f(){ :; }; fi; f": "project",
+ "if true; then f(){ wf apply a.zip; }; elif true; then f(){ wf apply b.zip; }; else f(){ :; }; fi; f": "project",
+ "case x in x) f(){ wf apply case.zip; };; y) f(){ :; };; esac; f": "project",
+}
+BRANCH_TABLE = list(BRANCH_MISSES) + [
+ "if false; then f(){ :; }; else f(){ wf apply else.zip; }; fi; f",
+ "if false; then f(){ :; }; elif true; then f(){ wf apply mid.zip; }; else f(){ :; }; fi; f",
+ "if true; then f(){ :; }; else f(){ :; }; fi; f",
+ "if true; then wf(){ :; }; else wf(){ :; }; fi; wf self-update shadowed.zip",
+ "f(){ wf apply keep.zip; }; if true; then f(){ wf apply then.zip; }; else f(){ wf apply else.zip; }; fi; f",
+ "if true; then if true; then f(){ wf apply nested.zip; }; else f(){ :; }; fi; fi; f",
+ "if true; then f(){ wf apply local.zip; }; f; else :; fi",
+ "case y in x) f(){ :; };; y) f(){ wf apply y.zip; };; esac; f",
+ "case x in\nx) f(){ wf self-update nl.zip; };;\ny) f(){ :; };;\nesac; f",
+ "case x in (x) f(){ wf apply paren.zip; };; esac; f",
+ "for i in 1 2; do f; f(){ wf apply loop2.zip; }; done",
+ "for i in 1; do f(){ wf apply loop.zip; }; done; f",
+ "while false; do f(){ :; }; done; wf self-update after.zip",
+ "if true; then f(){ wf apply p.zip; }; else f(){ :; }; fi | cat; f",
+ "(if true; then f(){ wf apply s.zip; }; else f(){ :; }; fi); f",
+ 'echo "$(if true; then f(){ :; }; fi)"; wf self-update sub.zip',
+ "if true; then f(){ wf apply b.zip; }; else f(){ :; }; fi & wait; f",
+ "if true; then f() ( wf apply sub.zip ); else f(){ :; }; fi; f",
+ "case $(wf apply subj.zip) in x) :;; esac",
+ "for i in $(wf self-update hdr.zip); do :; done",
+ "if true; then f(){ wf apply r.zip; } >/dev/null; else f(){ :; }; fi; f",
+]
+
+
+def bash_trace_kind(command):
+    """Run ``command`` in real Bash with a stand-in wf that only records argv."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        folder = Path(folder)
+        (folder / "bin").mkdir()
+        trace = folder / "trace"
+        (folder / "bin" / "wf").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$WF_TRACE"\n')
+        (folder / "bin" / "time").write_text('#!/bin/sh\nexec "$@"\n')   # stand-in external time
+        for name in ("wf", "time"):
+            (folder / "bin" / name).chmod(0o755)
+        command = command.replace("EXT_TIME", str(folder / "bin" / "time"))
+        subprocess.run(["bash", "-c", command], cwd=folder, capture_output=True, timeout=20,
+                       env={"PATH": f"{folder / 'bin'}:/usr/bin:/bin", "WF_TRACE": str(trace), "HOME": str(folder)})
+        calls = trace.read_text().splitlines() if trace.exists() else []
+        classified = (live._legacy_install(command) or {}).get("kind")
+    kinds = {"self-update": "tool", "apply": "project"}
+    executed = next((kinds[c.split()[0]] for c in calls if c.split() and c.split()[0] in kinds), None)
+    return executed, classified, calls
 
 
 class _Fixture(unittest.TestCase):
@@ -152,9 +300,10 @@ class ProductionTrustTests(_Fixture):
         self.assertEqual(live._evaluate_snapshot(snap), before)
         self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
         self.assertNotEqual(self.item(inst)["layer"], "verified")
-        # A recreated file is a new identity: the old grant stays invalid until
-        # a fresh collection is committed.
-        self.registry.write_bytes(raw)
+        # A registry written again (here with different bytes, so the check does
+        # not depend on inode reuse) keeps the old grant invalid until a fresh
+        # collection is committed.
+        self.registry.write_bytes(raw + b" ")
         self.assertFalse(self.item(inst)["collection"]["valid"])
         self.assertIs(self.run_goal(inst)["granted"], True)
         self.assertEqual(self.item(inst)["layer"], "verified")
@@ -239,6 +388,194 @@ class OutputSyntheticTests(MarkedSyntheticTests):
     """The verifier output alone says synthetic; transport omits the flag."""
     mode = "output"
     trust_reason = "production_trust_history_synthetic"
+
+
+def sealed(path, body):
+    """Write a store record exactly as release._record_new seals it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(review._canon(dict(body, body_sha256=release._digest(body))))
+
+
+class TransactionInventoryTests(_Fixture):
+    def blocked_after_prepare(self, inst):
+        """Third real apply_zip(by=driver), no exec: prepared, then a real block."""
+        from unittest.mock import patch
+        package = self.env.pkg("v0.3", {"PROJECT.md": _project_md("v0.3").encode(),
+                                         "CHANGELOG.md": b"# CHANGELOG\n\n## v0.3 - t\n- blocked\n",
+                                         "app.py": b"v0.3"})
+        rid = review.prepare(inst, package, kind="project", author="B")["request_id"]
+        self.assertTrue(review.run(rid)["allowed"])
+        original = release._InstallTx.__init__
+
+        def prepared_then_block(tx, *args, **kwargs):
+            original(tx, *args, **kwargs)
+            self.env.behave(verdict="block")
+            review.run(rid)
+            self.env.behave(verdict="pass")
+
+        with patch.object(release._InstallTx, "__init__", prepared_then_block):
+            with self.assertRaises(core.WfError):
+                release.apply_zip(core.Instance(inst.root), review_id=rid, by="driver")
+
+    def test_execless_failed_transaction_blocks_and_counts(self):
+        inst = self.fixture()
+        self.write_registry(self.registration())
+        seqs = len(live._strict_log(inst.events_path.read_bytes(), inst.events_path))
+        self.assertEqual(self.evaluate(inst)["authorization"], "available")
+        self.blocked_after_prepare(inst)
+        self.assertEqual(len(live._strict_log(inst.events_path.read_bytes(), inst.events_path)), seqs)
+        store = inst.evidence / "install"
+        failed = [p.name for p in store.iterdir() if (p / "failed.json").exists()]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(sorted(x.name for x in (store / failed[0]).glob("*.json")),
+                         ["baseline.json", "failed.json", "prepared.json"])
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        rows = [r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction")]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["seq"], row["turn"], row["reference"], row["state"], row["diagnostics"]),
+                         (None, 1, None, "failed", [live.TRANSACTION_DIAGNOSTIC]))
+        self.assertEqual((row["transaction"]["store"], row["transaction"]["id"], row["transaction"]["attribution"]),
+                         ("project", failed[0], "turn"))
+        self.assertEqual({r["record"]: r["state"] for r in row["transaction"]["records"]},
+                         {"baseline.json": None, "failed.json": "failed", "prepared.json": "prepared"})
+        self.assertEqual((result["authorization"], result["reason"]), ("unavailable", "install_history:failed"))
+        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(criterion["status"], "attempt_failed")
+        self.assertEqual(criterion["attempts"], {"total": 2, "ok": 1, "timeout": 0, "unknown": 0,
+                                                 "unbound_transactions": 1, "failed": 1})
+        self.assertIn(failed[0], criterion["why"])
+        self.assertFalse(result["report"]["summary"]["passed_strict"])
+        from unittest.mock import patch
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")), \
+             patch.object(Path, "resolve", side_effect=AssertionError("replay resolved a path")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertTrue(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        (store / failed[0] / "failed.json").chmod(0o600)
+        (store / failed[0] / "failed.json").write_bytes(b"{}")
+        self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        self.assertEqual(self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"][-1]["state"], "corrupt")
+
+    def test_store_records_attribution_restore_and_corrupt(self):
+        inst = self.fixture()
+        self.write_registry(self.registration())
+        tool_store = self.env.tool / "local" / "install"
+        self.assertTrue(tool_store.is_dir())
+        # Time unknown (no prepared record): blocks even outside any round.
+        lost = tool_store / ("tx-" + "a" * 32)
+        sealed(lost / "failed.json", {"schema": "install_tx/1", "state": "failed", "tx_id": lost.name})
+        result = self.evaluate(inst)
+        row = next(r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction"))
+        self.assertEqual((row["turn"], row["state"], row["transaction"]["attribution"], row["diagnostics"]),
+                         (None, "corrupt", "time_unknown",
+                          [live.TRANSACTION_DIAGNOSTIC, "transaction_record_missing:prepared.json"]))
+        self.assertTrue(result["history_authorization"]["eligible"])
+        self.assertEqual(result["install_transactions"]["why"],
+                         ["install_transaction_corrupt", "install_transaction_time_unknown"])
+        self.assertEqual(result["reason"], "install_transaction_corrupt；install_transaction_time_unknown")
+        for path in sorted(lost.iterdir()):
+            path.unlink()
+        lost.rmdir()
+        # Before the first round: listed, not blocking.
+        old = tool_store / ("tx-" + "b" * 32)
+        sealed(old / "prepared.json", {"schema": "install_tx/1", "state": "prepared", "tx_id": old.name,
+                                       "lock": {"acquired_at": "2020-01-01T00:00:00+00:00"}})
+        result = self.evaluate(inst)
+        row = next(r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction"))
+        self.assertEqual((row["turn"], row["state"], row["transaction"]["attribution"]),
+                         (None, "unknown", "before_first_turn"))
+        self.assertEqual(result["authorization"], "available")
+        # A restore job inside the round is an unbound target mutation.
+        restore = inst.evidence / "install" / ("restore-" + "c" * 32)
+        sealed(restore / "prepared.json", {"schema": "install_restore/1", "state": "prepared",
+                                           "restore_id": restore.name, "prepared_at": core.now().isoformat()})
+        result = self.evaluate(inst)
+        row = next(r for r in result["window_inputs"]["review_inputs"]["entries"]
+                   if (r.get("transaction") or {}).get("id") == restore.name)
+        self.assertEqual((row["turn"], row["state"], row["transaction"]["job"]), (1, "unknown", "restore"))
+        self.assertEqual((result["authorization"], result["reason"]), ("unavailable", "install_history:unknown"))
+        # An unsealed record is corrupt, never a bound or successful attempt.
+        bad = inst.evidence / "install" / ("tx-" + "d" * 32)
+        bad.mkdir()
+        (bad / "prepared.json").write_text(json.dumps({"state": "completed"}))
+        rows = {r["transaction"]["id"]: r for r in self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"]
+                if r.get("transaction")}
+        self.assertEqual((rows[bad.name]["state"], rows[bad.name]["diagnostics"]),
+                         ("corrupt", [live.TRANSACTION_DIAGNOSTIC, "transaction_record_corrupt:prepared.json"]))
+
+
+def prepared_body(txid, **change):
+    body = {"schema": "install_tx/1", "state": "prepared", "tx_id": txid,
+            "lock": {"acquired_at": core.now().isoformat()}}
+    body.update(change)
+    return body
+
+
+class TransactionProtocolTests(_Fixture):
+    def test_record_shapes_are_validated_not_crashing(self):
+        """Seal is not enough: schema/state/id/lock/link must match the writer."""
+        import shutil
+        inst = self.fixture()
+        self.write_registry(self.registration())
+        self.assertEqual(self.evaluate(inst)["authorization"], "available")
+        store = inst.evidence / "install"
+        tx = "tx-" + "e" * 32
+        restore = "restore-" + "e" * 32
+        cases = [
+            ("lock-string", tx, {"prepared.json": prepared_body(tx, lock="not-an-object")},
+             "transaction_record_field:prepared.json:lock"),
+            ("lock-empty", tx, {"prepared.json": prepared_body(tx, lock={})}, "transaction_record_field:prepared.json:lock"),
+            ("lock-naive", tx, {"prepared.json": prepared_body(tx, lock={"acquired_at": "2026-10-15T00:00:00"})},
+             "transaction_record_field:prepared.json:lock"),
+            ("schema", tx, {"prepared.json": prepared_body(tx, schema="install_tx/9")},
+             "transaction_record_schema:prepared.json"),
+            ("state", tx, {"prepared.json": prepared_body(tx, state="completed")},
+             "transaction_record_field:prepared.json:state"),
+            ("tx_id", tx, {"prepared.json": prepared_body("tx-" + "f" * 32)}, "transaction_record_field:prepared.json:tx_id"),
+            ("unknown-record", tx, {"prepared.json": prepared_body(tx),
+                                    "mystery.json": {"schema": "install_tx/1", "state": "prepared", "tx_id": tx}},
+             "transaction_record_unknown:mystery.json"),
+            ("unlinked-failed", tx, {"prepared.json": prepared_body(tx),
+                                     "failed.json": {"schema": "install_tx/1", "state": "failed", "tx_id": tx,
+                                                     "prepared_sha256": "0" * 64}},
+             "transaction_record_field:failed.json:prepared_sha256"),
+            ("baseline-schema", tx, {"prepared.json": prepared_body(tx),
+                                     "baseline.json": {"schema": "baseline/9", "tx_id": tx}},
+             "transaction_record_schema:baseline.json"),
+            ("bad-id", "tx-" + "Z" * 32, {"prepared.json": prepared_body("tx-" + "Z" * 32)}, "transaction_id_invalid"),
+            ("restore-time", restore, {"prepared.json": {"schema": "install_restore/1", "state": "prepared",
+                                                         "restore_id": restore}},
+             "transaction_record_field:prepared.json:prepared_at"),
+        ]
+        for label, name, records, diagnostic in cases:
+            for record, body in records.items():
+                sealed(store / name / record, body)
+            snap = live._capture_inputs(inst, rounds=1)
+            result = live._evaluate_snapshot(snap)
+            row = next(r for r in result["window_inputs"]["review_inputs"]["entries"]
+                       if (r.get("transaction") or {}).get("id") == name)
+            self.assertEqual(row["state"], "corrupt", label)
+            self.assertIn(diagnostic, row["diagnostics"], label)
+            self.assertIsNone(row["reference"], label)
+            self.assertIn("install_transaction_corrupt", result["install_transactions"]["why"], label)
+            self.assertEqual(result["authorization"], "unavailable", label)
+            if label == "lock-string":
+                # A bad field is never an ordinary unknown time that could be ignored.
+                self.assertEqual((row["turn"], row["transaction"]["attribution"]), (None, "time_unknown"))
+                self.assertEqual(result["reason"], "install_transaction_corrupt；install_transaction_time_unknown")
+                from unittest.mock import patch
+                with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")):
+                    self.assertEqual(live._evaluate_snapshot(snap), result)
+            shutil.rmtree(store / name)
+        # A record that is a directory is explicit, too.
+        (store / tx / "prepared.json").mkdir(parents=True)
+        row = next(r for r in self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"]
+                   if (r.get("transaction") or {}).get("id") == tx)
+        self.assertEqual((row["state"], row["diagnostics"]),
+                         ("corrupt", [live.TRANSACTION_DIAGNOSTIC, "transaction_record_not_file:prepared.json"]))
+        shutil.rmtree(store / tx)
+        self.assertEqual(self.evaluate(inst)["authorization"], "available")
 
 
 def live_history_reader(inst):
@@ -338,7 +675,29 @@ class LegacyEntryTests(_Fixture):
         self.assertEqual(live._evaluate_snapshot(snap)["window_inputs"]["review_inputs"],
                          result["window_inputs"]["review_inputs"])
 
-    def legacy_only_fixture(self):
+    def test_real_drill_review_parent_exec_is_unknown(self):
+        """CT3: the actual wf.py drill review, outer exit 0, no parent entry before."""
+        inst = self.fixture()
+        wf_py = Path(live.__file__).resolve().parent.parent / "wf.py"
+        seqs = {}
+        for kind in ("block", "timeout"):
+            command = shlex.join([sys.executable, str(wf_py), "drill", "review", "--kind", kind,
+                                  "--dir", str(self.base / f"real drill {kind}"), "--review", str(self.env.runner),
+                                  "--review-timeout-s", "3"]) + " || true"
+            self.assertEqual(ops.run_exec(inst, command, by="driver", timeout=240), 0)
+            event = live._strict_log(inst.events_path.read_bytes(), inst.events_path)[-1]
+            self.assertEqual(event["install_refs"], [])
+            self.assertTrue((self.base / f"real drill {kind}" / "drill-result.json").exists())
+            seqs[kind] = event["seq"]
+        result = self.evaluate(inst)
+        rows = {r["seq"]: r for r in result["window_inputs"]["review_inputs"]["entries"]}
+        for kind, seq in seqs.items():
+            self.assertEqual((rows[seq]["state"], rows[seq]["reference"], rows[seq]["diagnostics"],
+                              rows[seq]["legacy_command"]["kind"]),
+                             ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review"), kind)
+        self.assertIn("install_history:unknown", result["history_authorization"]["why"])
+
+    def legacy_only_fixture(self, legacy=None):
         """Same live window as the C5 fixture but with no structured receipt."""
         from datetime import timedelta
         from .selftest_review import _git
@@ -350,12 +709,13 @@ class LegacyEntryTests(_Fixture):
         for kind, fields in (("reply_binding", {"receipt": "ok", "deliveries": "ok"}),
                              ("reply_checked", {}), ("round_result", {"ok": True})):
             inst.event(kind, by="driver", **fields)
-        legacy = {
+        legacy = legacy if legacy is not None else {
             "project": "wf apply legacy.zip",
             "tool_failed": shlex.join([sys.executable, "/space path/wf.py", "self-update", "legacy.zip"]),
             "drill": shlex.join([sys.executable, "/space path/wf.py", "drill", "review", "--kind", "block",
                                  "--dir", "/d", "--review", "/r"]),
             "echo": "echo 'wf self-update legacy.zip'",
+            "tool_absent": "wf self-update --auto workflow/outbox/missing.zip",
         }
         for name, command in legacy.items():
             inst.event("exec", cid=f"c{len(name):02d}", cmd=command, exit_code=1 if name == "tool_failed" else 0,
@@ -399,9 +759,17 @@ class LegacyEntryTests(_Fixture):
                           for name, seq in seqs.items() if name != "echo"},
                          {"project": ("unknown", None, ["legacy_install_reference_unavailable"], "project"),
                           "tool_failed": ("unknown", None, ["legacy_install_reference_unavailable"], "tool"),
-                          "drill": ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review")})
+                          "drill": ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review"),
+                          "tool_absent": ("unknown", None, ["legacy_install_reference_unavailable"], "tool")})
         self.assertNotIn(seqs["echo"], rows)
+        # An exit-0 legacy self-update whose package is gone is frozen as
+        # absence and reported, instead of aborting the whole collection.
+        absent = {s["path"]: s["state"] for s in descriptor["sources"]}
+        self.assertEqual(absent[str(inst.root / "workflow/outbox/missing.zip")], "absent")
         result = live._evaluate_snapshot(snap)
+        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertFalse(criterion["ok"])
+        self.assertIn("没有记录", criterion["why"])
         self.assertIn("install_history:unknown", result["history_authorization"]["why"])
         self.assertEqual(result["authorization"], "unavailable")
         # Capture and replay share the source: frozen replay rebuilds the same
@@ -416,8 +784,84 @@ class LegacyEntryTests(_Fixture):
         self.assertIs(verified["granted"], False)
         self.assertIn("install_history:unknown", verified["why"])
 
+    def test_uncalled_function_definition_is_not_an_install(self):
+        """Real ops.run_exec: definitions, shadowing and definition redirections run no wf."""
+        inst = self.fixture()
+        self.assertTrue(self.evaluate(inst)["report"]["summary"]["passed_strict"])
+
+        def stores():
+            return [sorted(p.name for p in store.iterdir())
+                    for store in (inst.evidence / "install", self.env.tool / "local" / "install")]
+
+        before = stores()
+        for command in ("helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary",
+                        "setup() { wf() { :; }; }; setup; wf self-update unused.zip",
+                        'f() { :; } >"$(wf self-update unused.zip)"',
+                        "setup() ( f() { wf self-update unused.zip; }; ); setup; f; :"):
+            self.assertEqual(ops.run_exec(inst, command, by="driver"), 0, command)
+            seq = live._strict_log(inst.events_path.read_bytes(), inst.events_path)[-1]["seq"]
+            self.assertEqual(stores(), before, command)
+            result = self.evaluate(inst)
+            self.assertFalse([r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("seq") == seq],
+                             command)
+            criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+            self.assertEqual(criterion["attempts"], {"total": 1, "ok": 1, "timeout": 0, "unknown": 0, "failed": 0})
+            self.assertTrue(result["report"]["summary"]["passed_strict"], command)
+            self.assertEqual(live.check(inst, rounds=1), result["report"])
+
+    def test_classifier_agrees_with_real_bash_argv_trace(self):
+        """Stand-in argv trace: a wf on PATH that only records its arguments."""
+        import shutil
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        for command in BASH_ORACLE:
+            executed, classified, calls = bash_trace_kind(command)
+            self.assertEqual(classified, executed, (command, calls))
+
+    def test_scope_table_agrees_with_real_bash_argv_trace(self):
+        """Definition scope per supported syntax, each row with shadow/redefinition contrasts."""
+        import shutil
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        over, executed_rows = [], 0
+        for row, commands in SCOPE_TABLE.items():
+            for command in commands:
+                executed, classified, calls = bash_trace_kind(command)
+                if row.startswith("CONSERVATIVE") and executed is None:
+                    if classified is not None:
+                        over.append(command)
+                    continue
+                executed_rows += executed is not None
+                self.assertEqual(classified, executed, (row, command, calls))
+        self.assertEqual(sorted(over), sorted([
+            "if true; then wf() { :; }; fi; wf self-update x.zip", "true && wf() { :; }; wf self-update x.zip",
+            "case a in a) wf() { :; };; esac; wf self-update x.zip",
+            "f() { wf apply keep.zip; }; if true; then f() { :; }; fi; f"]))
+        self.assertGreater(executed_rows, 20)
+
+    def test_branch_union_agrees_with_real_bash_argv_trace(self):
+        """C-SCOPE-FIX2: if/elif/else and case branches, loop iterations: union of possible definitions."""
+        import shutil
+        import subprocess
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        version = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
+                                 capture_output=True, text=True).stdout.strip()
+        if version != "5.2":
+            self.skipTest(f"branch oracle is pinned to real Bash 5.2, found {version}")
+        rows = []
+        for command in BRANCH_TABLE:
+            executed, classified, calls = bash_trace_kind(command)
+            rows.append((command, executed, classified))
+            self.assertEqual(classified, executed, (command, calls))
+        self.assertEqual({c: e for c, e, _ in rows if c in BRANCH_MISSES}, BRANCH_MISSES)
+        self.assertEqual(len(rows), len(BRANCH_TABLE))
+        self.assertGreaterEqual(sum(e is not None for _, e, _ in rows), 18)
+        self.assertGreaterEqual(sum(e is None for _, e, _ in rows), 4)
+
     def test_pre_receipt_events_and_classifier(self):
-        reader = SimpleNamespace(bytes=lambda path: None)
+        reader = SimpleNamespace(bytes=lambda path: None,
+                                 directory=lambda path: {"state": "absent", "members": []})
         inst = SimpleNamespace(name="p", root=Path("/p"), evidence=Path("/p/workflow/evidence"))
         events = [
             {"type": "exec", "seq": 1, "turn": 1, "cmd": "wf apply legacy.zip", "exit_code": 0},
@@ -451,16 +895,280 @@ class LegacyEntryTests(_Fixture):
             "cd /x && python3 '/a b/wf.py' drill --kind timeout review --dir /d --review /r": ("inner_review", None),
             "wf apply x.zip && wf drill review --kind block --dir /d --review /r": ("inner_review", None),
             "wf apply x.zip; wf self-update y.zip": ("project", "x.zip"),
+            'echo "$(wf apply sub.zip)"': ("project", "sub.zip"),
+            "echo `wf self-update tick.zip`": ("tool", "tick.zip"),
+            "if true; then wf apply cond.zip; fi": ("project", "cond.zip"),
+            "{ wf apply group.zip; }": ("project", "group.zip"),
+            "2>/dev/null wf apply fd.zip": ("project", "fd.zip"),
+            "wf apply r.zip > log 2>&1": ("project", "r.zip"),
+            "cat <<EOF\n$(wf apply here.zip)\nEOF": ("project", "here.zip"),
+            "echo x # note\nwf apply after.zip": ("project", "after.zip"),
+            "helper() { wf self-update used.zip; }; helper": ("tool", "used.zip"),
+            "function h { wf apply fn.zip; }\nh": ("project", "fn.zip"),
+            'f() { echo "$(wf apply sub.zip)"; }; f': ("project", "sub.zip"),
+            'f() { wf apply out.zip; }; echo "$(f)"': ("project", "out.zip"),
+            "g() { f; }; f() { wf apply late.zip; }; g": ("project", "late.zip"),
+            "wf() { echo shadow; }; command wf apply real.zip": ("project", "real.zip"),
+            "f() ( wf apply paren.zip ); f > log": ("project", "paren.zip"),
+            "f() { wf self-update used.zip; }; time f": ("tool", "used.zip"),
+            "setup() { f() { wf self-update used.zip; }; }; setup; f": ("tool", "used.zip"),
+            "f() { :; }; setup() { f() { wf self-update used.zip; }; }; setup; f": ("tool", "used.zip"),
+            'f() { :; } >"$(wf self-update used.zip)"; f': ("tool", "used.zip"),
+            "(wf() { :; }); wf self-update leak.zip": ("tool", "leak.zip"),
         }
         for command, (kind, argument) in positives.items():
             got = live._legacy_install(command)
             self.assertEqual((got["kind"], got["argument"], got["parsed"]), (kind, argument, True), command)
         for command in ("echo 'wf apply x.zip'", "grep 'wf self-update' log", "python3 -c 'print(1)'",
                         "python3 wf.py selftest", "wf status", "make apply", "exit 124", "echo 'oops",
-                        "echo 'wf drill review'", "wf drill", "wf drill other --kind block"):
+                        "echo 'wf drill review'", "wf drill", "wf drill other --kind block",
+                        "echo ';' wf apply x.zip", "echo '&&' wf self-update y.zip", "printf '%s\\n' '|' wf apply x",
+                        "echo hi > wf apply x.zip", "make # wf apply x.zip", "cat <<'EOF'\nwf apply x.zip\nEOF",
+                        "cat <<EOF\nwf apply x.zip\nEOF", 'echo "a; wf apply x.zip"', "echo a\\;wf apply x",
+                        "cat <<< wf apply x",
+                        "helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary",
+                        "function helper { wf apply x.zip; }", "f() ( wf apply x.zip )",
+                        'f() { echo "$(wf apply x.zip)"; }', "f() {\ncat <<EOF\n$(wf apply x.zip)\nEOF\n}",
+                        "wf() { echo shadow; }; wf apply x.zip", "helper; helper() { wf apply x.zip; }",
+                        "setup() { wf() { :; }; }; setup; wf self-update unused.zip",
+                        'f() { :; } >"$(wf self-update unused.zip)"', "command -v wf self-update",
+                        "f() { wf apply x.zip; }; command f", "f() { wf apply x.zip; }; env f"):
             self.assertIsNone(live._legacy_install(command), command)
         unparsable = live._legacy_install("wf apply 'x.zip")
         self.assertEqual((unparsable["parsed"], unparsable["kind"], unparsable["argument"]), (False, None, None))
+
+
+class ExeclessWindowTests(_Fixture):
+    legacy_only_fixture = LegacyEntryTests.legacy_only_fixture
+    blocked_after_prepare = TransactionInventoryTests.blocked_after_prepare
+
+    def ordinary(self):
+        """Pre-receipt round whose only exec is ``true`` (no receipt, no legacy entry)."""
+        inst, seqs = self.legacy_only_fixture({"plain": "true"})
+        self.assertFalse(live._history_required(live._strict_log(inst.events_path.read_bytes(), inst.events_path)))
+        return inst
+
+    def test_ordinary_window_lists_execless_failed_transaction(self):
+        inst = self.ordinary()
+        before = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(before)
+        self.assertEqual(before.descriptor["review_inputs"],
+                         {"state": "unavailable", "reason": "install_history_unavailable",
+                          "transaction_stores": [
+                              {"store": "project", "path": str(inst.evidence / "install"), "state": "absent"},
+                              {"store": "tool", "path": str(self.env.tool / "local" / "install"), "state": "absent"}]})
+        self.assertEqual(next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)["status"],
+                         "not_applicable")
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+        self.blocked_after_prepare(inst)
+        # The frozen store listing gates history: the old window is now stale.
+        self.assertFalse(live._revalidate_inputs(inst, before.descriptor)["valid"])
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        inputs = snap.descriptor["review_inputs"]
+        self.assertEqual(inputs["schema"], "live-install-history/1")
+        self.assertIs(snap.descriptor["complete"], False)
+        rows = [r for r in inputs["entries"] if r.get("transaction")]
+        self.assertEqual([(r["seq"], r["turn"], r["reference"], r["state"], r["transaction"]["store"])
+                          for r in rows], [(None, 1, None, "failed", "project")])
+        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(criterion["status"], "attempt_failed")
+        self.assertEqual(criterion["attempts"], {"total": 1, "ok": 0, "timeout": 0, "unknown": 0,
+                                                 "unbound_transactions": 1, "failed": 1})
+        self.assertIn(rows[0]["transaction"]["id"], criterion["why"])
+        self.assertEqual(result["authorization"], "unavailable")
+        self.assertIn("install_history:failed", result["history_authorization"]["why"])
+        self.assertEqual([s["state"] for s in result["install_transactions"]["stores"]], ["present", "absent"])
+        from unittest.mock import patch
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")), \
+             patch.object(Path, "resolve", side_effect=AssertionError("replay resolved a path")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertTrue(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        verified = self.run_goal(inst)
+        self.assertIs(verified["granted"], False)
+
+    def direct_matches_frozen(self, legacy):
+        from unittest.mock import patch
+        inst, _ = self.legacy_only_fixture(legacy)
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        self.assertEqual(sum(e["type"] == "exec" for e in events), len(legacy))
+        self.assertIsNone(live._direct_history_route(inst, events))
+        before = live._capture_inputs(inst, rounds=1)
+        direct = live.check(inst, rounds=1)
+        self.assertEqual(direct, live._evaluate_snapshot(before)["report"])
+        self.assertNotIn("authorization", direct)   # ordinary window: unchanged legacy report
+        self.blocked_after_prepare(inst)
+        self.assertIs(live._revalidate_inputs(inst, before.descriptor)["valid"], False)
+        self.assertEqual(live._direct_history_route(inst, events), "strict")
+        calls = []
+        original = live._capture_inputs
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        with patch.object(live, "_capture_inputs", counted):
+            direct = live.check(inst, rounds=1)
+        self.assertEqual(len(calls), 1)   # the same frozen collection, no second path
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        self.assertEqual(direct, result["report"])
+        criterion = next(c for c in direct["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(criterion["status"], "attempt_failed")
+        self.assertEqual(criterion["attempts"], {"total": 1, "ok": 0, "timeout": 0, "unknown": 0,
+                                                 "unbound_transactions": 1, "failed": 1})
+        unbound = direct["authorization"]["unbound_transactions"]
+        self.assertEqual([(u["store"], u["state"], u["turn"], u["attribution"]) for u in unbound],
+                         [("project", "failed", 1, "turn")])
+        self.assertIn(unbound[0]["id"], criterion["why"])
+        self.assertEqual(direct["authorization"]["state"], "unavailable")
+        self.assertIn("install_history:failed", direct["authorization"]["why"])
+        self.assertFalse(direct["summary"]["passed_strict"])
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")), \
+             patch.object(live, "_directory_source", side_effect=AssertionError("replay listed disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        return inst
+
+    def test_direct_check_zero_exec_window_lists_execless_transaction(self):
+        self.direct_matches_frozen({})
+
+    def test_direct_check_true_only_window_lists_execless_transaction(self):
+        inst = self.direct_matches_frozen({"plain": "true"})
+        # A transaction window never falls back to a report that omits it.
+        cfg = json.loads(self.env.transport.read_bytes())
+        adapter = Path(cfg["log"])
+        adapter.write_text(adapter.read_text().replace('"root"', '"elsewhere"'), encoding="utf-8")
+        report = live.check(inst, rounds=1)
+        self.assertEqual((report["rounds"], report["passed"], report["input_problem"]["state"]), ([], False, "unknown"))
+        self.assertNotIn("authorization", report)
+
+    def test_direct_check_pure_legacy_window(self):
+        inst, _ = self.legacy_only_fixture()
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        self.assertEqual(live._direct_history_route(inst, events), "legacy")
+        result = self.evaluate(inst)
+        direct = live.check(inst, rounds=1)
+        self.assertEqual(direct, result["report"])
+        self.assertEqual(direct["authorization"]["state"], "unavailable")
+        self.assertIn("install_history:unknown", direct["authorization"]["why"])
+        # When strict capture is impossible the legacy report stays available,
+        # with the uncollected history made explicit.
+        cfg = json.loads(self.env.transport.read_bytes())
+        adapter = Path(cfg["log"])
+        adapter.write_text(adapter.read_text().replace('"root"', '"elsewhere"'), encoding="utf-8")
+        report = live.check(inst, rounds=1)
+        self.assertTrue(report["rounds"])
+        self.assertEqual((report["authorization"]["state"], report["authorization"]["why"],
+                          report["authorization"]["input_problem"]["state"]),
+                         ("unavailable", ["install_history_uncollected"], "unknown"))
+        self.assertEqual({k: v for k, v in report.items() if k != "authorization"},
+                         live.check(inst, rounds=1, _route=False))
+
+    def stale_legacy_route(self, hook):
+        """Pure-legacy window routed ``legacy``; a real blocked apply lands at ``hook``."""
+        from unittest.mock import patch
+        inst, _ = self.legacy_only_fixture()
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        self.assertEqual(live._direct_history_route(inst, events), "legacy")
+        adapter = Path(json.loads(self.env.transport.read_bytes())["log"])
+        adapter.write_text(adapter.read_text().replace('"root"', '"elsewhere"'), encoding="utf-8")
+        fired = []
+        original = getattr(live, hook)
+
+        def interleave(*args, **kwargs):
+            if not fired and (hook == "_capture_inputs" or kwargs.get("_route") is False):
+                fired.append(1)
+                self.blocked_after_prepare(inst)   # real apply_zip, real review block
+            return original(*args, **kwargs)
+
+        with patch.object(live, hook, interleave):
+            report = live.check(inst, rounds=1)
+        self.assertEqual(fired, [1])
+        failed = [p for p in (inst.evidence / "install").iterdir() if (p / "failed.json").exists()]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(live._strict_log(inst.events_path.read_bytes(), inst.events_path), events)
+        # Never the cached legacy fallback that would omit the new transaction.
+        self.assertEqual((report["rounds"], report["passed"], report["input_problem"]["state"]), ([], False, "unknown"))
+        self.assertNotIn("authorization", report)
+        self.assertEqual(live.check(inst, rounds=1), report)
+
+    def test_capture_failure_rechecks_route_when_tx_appears_before_capture(self):
+        self.stale_legacy_route("_capture_inputs")
+
+    def test_capture_failure_rechecks_route_when_tx_appears_during_fallback(self):
+        self.stale_legacy_route("check")
+
+    def test_store_and_record_faults_are_explicit(self):
+        import shutil
+        from unittest.mock import patch
+        inst = self.ordinary()
+
+        def store_row(result):
+            rows = [r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction")]
+            self.assertEqual(len(rows), 1, rows)
+            self.assertIn("install_transaction_corrupt", result["install_transactions"]["why"])
+            self.assertEqual(result["authorization"], "unavailable")
+            return rows[0]
+
+        # Tool store is a symlink.
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        tool_store = self.env.tool / "local" / "install"
+        tool_store.parent.mkdir(parents=True, exist_ok=True)
+        tool_store.symlink_to(elsewhere, target_is_directory=True)
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        row = store_row(result)
+        self.assertEqual((row["transaction"]["store"], row["state"], row["diagnostics"]),
+                         ("tool", "corrupt", [live.TRANSACTION_DIAGNOSTIC, "transaction_store_unsupported:symlink directory"]))
+        self.assertEqual(result["install_transactions"]["stores"][1]["state"], "fault")
+        with patch.object(live, "_directory_source", side_effect=AssertionError("replay listed disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+        self.assertEqual([(u["store"], u["state"]) for u in result["report"]["authorization"]["unbound_transactions"]],
+                         [("tool", "corrupt")])
+        self.assertEqual(result["report"]["authorization"]["state"], "unavailable")
+        tool_store.unlink()
+        # Project store is not a directory.
+        store = inst.evidence / "install"
+        store.write_text("not a directory")
+        row = store_row(self.evaluate(inst))
+        self.assertEqual(row["diagnostics"],
+                         [live.TRANSACTION_DIAGNOSTIC, "transaction_store_unreadable:NotADirectoryError"])
+        store.unlink()
+        # A transaction directory with a symlinked record.
+        tx = store / ("tx-" + "f" * 32)
+        tx.mkdir(parents=True)
+        (tx / "prepared.json").symlink_to(elsewhere)
+        row = store_row(self.evaluate(inst))
+        self.assertEqual((row["transaction"]["id"], row["diagnostics"]),
+                         (tx.name, [live.TRANSACTION_DIAGNOSTIC, "transaction_directory_unsupported:directory member type"]))
+        (tx / "prepared.json").unlink()
+        # An unreadable record (fault injected at capture only) replays from
+        # the frozen fault without touching disk, and fresh revalidation sees
+        # that the fault no longer holds.
+        sealed(tx / "prepared.json", prepared_body(tx.name))
+        original = live._file_source
+        target = str(tx / "prepared.json")
+
+        def unreadable(path):
+            if str(path) == target:
+                raise live._InputProblem("unreadable", path, "PermissionError")
+            return original(path)
+
+        with patch.object(live, "_file_source", unreadable):
+            snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        row = store_row(result)
+        self.assertEqual(row["diagnostics"], [live.TRANSACTION_DIAGNOSTIC, "transaction_record_unreadable:prepared.json"])
+        self.assertEqual(snap.descriptor["review_inputs"]["transaction_faults"],
+                         [{"fault": True, "op": "bytes", "path": target, "state": "unreadable", "detail": "PermissionError"}])
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        readable = [r for r in self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"] if r.get("transaction")]
+        self.assertEqual((readable[0]["state"], readable[0]["transaction"]["attribution"]), ("unknown", "turn"))
+        shutil.rmtree(store)
 
 
 if __name__ == "__main__":
