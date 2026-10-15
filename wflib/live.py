@@ -309,28 +309,48 @@ def _function_body(tokens, j):
     raise ValueError("unsupported function body")
 
 
-def _shell_items(tokens):
-    """Ordered ``("seg", argv, substitutions)`` and ``("def", name, items)``.
+_LEGACY_MAX_DEPTH = 6
 
-    A function definition (``name() {...}``, ``name() (...)``,
-    ``function name {...}``) is recorded, not executed: its body runs only
-    where the function is later invoked.
+
+def _parse_items(tokens, i=0, nested=False):
+    """Items of one shell list: ``("seg", argv, subs, isolated)``,
+    ``("def", name, body_items, redirect_subs, isolated)`` and
+    ``("sub", items)`` for ``( ... )``. ``isolated`` marks pipeline members
+    and background jobs, which run in a subshell.
     """
     import re
-    items, argv, subs = [], [], []
-    i, n = 0, len(tokens)
+    items, seps, argv, subs = [], [], [], []
+    n = len(tokens)
 
     def flush():
         nonlocal argv, subs
         if argv or subs:
-            items.append(("seg", argv, subs))
+            items.append(["seg", argv, subs])
+            seps.append(None)
         argv, subs = [], []
+
+    def finish():
+        out = []
+        for k, item in enumerate(items):
+            isolated = seps[k] in ("|", "|&", "&") or (k > 0 and seps[k - 1] in ("|", "|&"))
+            out.append(("sub", item[1]) if item[0] == "sub" else tuple(item) + (isolated,))
+        return out
 
     while i < n:
         token = tokens[i]
         if token[0] == "op":
+            op = token[1]
+            if op == "(" and not argv and not subs:
+                inner, i = _parse_items(tokens, i + 1, nested=True)
+                items.append(["sub", inner])
+                seps.append(None)
+                continue
             flush()
             i += 1
+            if op == ")" and nested:
+                return finish(), i
+            if seps and seps[-1] is None and op not in ("(", ")"):
+                seps[-1] = op
             continue
         if token[0] == "subs":
             subs = subs + list(token[1])
@@ -349,13 +369,28 @@ def _shell_items(tokens):
                 while j < n and tokens[j] == ("op", "\n"):
                     j += 1
                 body, i = _function_body(tokens, j)
-                items.append(("def", name, _shell_items(body)))
+                # Redirections after the body (and their substitutions) belong
+                # to the definition and run only when the function is invoked.
+                redirect = []
+                while i < n and tokens[i][0] == "subs":
+                    redirect.extend(tokens[i][1])
+                    i += 1
+                items.append(["def", name, _parse_items(body)[0], redirect])
+                seps.append(None)
                 continue
         argv.append(token[1])
         subs = subs + list(token[2])
         i += 1
     flush()
-    return items
+    return finish(), i
+
+
+def _shell_items(tokens):
+    return _parse_items(tokens)[0]
+
+
+def _unknown_legacy():
+    return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False, "argument": None}
 
 
 def _pick_legacy(hits):
@@ -369,16 +404,28 @@ def _pick_legacy(hits):
     return None
 
 
-def _classify_items(items, depth, functions):
-    """Hits of the commands that actually run, in order; definitions do not run."""
-    functions, hits = dict(functions), []
+def _classify_items(items, depth, env):
+    """Hits of the commands that actually run, in order.
+
+    ``env`` is the function table of the current shell and is updated in
+    place: a definition (also one made inside an invoked function or eval)
+    persists for later commands. Subshells (``( ... )``, pipeline members,
+    background jobs, command substitutions) work on a copy.
+    """
+    hits = []
     for item in items:
         if item[0] == "def":
-            functions[item[1]] = item[2]
+            _, name, body, redirect, isolated = item
+            if not isolated:
+                env[name] = (body, redirect)
             continue
-        _, argv, subs = item
-        hits.append(_legacy_simple(argv, depth, functions))
-        hits.extend(_legacy_install(body, depth + 1, functions) for body in subs)
+        if item[0] == "sub":
+            hits.extend(_classify_items(item[1], depth, dict(env)))
+            continue
+        _, argv, subs, isolated = item
+        scope = dict(env) if isolated else env
+        hits.extend(_legacy_install(body, depth + 1, dict(scope)) for body in subs)
+        hits.append(_legacy_simple(argv, depth, scope))
     return hits
 
 
@@ -389,38 +436,61 @@ def _legacy_install(cmd, _depth=0, _functions=None):
     argument}``. ``argument`` is only the first positional package operand used
     by the legacy report path; it is never an installation reference and never
     authorizes anything. Commands that mention a wf entry point but cannot be
-    tokenized are returned with ``parsed=False`` and ``kind=None`` (explicitly
-    unknown). Function bodies count only where the function is invoked.
-    Indirection through scripts, aliases or variables is outside this
-    reporting classifier.
+    tokenized, and nesting beyond the supported depth, are explicitly unknown
+    (``parsed=False``, ``kind=None``). Function bodies count only where the
+    function is invoked. Indirection through scripts, aliases, variables or
+    functions defined outside the command is outside this reporting classifier.
     """
     import re
-    if not isinstance(cmd, str) or not cmd.strip() or _depth > 3:
+    if not isinstance(cmd, str) or not cmd.strip():
         return None
+    if _depth > _LEGACY_MAX_DEPTH:
+        return _unknown_legacy()
     try:
         items = _shell_items(_shell_tokens(cmd))
     except ValueError:
         mentions = re.search(r"(?:^|[\s/'\"`;&|(])wf(?:\.py)?(?=['\"\s`]|$)", cmd) \
             and re.search(r"(?<![\w-])(?:apply|self-update|drill)(?![\w-])", cmd)
-        return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False,
-                "argument": None} if mentions else None
-    return _pick_legacy(_classify_items(items, _depth, _functions or {}))
+        return _unknown_legacy() if mentions else None
+    return _pick_legacy(_classify_items(items, _depth, _functions if _functions is not None else {}))
 
 
 def _legacy_simple(argv, depth, functions=None):
     import re
     i, n = 0, len(argv)
     assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
-    while i < n and (assignment.fullmatch(argv[i]) or argv[i] in _SHELL_RESERVED):
-        i += 1
-    if i < n and functions and argv[i] in functions:
-        # A shell function shadows any command of the same name (including wf).
-        return _pick_legacy(_classify_items(functions[argv[i]], depth + 1, functions)) if depth < 3 else None
+    while i < n:
+        if assignment.fullmatch(argv[i]) or argv[i] in _SHELL_RESERVED:
+            i += 1
+        elif argv[i] == "time":
+            # The unqualified ``time`` is a shell keyword: the timed command can
+            # be a function. A path such as /usr/bin/time is an external wrapper.
+            i += 1
+            while i < n and argv[i].startswith("-") and argv[i] != "--":
+                i += 1
+            if i < n and argv[i] == "--":
+                i += 1
+        else:
+            break
+    if i < n and functions is not None and argv[i] in functions:
+        # A shell function shadows any command of the same name (including wf)
+        # and runs in the current shell: definitions it makes persist.
+        if depth >= _LEGACY_MAX_DEPTH:
+            return _unknown_legacy()
+        body, redirect = functions[argv[i]]
+        hits = [_legacy_install(text, depth + 1, dict(functions)) for text in redirect]
+        hits.extend(_classify_items(body, depth + 1, functions))
+        return _pick_legacy(hits)
     while i < n and argv[i].rsplit("/", 1)[-1] in _WRAPPERS:
         wrapper = argv[i].rsplit("/", 1)[-1]
         i += 1
+        options = []
         while i < n and (argv[i].startswith("-") or assignment.fullmatch(argv[i])):
+            options.append(argv[i])
             i += 2 if argv[i] in _WRAPPER_VALUE_OPTIONS else 1
+        if wrapper == "command" and any(o.startswith("-") and o != "--" and ("v" in o or "V" in o)
+                                        for o in options):
+            return None   # command -v/-V only reports how a name would resolve
         if wrapper == "timeout" and i < n:
             i += 1   # duration operand
     if i >= n:
@@ -858,6 +928,14 @@ def _direct_history_route(inst, events):
     return "legacy" if _history_required(events) else None
 
 
+def _fresh_route(inst):
+    """Route from fresh events and store listings; any doubt means strict."""
+    try:
+        return _direct_history_route(inst, _jsonl(inst.events_path))
+    except (OSError, ValueError, TypeError, _InputProblem):
+        return "strict"
+
+
 def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None, _route=True) -> dict:
     # 1.9.3：按执行端第 123 轮的复核再修——不跳过失败的轮次（按轮号连续计）；日志条目必须带项目字段；回复要核父子 uuid；
     # 审查核版本包哈希与先后；待办按事件核关闭时刻；发现延迟不得为负；同步要带当时的 HEAD；
@@ -877,15 +955,20 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None, _route=Tr
             return _evaluate_snapshot(_capture_inputs(inst, rounds=rounds, budget_s=budget_s))["report"]
         except _InputProblem as exc:
             problem = {"state": exc.state, "source": exc.source, "detail": exc.detail}
-            if route == "strict":
-                missing = [f"实景输入 {exc.state}：{exc.source}：{exc.detail}"]
-                return {"rounds": [], "streak": 0, "need": rounds, "missing": missing, "passed": False,
-                        "summary": _summary(inst, [], [], rounds, 0, missing, False),
-                        "input_problem": problem}
-            report = check(inst, rounds, budget_s, _route=False)
-            report["authorization"] = {"schema": REPORT_AUTHORIZATION_SCHEMA, "state": "unavailable",
-                                       "why": ["install_history_uncollected"], "input_problem": problem}
-            return report
+            # The route was decided before capture. A legacy fallback is allowed
+            # only while fresh facts still show no receipt, no transaction and
+            # no store fault, both before and after the legacy report is built;
+            # otherwise the explicit capture failure is reported.
+            if route == "legacy" and _fresh_route(inst) == "legacy":
+                report = check(inst, rounds, budget_s, _route=False)
+                if _fresh_route(inst) == "legacy":
+                    report["authorization"] = {"schema": REPORT_AUTHORIZATION_SCHEMA, "state": "unavailable",
+                                               "why": ["install_history_uncollected"], "input_problem": problem}
+                    return report
+            missing = [f"实景输入 {exc.state}：{exc.source}：{exc.detail}"]
+            return {"rounds": [], "streak": 0, "need": rounds, "missing": missing, "passed": False,
+                    "summary": _summary(inst, [], [], rounds, 0, missing, False),
+                    "input_problem": problem}
     histories = _inputs.install_histories(inst, ev) if _inputs else None
     history_entries = (histories or {}).get("entries", [])
     turns = read_log(inst.turns_path)

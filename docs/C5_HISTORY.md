@@ -329,9 +329,13 @@ decision (`live._direct_history_route`):
   explicit `input_problem` report; it never falls back to a report that omits
   the transaction.
 - `legacy`: only classified legacy/inner exec commands. If strict capture is
-  impossible, the legacy report is returned with
-  `authorization = {state: unavailable, why: [install_history_uncollected],
-  input_problem}`.
+  impossible, the route decided before capture is not trusted: the legacy
+  report is returned (with `authorization = {state: unavailable, why:
+  [install_history_uncollected], input_problem}`) only if a fresh route probe
+  both before and after building it still finds no receipt, no transaction and
+  no store fault. Otherwise, or if that probe cannot complete, the explicit
+  `input_problem` report is returned, so a transaction that appeared after the
+  first routing decision is never hidden by the fallback.
 - otherwise (an ordinary window without transactions) the report is
   unchanged.
 
@@ -358,16 +362,26 @@ as non-commands, skips reserved words (`if`/`then`/`do`/`{`/`!` …), splits on
 unquoted newlines, and recursively checks `$(...)` and backquote bodies,
 including those inside double quotes and unquoted here-documents. Function
 definitions (`name() {...}`, `name() (...)`, `function name {...}`) do not run:
-their bodies, including substitutions and here-documents inside them, count
-only where the function is invoked later in the same command (also through
-`$(name)`, `eval` or another function). A function shadows a command of the
-same name, including `wf`; `command`, `env`, `exec` and other wrappers bypass
-functions. A command
+their bodies and the substitutions of redirections written after the body
+count only where the function is invoked later in the same command (also
+through `$(name)`, `eval` or another function). Function scope follows the
+shell: an invoked function runs in the caller's shell, so definitions and
+redefinitions it makes persist; `( ... )` groups, pipeline members, background
+jobs and command substitutions work on a copy, so their definitions do not
+leak. A function shadows a command of the same name, including `wf`. The
+unqualified `time` keyword (with `-p`) times the following command, which may
+be a function; a path such as `/usr/bin/time` is an external wrapper. `command`,
+`env`, `exec` and the other wrappers bypass functions, and `command -v`/`-V`
+(also combined, e.g. `-pv`) only query and do not execute. Nesting beyond six
+levels (deep recursion) is explicitly unknown. The selftests compare these
+cases with real Bash, using a stand-in `wf` that only records its arguments. A command
 that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
 unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
 diagnostic only; no installation reference is derived from a basename or
-command string. Scripts, aliases, variables and functions defined outside the
-command (for example in a sourced file) are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
+command string. Conditions are not evaluated: commands in `if`/`case`/loop
+branches are counted as if they run (conservative). Scripts, aliases,
+variables, functions defined outside the command (for example in a sourced
+file) and other indirection are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
 report path reads the parsed first package operand and reports
 `旧版安装命令无法解析（unknown）` when none exists. A missing legacy package or
 review result is frozen as an absent source and reported (`没有记录` /

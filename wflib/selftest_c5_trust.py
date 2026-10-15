@@ -30,6 +30,28 @@ GOAL = {"id": "C5T", "title": "C5-G1 trust contract", "kind": "exec", "check": "
         "live": {"rounds": 1, "segments": list(range(1, 11))}}
 
 
+BASH_ORACLE = [
+    "setup() { wf() { :; }; }; setup; wf self-update unused.zip",
+    'f() { :; } >"$(wf self-update unused.zip)"',
+    "command -v wf self-update", "command -V wf", "command -pv wf self-update x.zip",
+    "f() { wf self-update used.zip; }; time f", "f() { wf self-update used.zip; }; time -p f",
+    "setup() { f() { wf self-update used.zip; }; }; setup; f",
+    "f() { :; }; setup() { f() { wf self-update used.zip; }; }; setup; f",
+    'f() { :; } >"$(wf self-update used.zip)"; f',
+    "(wf() { :; }); wf self-update leak.zip", 'echo "$(wf() { :; })"; wf self-update leak.zip',
+    "setup() { wf() { :; }; }; setup | cat; wf self-update leak.zip",
+    "setup() { wf() { :; }; }; setup & wait; wf self-update leak.zip",
+    "setup() { wf() { :; }; }; setup && wf self-update shadowed.zip",
+    "f() { wf apply x.zip; }; command f", "f() { wf apply x.zip; }; env f",
+    "f() { wf apply x.zip; }; EXT_TIME f", "EXT_TIME wf self-update ext.zip",
+    "wf() { :; }; command wf self-update real.zip", "wf() { :; }; env wf self-update real.zip",
+    "helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary", "helper() { wf self-update used.zip; }; helper",
+    "wf() { echo shadow; }; wf apply x.zip", "g() { f; }; f() { wf apply late.zip; }; g",
+    "eval 'f() { wf apply ev.zip; }'; f", "echo ';' wf apply x.zip", 'echo "$(wf apply sub.zip)"',
+    "if true; then wf apply cond.zip; fi", "cat <<'EOF'\nwf apply x.zip\nEOF", "true | wf self-update pipe.zip",
+]
+
+
 class _Fixture(unittest.TestCase):
     """Two real protected installs (project + tool) through ops.run_exec."""
     # "unmarked": output and transport omit synthetic (reviewed counterexample);
@@ -637,18 +659,53 @@ class LegacyEntryTests(_Fixture):
         self.assertIn("install_history:unknown", verified["why"])
 
     def test_uncalled_function_definition_is_not_an_install(self):
-        """Real ops.run_exec: defining (not calling) a function that mentions wf."""
+        """Real ops.run_exec: definitions, shadowing and definition redirections run no wf."""
         inst = self.fixture()
         self.assertTrue(self.evaluate(inst)["report"]["summary"]["passed_strict"])
-        rc = ops.run_exec(inst, "helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary", by="driver")
-        self.assertEqual(rc, 0)
-        seq = live._strict_log(inst.events_path.read_bytes(), inst.events_path)[-1]["seq"]
-        result = self.evaluate(inst)
-        self.assertFalse([r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("seq") == seq])
-        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
-        self.assertEqual(criterion["attempts"], {"total": 1, "ok": 1, "timeout": 0, "unknown": 0, "failed": 0})
-        self.assertTrue(result["report"]["summary"]["passed_strict"])
-        self.assertEqual(live.check(inst, rounds=1), result["report"])
+
+        def stores():
+            return [sorted(p.name for p in store.iterdir())
+                    for store in (inst.evidence / "install", self.env.tool / "local" / "install")]
+
+        before = stores()
+        for command in ("helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary",
+                        "setup() { wf() { :; }; }; setup; wf self-update unused.zip",
+                        'f() { :; } >"$(wf self-update unused.zip)"'):
+            self.assertEqual(ops.run_exec(inst, command, by="driver"), 0, command)
+            seq = live._strict_log(inst.events_path.read_bytes(), inst.events_path)[-1]["seq"]
+            self.assertEqual(stores(), before, command)
+            result = self.evaluate(inst)
+            self.assertFalse([r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("seq") == seq],
+                             command)
+            criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+            self.assertEqual(criterion["attempts"], {"total": 1, "ok": 1, "timeout": 0, "unknown": 0, "failed": 0})
+            self.assertTrue(result["report"]["summary"]["passed_strict"], command)
+            self.assertEqual(live.check(inst, rounds=1), result["report"])
+
+    def test_classifier_agrees_with_real_bash_argv_trace(self):
+        """Stand-in argv trace: a wf on PATH that only records its arguments."""
+        import shutil
+        import subprocess
+        import tempfile
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        for command in BASH_ORACLE:
+            with tempfile.TemporaryDirectory() as folder:
+                folder = Path(folder)
+                (folder / "bin").mkdir()
+                trace = folder / "trace"
+                (folder / "bin" / "wf").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$WF_TRACE"\n')
+                (folder / "bin" / "time").write_text('#!/bin/sh\nexec "$@"\n')   # stand-in external time
+                for name in ("wf", "time"):
+                    (folder / "bin" / name).chmod(0o755)
+                command = command.replace("EXT_TIME", str(folder / "bin" / "time"))
+                subprocess.run(["bash", "-c", command], cwd=folder, capture_output=True, timeout=20,
+                               env={"PATH": f"{folder / 'bin'}:/usr/bin:/bin", "WF_TRACE": str(trace),
+                                    "HOME": str(folder)})
+                calls = trace.read_text().splitlines() if trace.exists() else []
+                kinds = {"self-update": "tool", "apply": "project"}
+                executed = next((kinds[c.split()[0]] for c in calls if c.split() and c.split()[0] in kinds), None)
+                self.assertEqual((live._legacy_install(command) or {}).get("kind"), executed, (command, calls))
 
     def test_pre_receipt_events_and_classifier(self):
         reader = SimpleNamespace(bytes=lambda path: None,
@@ -701,6 +758,11 @@ class LegacyEntryTests(_Fixture):
             "g() { f; }; f() { wf apply late.zip; }; g": ("project", "late.zip"),
             "wf() { echo shadow; }; command wf apply real.zip": ("project", "real.zip"),
             "f() ( wf apply paren.zip ); f > log": ("project", "paren.zip"),
+            "f() { wf self-update used.zip; }; time f": ("tool", "used.zip"),
+            "setup() { f() { wf self-update used.zip; }; }; setup; f": ("tool", "used.zip"),
+            "f() { :; }; setup() { f() { wf self-update used.zip; }; }; setup; f": ("tool", "used.zip"),
+            'f() { :; } >"$(wf self-update used.zip)"; f': ("tool", "used.zip"),
+            "(wf() { :; }); wf self-update leak.zip": ("tool", "leak.zip"),
         }
         for command, (kind, argument) in positives.items():
             got = live._legacy_install(command)
@@ -715,7 +777,10 @@ class LegacyEntryTests(_Fixture):
                         "helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary",
                         "function helper { wf apply x.zip; }", "f() ( wf apply x.zip )",
                         'f() { echo "$(wf apply x.zip)"; }', "f() {\ncat <<EOF\n$(wf apply x.zip)\nEOF\n}",
-                        "wf() { echo shadow; }; wf apply x.zip", "helper; helper() { wf apply x.zip; }"):
+                        "wf() { echo shadow; }; wf apply x.zip", "helper; helper() { wf apply x.zip; }",
+                        "setup() { wf() { :; }; }; setup; wf self-update unused.zip",
+                        'f() { :; } >"$(wf self-update unused.zip)"', "command -v wf self-update",
+                        "f() { wf apply x.zip; }; command f", "f() { wf apply x.zip; }; env f"):
             self.assertIsNone(live._legacy_install(command), command)
         unparsable = live._legacy_install("wf apply 'x.zip")
         self.assertEqual((unparsable["parsed"], unparsable["kind"], unparsable["argument"]), (False, None, None))
@@ -846,6 +911,40 @@ class ExeclessWindowTests(_Fixture):
                          ("unavailable", ["install_history_uncollected"], "unknown"))
         self.assertEqual({k: v for k, v in report.items() if k != "authorization"},
                          live.check(inst, rounds=1, _route=False))
+
+    def stale_legacy_route(self, hook):
+        """Pure-legacy window routed ``legacy``; a real blocked apply lands at ``hook``."""
+        from unittest.mock import patch
+        inst, _ = self.legacy_only_fixture()
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        self.assertEqual(live._direct_history_route(inst, events), "legacy")
+        adapter = Path(json.loads(self.env.transport.read_bytes())["log"])
+        adapter.write_text(adapter.read_text().replace('"root"', '"elsewhere"'), encoding="utf-8")
+        fired = []
+        original = getattr(live, hook)
+
+        def interleave(*args, **kwargs):
+            if not fired and (hook == "_capture_inputs" or kwargs.get("_route") is False):
+                fired.append(1)
+                self.blocked_after_prepare(inst)   # real apply_zip, real review block
+            return original(*args, **kwargs)
+
+        with patch.object(live, hook, interleave):
+            report = live.check(inst, rounds=1)
+        self.assertEqual(fired, [1])
+        failed = [p for p in (inst.evidence / "install").iterdir() if (p / "failed.json").exists()]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(live._strict_log(inst.events_path.read_bytes(), inst.events_path), events)
+        # Never the cached legacy fallback that would omit the new transaction.
+        self.assertEqual((report["rounds"], report["passed"], report["input_problem"]["state"]), ([], False, "unknown"))
+        self.assertNotIn("authorization", report)
+        self.assertEqual(live.check(inst, rounds=1), report)
+
+    def test_capture_failure_rechecks_route_when_tx_appears_before_capture(self):
+        self.stale_legacy_route("_capture_inputs")
+
+    def test_capture_failure_rechecks_route_when_tx_appears_during_fallback(self):
+        self.stale_legacy_route("check")
 
     def test_store_and_record_faults_are_explicit(self):
         import shutil
