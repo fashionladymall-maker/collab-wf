@@ -2096,6 +2096,7 @@ def _p_wrong_neg():
 
 
 def _provider(category, pos, neg):
+    """pos/neg 是本模块里的函数名，每次调用时才解析：受控变异可以替换底层用例本身，而不是只替换包装。"""
     def run() -> dict:
         why = _guard()
         out = {"schema": "c1-provider/1", "category": category, "lane": "A", "card": "B2-A2a"}
@@ -2104,7 +2105,7 @@ def _provider(category, pos, neg):
                 out[kind] = {"ran": False, "ok": False, "evidence": why}
                 continue
             try:
-                ok, ev = fn()
+                ok, ev = (globals()[fn] if isinstance(fn, str) else fn)()
                 out[kind] = {"ran": True, "ok": bool(ok), "evidence": ev}
             except Exception:
                 import traceback
@@ -2117,13 +2118,14 @@ def _provider(category, pos, neg):
     return run
 
 
-def _a2b_provider(category, pos, neg):
-    """新类别同时满足共享契约和既有 positive/negative 调用方，不改变旧提供方格式。"""
+def _c1_provider(category, pos, neg, card):
+    """c1-provider/1 共享结构（provider/category/schema/cases/error）加旧 positive/negative/ok：
+    一次调用里每个用例只执行一次，两种格式都取自这同一次结果；guard 不足、异常、失败都不会得到 error=None。"""
     legacy = _provider(category, pos, neg)
 
     def run():
         out = legacy()
-        out.update(provider="A", card="B2-A2b", error=None)
+        out.update(provider="A", card=card, error=None)
         out["cases"] = [{"name": category + "-" + kind, "polarity": polarity,
                          "ran": out[kind]["ran"], "ok": out[kind]["ok"],
                          "detail": json.dumps(out[kind]["evidence"], ensure_ascii=False, default=str)}
@@ -2135,24 +2137,162 @@ def _a2b_provider(category, pos, neg):
     return run
 
 
-C1_PROVIDERS = {
-    "2R-busy": _provider("2R-busy", _p_busy_pos, _p_busy_neg),
-    "2R-network": _provider("2R-network", _p_network_pos, _p_network_neg),
-    "2R-quota": _provider("2R-quota", _p_quota_pos, _p_quota_neg),
-    "2R-send-unknown": _provider("2R-send-unknown", _p_unknown_pos, _p_unknown_neg),
-    "2R-executor-absent": _provider("2R-executor-absent", _p_absent_pos, _p_absent_neg),
-    "2S-credential": _provider("2S-credential", _p_cred_pos, _p_cred_neg),
-    "2S-wrong-project": _provider("2S-wrong-project", _p_wrong_pos, _p_wrong_neg),
-    "6b-task-generation": _a2b_provider("6b-task-generation", _p_generation_pos, _p_generation_neg),
-    "6b-interrupted": _a2b_provider("6b-interrupted", _p_interrupted_pos, _p_interrupted_neg),
+def _a2b_provider(category, pos, neg):
+    """新类别同时满足共享契约和既有 positive/negative 调用方，不改变旧提供方格式。"""
+    return _c1_provider(category, pos, neg, "B2-A2b")
+
+
+# C1 七类旧导出（B2-A2a）补上与 A2b 相同的共享结构；用例与业务断言不变（A-C1-SCHEMA）。
+C1_CASES = {
+    "2R-busy": ("_p_busy_pos", "_p_busy_neg", "B2-A2a"),
+    "2R-network": ("_p_network_pos", "_p_network_neg", "B2-A2a"),
+    "2R-quota": ("_p_quota_pos", "_p_quota_neg", "B2-A2a"),
+    "2R-send-unknown": ("_p_unknown_pos", "_p_unknown_neg", "B2-A2a"),
+    "2R-executor-absent": ("_p_absent_pos", "_p_absent_neg", "B2-A2a"),
+    "2S-credential": ("_p_cred_pos", "_p_cred_neg", "B2-A2a"),
+    "2S-wrong-project": ("_p_wrong_pos", "_p_wrong_neg", "B2-A2a"),
+    "6b-task-generation": ("_p_generation_pos", "_p_generation_neg", "B2-A2b"),
+    "6b-interrupted": ("_p_interrupted_pos", "_p_interrupted_neg", "B2-A2b"),
 }
+C1_PROVIDERS = {cat: _c1_provider(cat, pos, neg, card) for cat, (pos, neg, card) in C1_CASES.items()}
+C1_CASE_KEYS = {"name", "polarity", "ran", "ok", "detail"}
+
+
+def _c1_shape_problems(r, category) -> list:
+    """c1-provider/1 严格机器检查（BATCH2_CONTRACT provider_api），并核对旧 positive/negative/ok 与新 cases 来自同一次结果。"""
+    p = []
+    if not isinstance(r, dict):
+        return ["not a dict"]
+    for key in ("category", "provider", "schema", "cases", "error"):
+        if key not in r:
+            p.append("missing " + key)
+    if r.get("schema") != "c1-provider/1":
+        p.append("schema")
+    if r.get("provider") != "A" or r.get("lane") != "A":
+        p.append("provider/lane")
+    if r.get("category") != category:
+        p.append("category " + repr(r.get("category")))
+    if r.get("card") != C1_CASES.get(category, (None, None, None))[2]:
+        p.append("card " + repr(r.get("card")))
+    cases = r.get("cases")
+    if not isinstance(cases, list) or len(cases) != 2:
+        return p + ["cases must be a list of exactly two"]
+    for c in cases:
+        if not isinstance(c, dict) or set(c) != C1_CASE_KEYS:
+            p.append("case keys " + repr(sorted(c) if isinstance(c, dict) else c))
+            continue
+        if not isinstance(c["name"], str) or not c["name"] or c["polarity"] not in ("pos", "neg") \
+                or type(c["ran"]) is not bool or type(c["ok"]) is not bool or not isinstance(c["detail"], str) or not c["detail"]:
+            p.append("case types " + str(c.get("name")))
+        if c["ok"] and not c["ran"]:
+            p.append("ok without ran " + str(c.get("name")))
+    if sorted(c.get("polarity") for c in cases if isinstance(c, dict)) != ["neg", "pos"]:
+        p.append("polarities")
+    if len({c.get("name") for c in cases if isinstance(c, dict)}) != 2:
+        p.append("duplicate case names")
+    by = {c.get("polarity"): c for c in cases if isinstance(c, dict)}
+    for kind, pol in (("positive", "pos"), ("negative", "neg")):
+        legacy = r.get(kind)
+        if not isinstance(legacy, dict) or set(legacy) != {"ran", "ok", "evidence"}:
+            p.append("legacy " + kind)
+        elif pol in by and (legacy["ran"] is not by[pol]["ran"] or legacy["ok"] is not by[pol]["ok"]):
+            p.append("legacy/case mismatch " + kind)
+    success = all(isinstance(c, dict) and c.get("ran") is True and c.get("ok") is True for c in cases)
+    if r.get("ok") is not success:
+        p.append("legacy ok != all cases ok")
+    err = r.get("error")
+    if success and err is not None:
+        p.append("error on success")
+    if not success and not (isinstance(err, str) and err):
+        p.append("missing error on failure")
+    return p
+
+
+def _counting(names):
+    """把底层用例按名字临时换成计数包装（行为不变），用来证明一次调用里每个用例只执行一次。"""
+    mod = sys.modules[__name__]
+    calls = {n: 0 for n in names}
+    originals = {n: getattr(mod, n) for n in names}
+
+    def wrap(name):
+        def run():
+            calls[name] += 1
+            return originals[name]()
+        return run
+    for n in names:
+        setattr(mod, n, wrap(n))
+    return calls, lambda: [setattr(mod, n, f) for n, f in originals.items()]
 
 
 def _t_a2_providers(_ok):
     for cat, fn in C1_PROVIDERS.items():
-        r = fn()
+        pos, neg, _card = C1_CASES[cat]
+        calls, restore = _counting((pos, neg))
+        try:
+            r = fn()
+        finally:
+            restore()
+        dump = json.dumps(r, ensure_ascii=False, default=str)
         _ok(f"B2-A2a 提供方 {cat}：正例与反例都实际运行并通过（c1-provider/1）",
-            r["ok"] and r["positive"]["ran"] and r["negative"]["ran"], json.dumps(r, ensure_ascii=False, default=str)[:1800])
+            r["ok"] and r["positive"]["ran"] and r["negative"]["ran"], dump[:1800])
+        problems = _c1_shape_problems(r, cat)
+        _ok(f"A-C1-SCHEMA 提供方 {cat}：共享结构严格检查、category 准确、正反例各自实际成功且 error=None，一次调用每个用例只执行一次",
+            not problems and r["error"] is None and calls == {pos: 1, neg: 1}, json.dumps([problems, calls], ensure_ascii=False)
+            + " " + dump[:1500])
+
+
+def _t_c1_mutations(_ok):
+    """受控变异：只坏底层正例或只坏底层反例时，新旧两种结果都不再绿，另一极性保持它自己的真实结果。"""
+    from unittest.mock import patch
+    from . import policy, recovery
+    mod = sys.modules[__name__]
+
+    def returns_false(name):
+        return lambda: (False, {"mutated": name})
+
+    def raises(name):
+        def run():
+            raise RuntimeError("mutated " + name)
+        return run
+
+    def verdict(r, cat, broken):
+        by = {c["polarity"]: c for c in r["cases"]}
+        kept = "neg" if broken == "pos" else "pos"
+        legacy = {"pos": "positive", "neg": "negative"}
+        return (not _c1_shape_problems(r, cat) and r["ok"] is False and isinstance(r["error"], str)
+                and by[broken]["ok"] is False and by[kept]["ok"] is True and by[kept]["ran"] is True
+                and r[legacy[broken]]["ok"] is False and r[legacy[kept]]["ok"] is True)
+
+    seen = {}
+    for cat, (pos, neg, _card) in C1_CASES.items():
+        for broken, name, fake in (("pos", pos, returns_false(pos)), ("neg", neg, raises(neg))):
+            with patch.object(mod, name, fake):
+                r = C1_PROVIDERS[cat]()
+            seen[f"{cat}:{broken}"] = (verdict(r, cat, broken) and "mutated " + name in r["error"].replace('"mutated": "', "mutated "),
+                                       r["error"][:160] if isinstance(r.get("error"), str) else r.get("error"))
+    _ok("A-C1-SCHEMA 底层用例受控变异：9 类分别只坏正例（返回假）或只坏反例（抛异常），新旧结果都不再绿，另一极性仍是它自己的真实成功",
+        all(v[0] for v in seen.values()), json.dumps({k: v for k, v in seen.items() if not v[0]} or len(seen), ensure_ascii=False)[:1800])
+
+    real_classify = policy.classify
+
+    def lax(*a, **kw):   # 业务变异：权限分类一律放行，“密钥”底线失效
+        return dict(real_classify(*a, **kw), auto=True, reasons=[])
+    with patch.object(policy, "classify", lax):
+        rc = C1_PROVIDERS["2S-credential"]()
+    with patch.object(recovery, "_exhausted", lambda *a, **k: ""):   # 业务变异：恢复期预算永不耗尽
+        rb = C1_PROVIDERS["2R-busy"]()
+    _ok("A-C1-SCHEMA 业务变异：密钥底线放行只让 2S-credential 正例失败；恢复预算永不耗尽只让 2R-busy 反例失败；新旧结果都不再绿",
+        verdict(rc, "2S-credential", "pos") and verdict(rb, "2R-busy", "neg"),
+        json.dumps([rc["cases"], rb["cases"]], ensure_ascii=False)[:1800])
+
+    saved = os.environ.pop("WF_LOCAL_DIR")
+    try:
+        rg = C1_PROVIDERS["2R-network"]()
+    finally:
+        os.environ["WF_LOCAL_DIR"] = saved
+    _ok("A-C1-SCHEMA 隔离前提不足：两个用例都不运行、都不成功，error 写明原因，结构仍合格",
+        not _c1_shape_problems(rg, "2R-network") and rg["ok"] is False and "WF_LOCAL_DIR" in (rg["error"] or "")
+        and all(c["ran"] is False and c["ok"] is False for c in rg["cases"]), json.dumps(rg, ensure_ascii=False)[:1200])
 
 
 def _t_a2b_provider_contract(_ok):
@@ -3040,6 +3180,7 @@ TESTS = [
     ("B2-A2a r2 坏恢复记录", _t_a2r2_corrupt),
     ("B2-A2a GPT 意图身份校验", _t_a2gpt_intent_identity),
     ("B2-A2b 提供方契约", _t_a2b_provider_contract),
+    ("A-C1-SCHEMA 受控变异", _t_c1_mutations),
     ("B2-A-IC-B1b P1 权限消费", _t_permission_consumption),
     ("B2-A-IC-B1b P2 正文绑定", _t_p2_message_binding),
 ]
