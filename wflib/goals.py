@@ -380,13 +380,19 @@ def progress(inst: Instance) -> dict:
                       "means": x.get("means"), "on_fail": x.get("on_fail")})
     okmap = {i["id"]: i["ok"] for i in items}
     for x, i in zip(g["goals"], items):   # 1.8.3（W75）：前置没满足的人工目标不算完成、不通知、不能确认
-        deps = _deps(g, x) if x["kind"] == "manual" else []
-        if deps:
-            miss = [d for d in deps if not okmap.get(d)]
-            i["ready"] = not miss
-            if miss:
-                i["ok"] = False
-                i["detail"] = "前置未满足：" + "、".join(miss) + "（未到确认的时候，不通知）"
+        if x["kind"] != "manual" or x.get("depends_on") is None:
+            continue
+        deps = _deps(g, x)
+        miss = [d for d in deps if not okmap.get(d)]
+        why = ["、".join(miss)] if miss else []
+        if not deps:   # B2-C2a：all_exec 在没有可执行目标时是空集，不能因 all([]) 而就绪、通知或被确认
+            why.append("没有可执行目标（前置为空集）")
+        if not st["approved"]:   # B2-C2a：目标未批准（或批准后被改动）时，人工验收不就绪
+            why.append("目标尚未批准或批准后被改动")
+        i["ready"] = not why
+        if why:
+            i["ok"] = False
+            i["detail"] = "前置未满足：" + "；".join(why) + "（未到确认的时候，不通知）"
     na_all = policy.approvals(inst).get("not_applicable") or {}
     cache = {}
     for x, i in zip(g["goals"], items):   # B1-C：分层只新增键，不改 ok
@@ -394,7 +400,9 @@ def progress(inst: Instance) -> dict:
     done = sum(1 for i in items if i["ok"])
     counts = {k: sum(1 for i in items if i["layer"] == k) for k in LAYERS}
     return {"defined": True, "approved": st["approved"], "changed_since_approval": st["changed_since_approval"],
-            "items": items, "done": done, "total": len(items), "reached": st["approved"] and done == len(items),
+            "items": items, "done": done, "total": len(items),
+            # B2-C2a：至少要有一个可执行目标才可能达成——空目标、只有人工目标时即使批准、全部确认也不算达成
+            "reached": st["approved"] and done == len(items) and any(x.get("kind") == "exec" for x in g["goals"]),
             "issues": validate(g), "phase": _phase(g), "history": _history(g), "counts": counts}
 
 
