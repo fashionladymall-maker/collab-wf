@@ -1,0 +1,6 @@
+{
+  "delete": [
+    "workflow/state.json.bak-before-clearsendref-20261012"
+  ],
+  "notes": "v2.8：补记第 84–89 轮；新增 ISOLATION.md；policy 启用 landed_timeout_s；删除第 87 轮留在项目目录、被自动存进版本库的 state.json 备份（W52，内容可从提交 cbea3da 取回）"
+}

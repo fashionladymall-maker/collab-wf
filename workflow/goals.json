@@ -1,0 +1,183 @@
+{
+  "_说明": "阶段目标（1.8.0 格式）。当前阶段 M2“专业基线（第一批）”取代 M1；M1 的 7 项已结束，只作历史（history），不计入当前进度。exec 类由驱动器在每轮验收后运行，机器判据用 wf self-check --probes（在临时 local/ 里对已安装的代码跑行为探针，只读）；还没实现的探针不会出现在输出里，对应目标保持未通过——判据先写死、不放宽。最终验收只认用户原话（M2-U1）。",
+  "phase": {
+    "id": "M2",
+    "title": "专业基线（第一批）：交接、动态目标与防循环",
+    "supersedes": "M1",
+    "since": "2026-10-13",
+    "requirements": [
+      "P0-A",
+      "P0-B",
+      "P0-C",
+      "P0-D",
+      "P0-E",
+      "P0-F",
+      "P0-G",
+      "P0-H"
+    ],
+    "scope": "collab-wf 工具本身；不含 Amy 的业务开发"
+  },
+  "goals": [
+    {
+      "id": "M2-B1",
+      "title": "阶段目标：看板与 STATUS 先显示当前阶段，旧阶段只作历史",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 阶段目标：通过"
+        ]
+      },
+      "means": "目标随需求阶段化，旧 7/7 不再代表新范围（P0-B）",
+      "on_fail": "交给 Claude 修复"
+    },
+    {
+      "id": "M2-B2",
+      "title": "待办可取消、可被取代，完成必须写结果",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 待办取消：通过"
+        ]
+      },
+      "means": "不用 done 冒充取消（P0-B、P1-N）",
+      "on_fail": "交给 Claude 修复"
+    },
+    {
+      "id": "M2-E1",
+      "title": "NO_REF 不再循环",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 NO_REF：通过"
+        ]
+      },
+      "means": "批准解决不了没有 ref，只能补登记或整轮收尾（P0-E）",
+      "on_fail": "交给 Claude 修复"
+    },
+    {
+      "id": "M2-F1",
+      "title": "回复完整性：识别工具上限并有界续接",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 回复完整性：通过"
+        ]
+      },
+      "means": "不把因上限结束的回复当作完整（P0-F）",
+      "on_fail": "交给 Claude 修复"
+    },
+    {
+      "id": "M2-H1",
+      "title": "同步凭证：没有提交号不算推送",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 同步凭证：通过"
+        ]
+      },
+      "means": "pushed、unchanged 都有提交号作证（P0-H 工具侧）",
+      "on_fail": "交给 Claude 修复"
+    },
+    {
+      "id": "M2-A1",
+      "title": "交接短消息钉在提交上、只链已推送的文件",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 交接短消息：通过"
+        ]
+      },
+      "means": "新对话读到的就是核验过的那一版（P0-A 工具侧）",
+      "on_fail": "交给 Claude 修复"
+    },
+    {
+      "id": "M2-F2",
+      "title": "回复发现延迟有界",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 回复发现延迟：通过"
+        ]
+      },
+      "means": "回复结束后在延迟预算内被接上（P0-F，W66）",
+      "on_fail": "1.8.1 交付后复查"
+    },
+    {
+      "id": "M2-C1",
+      "title": "默认工程门禁基线与角色准入退出",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 门禁基线：通过"
+        ]
+      },
+      "means": "不靠用户提醒的默认治理（P0-C）",
+      "on_fail": "交付后复查"
+    },
+    {
+      "id": "M2-D1",
+      "title": "经验闭环：台账缺项不得标已解决",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 经验闭环：通过"
+        ]
+      },
+      "means": "失败一定落到机制与回归（P0-D）",
+      "on_fail": "交付后复查"
+    },
+    {
+      "id": "M2-G1",
+      "title": "共享资源仲裁 S4",
+      "kind": "exec",
+      "check": "wf self-check --probes",
+      "pass": {
+        "contains": [
+          "探针 共享仲裁：通过"
+        ]
+      },
+      "means": "同一账号上多个项目不互饿、可审计（P0-G）",
+      "on_fail": "交付后复查"
+    },
+    {
+      "id": "M2-R1",
+      "title": "实景：连续 3 个正式轮次全链路达标（LIVE.md）",
+      "kind": "exec",
+      "check": "wf live-check --rounds 3",
+      "pass": {
+        "exit": 0,
+        "contains": [
+          "——通过"
+        ]
+      },
+      "means": "在用户真实环境里，发送、归属、交付、审查、执行、待办、回报、同步逐段都有证据（verified，不是探针）",
+      "on_fail": "按 wf live-check 列出的不达标段处理；计数从下一轮重来"
+    },
+    {
+      "id": "M2-U1",
+      "title": "用户验收 M2",
+      "kind": "manual",
+      "means": "本阶段全部可执行目标通过、并各有一次真实运行态证据后，由用户本人确认；前置没满足时不通知",
+      "on_fail": "按用户意见补齐",
+      "depends_on": "all_exec"
+    }
+  ],
+  "history": [
+    {
+      "id": "M1",
+      "title": "无人值守稳定运行",
+      "status": "done",
+      "closed": "2026-10-12",
+      "summary": "7/7：G1 工具文件与清单一致、G2 体检健康、G3a–d 历史最长连续 3/6/8/10 轮无人工动作、G4 驱动器自建自装；第 71 轮达成，第 98 轮由用户授权执行端代为验收；原判据见 v3.2 的 goals.json（git 历史）"
+    }
+  ]
+}
