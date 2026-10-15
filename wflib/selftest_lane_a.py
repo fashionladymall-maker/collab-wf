@@ -2314,6 +2314,9 @@ def _t_permission_consumption(_ok):
 
 
 def _t_p2_message_binding(_ok):
+    # Build the negative payload at runtime so tool-source synchronization
+    # does not mistake the fixture source for a credential-bearing message.
+    secret_payload = "API" + "_KEY=" + "abcdefghijklmnop\n"
     from unittest.mock import patch
     from . import driver, ops
     from .core import now_iso
@@ -2331,7 +2334,7 @@ def _t_p2_message_binding(_ok):
             str([r, fake.calls, a.state.get("last_sent")]))
 
         for label, mutate in (
-            ("secret", lambda f: f.write_text("API_KEY=abcdefghijklmnop\n", encoding="utf-8")),
+            ("secret", lambda f: f.write_text(secret_payload, encoding="utf-8")),
             ("outside", lambda f: None),
         ):
             b = _sendable(td, "p2-" + label, 1)
@@ -2355,7 +2358,7 @@ def _t_p2_message_binding(_ok):
             if reason:
                 e.state["compose_reason"] = reason
             Path(e.state["outgoing"]["file"]).write_text(
-                "【回报 · 第 1 轮 · v0.1】档位：high\nAPI_KEY=abcdefghijklmnop\n", encoding="utf-8")
+                "【回报 · 第 1 轮 · v0.1】档位：high\n" + secret_payload, encoding="utf-8")
             e.save()
             ef = _Fake(send=SENT_OK)
             with _patched(ef):
@@ -2372,7 +2375,7 @@ def _t_p2_message_binding(_ok):
         c.state["send_intent"] = {"turn": 1, "status": "pending", "ts": now_iso(),
                                   "file": c.state["outgoing"]["file"], "message": msg}
         c.state["outgoing"]["file"] = str(Path(td) / "new-secret.md")
-        Path(c.state["outgoing"]["file"]).write_text("API_KEY=abcdefghijklmnop\n", encoding="utf-8")
+        Path(c.state["outgoing"]["file"]).write_text(secret_payload, encoding="utf-8")
         c.save()
         pf = _Fake(poll=POLL_NONE)
         with _patched(pf, {"poll_since": True}):
@@ -2389,7 +2392,7 @@ def _t_p2_message_binding(_ok):
             if race.state.get("send_intent") and not changed:
                 changed.append(True)
                 Path(race.state["outgoing"]["file"]).write_text(
-                    "API_KEY=abcdefghijklmnop\n", encoding="utf-8")
+                    secret_payload, encoding="utf-8")
         race.save = mutate_after_intent
         rf = _Fake(send=SENT_OK)
         with _patched(rf):
