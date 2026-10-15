@@ -227,7 +227,9 @@ def _t_na(_ok):
                 res[gid] = "accepted"
             except WfError:
                 res[gid] = "refused"
-        # F1、S1 的失败记录来自改动前的目标（goals_sha 已变），layer 按原规则是 pending；
+        # F1、S1 的失败记录写于只含 F1、S1 的目标文件；之后只新增了无关目标 N1、U1。B2-C2b 起这两条是逐目标 v2 记录，
+        # 无关目标的变化不使它们失效：F1（只读程序 false，绑定整个项目）layer 为 failed；S1 的 sleep 无法推导依赖，
+        # 绑定不成立（失败关闭）而为 pending。B1 时两者都按全局 goals_sha 为 pending。
         # 绕过 mark_na 直接写入当前 goals_sha 的 NA：失败记录在，NA 也不生效
         a = policy.approvals(inst)
         cur = policy.status(inst, "goals")["current"]
@@ -248,7 +250,7 @@ def _t_na(_ok):
     _ok("B1-C 不适用：条件、排除范围、理由、判定人缺任一拒绝；exit 1 与超时 124 拒绝；失败记录在时直接写入的 NA 不生效；"
         "NA 不计入 ok 与 reached；目标改动后 NA 失效",
         res["miss"] == ["refused"] * 4 and res["exits"] == [1, 124] and res["F1"] == "refused" and res["S1"] == "refused"
-        and lay1["F1"] == ("pending", False) and lay1["S1"] == ("pending", False) and "不能算不适用" in f1why
+        and lay1["F1"] == ("failed", False) and lay1["S1"] == ("pending", False) and "不能算不适用" in f1why
         and lay1["N1"] == ("not_applicable", False) and lay1["U1"] == ("not_applicable", False)
         and set((n1.get("na") or {})) >= {"condition", "scope", "reason", "by"}
         and p1["done"] == 0 and p1["reached"] is False and p1["counts"]["not_applicable"] == 2
@@ -1130,11 +1132,809 @@ def _t_goals_empty_guard(_ok):
         and res["default_done"] == (4, 4, True), json.dumps({k: res[k] for k in ("default", "default_done")}, ensure_ascii=False))
 
 
+def _t_mech_v2(_ok):
+    """B2-C2b（含返工）：逐目标机械绑定 v2——无关目标变化复用；本目标与依赖定义、闭包内文件（新增、删除、权限、内容、
+    链接去处）变化失效；绑定不成立（读失败、超预算、检查期间变化、运行时审计不通过、无法推导）一律失败关闭；
+    只认明确的旧格式；兄弟分支汇合成环也能发现；progress 的 ok、layer、reached 一致。临时工具树与项目。"""
+    from . import goals, policy
+    from .core import WfError
+    out, bad_consistency = {}, []
+    old = (goals._TOOL_ROOT, goals._hash_file, goals._BUDGET_FILES)
+    with tempfile.TemporaryDirectory() as td:
+        tool = _tool_repo(td)
+        for rel, txt in (("wflib/selftest_x.py", "T = 1\n"), ("dashboard/flow.html", "<p>x</p>\n"),
+                         ("MANIFEST.json", "{}\n"), ("docs/a.md", "# a\n"), ("local/runtime.json", "{}\n")):
+            (tool / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tool / rel).write_text(txt, encoding="utf-8")
+        a = _inst(td, "c2b", {"state": "IDLE", "turn": 1})
+        root = a.root
+        files = {"scripts/check.py": "import sys\nprint(open(sys.argv[1]).read().strip())\n",
+                 "scripts/dyn.py": "import subprocess\nprint('ok')\n",
+                 "scripts/env.py": "import os\nprint(os.environ.get('HOME') and 'ok')\n",
+                 "scripts/lit.py": "print(open('README.md').read())\n",
+                 "scripts/imp.py": "import helper\nprint(helper.X)\n", "scripts/helper.py": "X = 'ok'\n",
+                 "scripts/comp.py": "p = 'da' + 'ta/in.txt'\nprint(open(p).read().strip())\n",
+                 "scripts/cd.py": "import os\nos.chdir('data')\nprint(open('in.txt').read().strip())\n",
+                 "scripts/ex.py": "import os\nprint('ok', flush=True)\nos._exit(0)\n",
+                 "scripts/st.py": "import os, sys\nprint('ok' if not os.path.exists(sys.argv[1]) else 'no')\n",
+                 "scripts/w.py": "open('data/out.txt', 'w').write('x')\nprint('ok')\n",
+                 "scripts/sp.py": "m = __import__('sub' + 'process')\nm.run(['true'])\nprint('ok')\n",
+                 "data/in.txt": "ok\n", "README.md": "readme\n", "notes.txt": "ok\n"}
+        for rel, txt in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(txt, encoding="utf-8")
+        outside = Path(td) / "outside"
+        outside.mkdir()
+        (outside / "in.txt").write_text("ok\n", encoding="utf-8")
+        os.symlink(root / "data", root / "alias")   # 项目内的符号链接：去处在项目内，可以绑定；affects 不许经过它
+        E = lambda gid, chk, **kw: dict({"id": gid, "title": gid, "kind": "exec", "check": chk, "pass": {"exit": 0},   # noqa: E731
+                                         "means": "m", "on_fail": "f"}, **kw)
+        M = lambda gid, **kw: dict({"id": gid, "title": gid, "kind": "manual", "means": "m", "on_fail": "f"}, **kw)   # noqa: E731
+        chk = "python3 scripts/check.py data/in.txt"
+        base = [E("W1", "wf version"), E("P1", chk, affects=["scripts", "data/in.txt"]), E("P1n", chk, affects=["scripts/check.py",
+                                                                                                                "data/in.txt"]),
+                E("P2", chk), E("P3", chk, affects=["scripts", "data"]), E("U1", "cat notes.txt"), E("D1", "python3 scripts/dyn.py"),
+                E("L1", "true", live={"rounds": 3, "segments": [1]}), E("X1", "true", depends_on=["W1"])]
+        ids = [x["id"] for x in base]
+        gp = a.wf / "goals.json"
+
+        def setg(gl, approve=True):
+            gp.write_text(json.dumps({"goals": gl}, ensure_ascii=False), encoding="utf-8")
+            if approve:
+                policy.approve(a, "goals", "测试", by="test")
+
+        def prog(tag):
+            p = goals.progress(a)
+            for i in p["items"]:
+                if i["kind"] == "exec" and (i["ok"] != (i["layer"] in ("mechanical_pass", "verified"))):
+                    bad_consistency.append((tag, i["id"], i["ok"], i["layer"]))
+            if p["reached"] and not (p["approved"] and all(i["ok"] for i in p["items"])):
+                bad_consistency.append((tag, "reached", p["approved"]))
+            return p
+
+        def notok(tag, only=None):
+            """不通过（ok 为假）的目标编号集合。"""
+            p = prog(tag)
+            return sorted(i["id"] for i in p["items"] if not i["ok"] and (only is None or i["id"] in only))
+
+        def detail(gid):
+            return next(i["detail"] for i in goals.progress(a)["items"] if i["id"] == gid)
+
+        def gs():
+            return json.loads((a.wf / "goals_state.json").read_text(encoding="utf-8"))
+
+        def put(d):
+            (a.wf / "goals_state.json").write_text(json.dumps(d), encoding="utf-8")
+
+        def kinds():
+            return {k: v.get("binding", {}).get("kind") or ("global" if v.get("binding", {}).get("schema") == goals.GLOBAL_SCHEMA
+                                                            else "unbound" if v.get("binding", {}).get("unbound") else "?")
+                    for k, v in gs().items()}
+        try:
+            goals._TOOL_ROOT = tool
+            setg(base)
+            goals.run_checks(a, by="test")
+            out["kinds"] = kinds()
+            out["s0"] = notok("s0", ids)
+            out["deps_X1"] = sorted(gs()["X1"]["binding"].get("deps") or {})
+            out["d1_detail"] = "依赖绑定不成立" in detail("D1")
+            # 无关变化复用（重新批准前 reached 为假）；定义变化失效
+            setg([dict(base[0], title="改过的标题")] + base[1:], approve=False)
+            p = prog("s1u")
+            out["s1u"] = (notok("s1u", ids), p["approved"], p["reached"])
+            policy.approve(a, "goals", "测试", by="test")
+            out["s1"] = notok("s1", ids)
+            setg([dict(base[0], title="改过的标题")] + base[1:] + [E("I2", "true")])
+            out["s2"] = notok("s2", ids)
+            setg([dict(base[0], means="新的含义")] + base[1:])
+            out["s3"] = (notok("s3", ids), "本目标的定义已改动" in detail("W1"))
+            setg([base[0], dict(base[1], **{"pass": {"exit": 0, "contains": ["o"]}})] + base[2:])
+            out["s4"] = notok("s4", ids)
+            setg(base)
+            goals.run_checks(a, by="test")
+            out["s5"] = notok("s5", ids)
+            seq = []
+            for tag, path, new in (
+                    ("dashboard", tool / "dashboard/flow.html", "<p>y</p>\n"), ("selftest", tool / "wflib/selftest_x.py", "T = 2\n"),
+                    ("manifest", tool / "MANIFEST.json", "{\"x\": 1}\n"), ("docs", tool / "docs/a.md", "# b\n"),
+                    ("tool_mode", tool / "wflib/x.py", 0o100), ("tool_local", tool / "local/runtime.json", "{\"y\": 2}\n"),
+                    ("readme", root / "README.md", "changed\n"), ("data_content", root / "data/in.txt", "ok 2\n"),
+                    ("data_mode", root / "data/in.txt", 0o100), ("runtime", a.wf / "events.jsonl", "{}\n")):
+                existed = path.exists()
+                keep_txt = path.read_bytes() if existed else None
+                keep_mode = os.stat(path).st_mode & 0o7777 if existed else None   # 恢复原权限，不写死（随 umask 不同）
+                if isinstance(new, int):
+                    os.chmod(path, keep_mode ^ new)   # 翻转一个权限位：无论 umask 如何都确实改变了权限
+                else:
+                    path.write_text(new, encoding="utf-8")
+                after = notok(tag, ids)
+                if existed:
+                    path.write_bytes(keep_txt)
+                    os.chmod(path, keep_mode)
+                else:
+                    path.unlink()
+                seq.append((tag, after, notok(tag + "-back", ids)))
+            for tag, p in (("tool_new", tool / "wflib/new.py"), ("data_new", root / "data/new.txt"),
+                           ("proj_new", root / "other.txt"), ("scripts_new", root / "scripts/new.py")):
+                p.write_text("n\n", encoding="utf-8")
+                after = notok(tag, ids)
+                p.unlink()
+                seq.append((tag, after, notok(tag + "-back", ids)))
+            (root / "data/in.txt").rename(root / "data/in.bak")
+            after = notok("data_del", ids)
+            (root / "data/in.bak").rename(root / "data/in.txt")
+            seq.append(("data_del", after, notok("data_del-back", ids)))
+            os.symlink(outside / "in.txt", root / "ext")   # 新增指向项目外的链接：整个项目绑定无法核对
+            after = notok("ext_link", ids)
+            (root / "ext").unlink()
+            seq.append(("ext_link", after, notok("ext_link-back", ids)))
+            out["seq"] = seq
+            # 坏 hash、读失败、证据被改：不复用
+            raw = gs()
+            d = json.loads(json.dumps(raw))
+            d["W1"]["binding"]["state"]["tool"]["digest"] = "0" * 64
+            d["P1"]["binding"]["goal_sha"] = "bad"
+            put(d)
+            out["badhash"] = notok("badhash", ids)
+            put(raw)
+
+            def flaky(p):
+                if str(p).endswith("README.md"):
+                    raise PermissionError("模拟读取失败")
+                return old[1](p)
+            goals._hash_file = flaky
+            out["readfail"] = (notok("readfail", ids), "无法核对" in detail("P2"))
+            goals._hash_file = old[1]
+            evp = root / raw["W1"]["evidence"]
+            keep = evp.read_bytes()
+            evp.write_bytes(keep + b"x")
+            out["evidence"] = notok("evidence", ids)
+            evp.write_bytes(keep)
+            out["restored"] = notok("restored", ids)
+            # 反例 1：新执行时绑定不成立（读权限失败、超出预算、检查期间变化）必须失败关闭，恢复后重新检查才通过
+            goals._hash_file = lambda p: (_ for _ in ()).throw(PermissionError("模拟")) if str(p).endswith("notes.txt") \
+                else old[1](p)
+            goals.run_checks(a, by="test")
+            goals._hash_file = old[1]
+            u1 = gs()["U1"]
+            (root / "notes.txt").write_text("changed later\n", encoding="utf-8")
+            out["perm"] = (u1["ok"], bool(u1["binding"].get("unbound")), "PermissionError" in u1["binding"].get("unbound", ""),
+                           "U1" in notok("perm", ids), "依赖绑定不成立" in detail("U1"))
+            (root / "notes.txt").write_text("ok\n", encoding="utf-8")
+            goals.run_checks(a, by="test")
+            out["perm_back"] = ("U1" in notok("perm_back", ids), gs()["U1"]["binding"].get("kind"))
+            if hasattr(os, "geteuid") and os.geteuid() != 0:   # 非 root 时再用真实的 chmod 000 走一遍
+                os.chmod(root / "notes.txt", 0)
+                goals.run_checks(a, by="test")
+                os.chmod(root / "notes.txt", 0o644)
+                out["perm_real"] = ("U1" in notok("perm_real", ids), bool(gs()["U1"]["binding"].get("unbound")))
+                goals.run_checks(a, by="test")
+            else:
+                out["perm_real"] = (True, True)   # root 读得到 000 的文件，真实路径由上面的模拟覆盖
+            goals._BUDGET_FILES = 1
+            goals.run_checks(a, by="test")
+            goals._BUDGET_FILES = old[2]
+            out["budget"] = (sorted(k for k, v in gs().items() if "超出核对预算" in str(v["binding"].get("unbound"))),
+                             notok("budget", ids))
+            goals.run_checks(a, by="test")
+            out["budget_back"] = notok("budget_back", ids)
+            # 反例 2：只认明确的旧格式；显式坏 schema、列表、null、去掉 schema 的 v2、非 live 目标用全局 schema 一律拒绝
+            raw = gs()
+            fmt = {}
+            for tag, mut in (("bogus", lambda b: dict(b, schema="bogus")), ("list", lambda b: [b]), ("null", lambda b: None),
+                             ("schema_removed", lambda b: {k: v for k, v in b.items() if k != "schema"}),
+                             ("global_on_exec", lambda b: {"schema": goals.GLOBAL_SCHEMA, "goals_sha": b["goals_sha"],
+                                                           "evidence_sha256": b["evidence_sha256"]}),
+                             ("legacy_b1", lambda b: {"goals_sha": b["goals_sha"], "evidence_sha256": b["evidence_sha256"]})):
+                d = json.loads(json.dumps(raw))
+                d["W1"]["binding"] = mut(d["W1"]["binding"])
+                put(d)
+                fmt[tag] = "W1" in notok("fmt-" + tag, ids)
+            d = json.loads(json.dumps(raw))
+            d["W1"].pop("binding")
+            put(d)
+            fmt["legacy_pre_b1"] = "W1" in notok("fmt-pre", ids)
+            put(raw)
+            out["formats"] = fmt
+            d = json.loads(json.dumps(raw))
+            d["W1"]["binding"] = {"goals_sha": d["W1"]["goals_sha"], "evidence_sha256": d["W1"]["binding"]["evidence_sha256"]}
+            put(d)
+            setg(base + [E("I3", "true")])
+            out["legacy_global"] = "W1" in notok("legacy_global", ids)
+            # 依赖：未知依赖、兄弟分支汇合成环 → 绑定不成立；菱形（无环）正常
+            g_cycle = {"goals": [M("A", depends_on=["B"]), M("B", depends_on=["A"]),
+                                 E("X3", "true", depends_on=["A", "B"]), M("C"), M("A2", depends_on=["C"]),
+                                 M("B2", depends_on=["C"]), E("X4", "true", depends_on=["A2", "B2"])]}
+            res = []
+            for gid in ("X3", "X4"):
+                try:
+                    res.append(sorted(goals._dep_defs(g_cycle, next(x for x in g_cycle["goals"] if x["id"] == gid))))
+                except goals._Unknown as e:
+                    res.append("成环" in str(e))
+            out["cycle"] = res
+            setg(base + [E("X2", "true", depends_on=["NOPE"])] + g_cycle["goals"])
+            goals.run_checks(a, by="test")
+            st2 = gs()
+            out["dep_unbound"] = ("不存在" in str(st2["X2"]["binding"].get("unbound")), "成环" in str(st2["X3"]["binding"].get("unbound")),
+                                  st2["X4"]["binding"].get("kind"), "X2" in notok("dep", ["X2"]), "X3" in notok("dep", ["X3"]))
+            # 运行时审计：计算出的路径、读项目外、换目录、os._exit 丢记录、对非字面量路径的存在性检查、读环境变量、检查期间写文件
+            rt = [E("R1", "python3 scripts/comp.py", affects=["scripts"]),
+                  E("R2", f"python3 scripts/check.py {outside / 'in.txt'}"),
+                  E("R3", "python3 scripts/cd.py"), E("R4", "python3 scripts/ex.py", affects=["scripts"]),
+                  E("R5", "python3 scripts/st.py data/nope.txt", affects=["scripts"]),
+                  E("R6", "python3 scripts/env.py"), E("R8", "python3 scripts/sp.py")]
+            setg(base + rt)
+            goals.run_checks(a, by="test")
+            st3 = gs()
+            out["runtime"] = {x["id"]: (st3[x["id"]]["binding"].get("kind") or "unbound") for x in rt}
+            out["runtime_ok_flags"] = notok("runtime", [x["id"] for x in rt])
+            out["runtime_why"] = {x["id"]: str(st3[x["id"]]["binding"].get("unbound", ""))[:30] for x in rt}
+            # 检查期间写入项目：本轮所有绑定到整个项目的记录都不成立（单独跑，避免影响上面的用例）
+            setg(base + [E("R7", "python3 scripts/w.py")])
+            goals.run_checks(a, by="test")
+            st4 = gs()
+            out["write_during"] = ("变化" in str(st4["R7"]["binding"].get("unbound")), "变化" in str(st4["P2"]["binding"].get("unbound")),
+                                   st4["W1"]["binding"].get("kind"))
+            (root / "data/out.txt").unlink()
+            # affects 目录里指向 affects 之外的链接：执行会跟随，无法只凭 affects 绑定
+            setg(base)
+            os.symlink(root / "notes.txt", root / "data/ln")
+            goals.run_checks(a, by="test")
+            out["aff_link"] = (str(gs()["P3"]["binding"].get("unbound", "")).startswith("符号链接"), "P3" in notok("aff_link", ids))
+            (root / "data/ln").unlink()
+            goals.run_checks(a, by="test")
+            out["aff_link_back"] = notok("aff_link_back", ids)
+            try:
+                goals.mark_na(a, "W1", condition="c", scope="s", reason="r", by="t")
+                out["na_on_pass"] = "accepted"
+            except WfError:
+                out["na_on_pass"] = "refused"
+            # 静态推导
+            P = lambda **kw: dict(base[1], **kw)   # noqa: E731
+            specs = {
+                "ok": P(), "dir": base[4], "none": base[3],
+                "dotdot": P(affects=["scripts", "../x"]), "abs": P(affects=["scripts", "/etc/passwd"]),
+                "no_script": P(affects=["data/in.txt"]), "link": P(check="python3 scripts/check.py alias/in.txt",
+                                                                affects=["scripts", "alias/in.txt"]),
+                "missing": P(affects=["scripts", "data/in.txt", "nope.txt"]), "not_list": P(affects="scripts"),
+                "unnorm": P(affects=["scripts", "data/./in.txt"]), "runtime_area": P(affects=["scripts", "data/in.txt", "workflow/evidence"]),
+                "literal": P(check="python3 scripts/lit.py", affects=["scripts/lit.py"]),
+                "import_missing": P(check="python3 scripts/imp.py", affects=["scripts/imp.py"]),
+                "import_ok": P(check="python3 scripts/imp.py", affects=["scripts/imp.py", "scripts/helper.py"]),
+                "dynamic": P(check="python3 scripts/dyn.py", affects=["scripts"]), "env": P(check="python3 scripts/env.py"),
+                "stat_nonliteral": P(check="python3 scripts/st.py data/nope.txt", affects=["scripts"]),
+                "interp_path": P(check=".venv/bin/python3 scripts/check.py data/in.txt"),
+                "wf_tool": base[0], "wf_probes": E("W3", "wf self-check --probes"), "wf_ledger": E("W4", "wf ledger"),
+                "wf_doctor": E("W2", "wf doctor"), "cat": base[5], "cat_abs": E("Y1", "cat /etc/hostname"),
+                "cat_var": E("Y2", "cat $HOME/x"), "cat_up": E("Y3", "cat ../x"), "git": E("Y4", "git log --oneline"),
+                "chain": E("Y5", "true && true"), "other": E("Y6", "curl http://x")}
+
+            def sk(x):
+                s = goals._closure_spec(a, x)
+                return s["kind"] + ("+" if s.get("narrow") else "-" if s["kind"] == "python" else "")
+            out["closure"] = {k: sk(v) for k, v in specs.items()}
+            setg([E("F1", "false"), E("W1", "wf version")])
+            goals.run_checks(a, by="test")
+            setg([E("F1", "false"), E("W1", "wf version"), E("I4", "true")])
+            f1 = next(i for i in prog("failed_reuse")["items"] if i["id"] == "F1")
+            out["failed_reuse"] = (f1["ok"], f1["layer"], f1["detail"].startswith("退出码"))
+        finally:
+            goals._TOOL_ROOT, goals._hash_file, goals._BUDGET_FILES = old
+    proj = ["P2", "U1", "X1"]
+    _ok("B2-C2b 新记录：wf 只读工具命令绑定整棵工具；affects 经静态核对与运行时审计确认后只绑定 affects；observer 的导入目录"
+        "不冒充脚本输入（P1n 也可收窄）；只读程序绑定项目；静态出现子进程的脚本绑定不成立（不通过）；带 live 的目标用全局绑定",
+        out.get("kinds") == {"W1": "tool", "P1": "affects", "P1n": "affects", "P2": "project", "P3": "affects", "U1": "project",
+                             "D1": "unbound", "L1": "global", "X1": "project"}
+        and out["s0"] == ["D1"] and out["deps_X1"] == ["W1"] and out["d1_detail"],
+        json.dumps({k: out.get(k) for k in ("kinds", "s0", "deps_X1", "d1_detail")}, ensure_ascii=False))
+    _ok("B2-C2b 无关目标变化复用（重新批准前 reached 为假）；本目标定义变化失效并连带依赖它的目标；旧式与全局绑定按全局失效",
+        out["s1u"] == (["D1", "L1"], False, False) and out["s1"] == ["D1", "L1"] and out["s2"] == ["D1", "L1"]
+        and out["s3"] == (["D1", "L1", "W1", "X1"], True) and out["s4"] == ["D1", "L1", "P1"] and out["s5"] == ["D1"],
+        json.dumps({k: out[k] for k in ("s1u", "s1", "s2", "s3", "s4", "s5")}, ensure_ascii=False))
+    exp_seq = {"dashboard": ["W1"], "selftest": ["W1"], "manifest": ["W1"], "docs": ["W1"], "tool_mode": ["W1"], "tool_local": [],
+               "readme": proj, "data_content": ["P1", "P1n", "P3"] + proj, "data_mode": ["P1", "P1n", "P3"] + proj, "runtime": [],
+               "tool_new": ["W1"], "data_new": ["P3"] + proj, "proj_new": proj, "scripts_new": ["P1", "P3"] + proj,
+               "data_del": ["P1", "P1n", "P3"] + proj, "ext_link": proj}
+    seq_bad = [(t, a2, b2) for t, a2, b2 in out.get("seq", [])
+               if a2 != sorted(set(exp_seq.get(t, ["?"])) | {"D1"}) or b2 != ["D1"]]
+    _ok("B2-C2b 依赖闭包：工具 dashboard、selftest、MANIFEST、docs、权限、新增文件只影响工具绑定（local/ 除外）；项目文件的内容、"
+        "权限、新增、删除与新增的项目外链接按 affects 或整个项目精确失效；运行数据不影响；恢复原样（原权限）后恢复有效",
+        not seq_bad and len(out.get("seq", [])) == 16, json.dumps(seq_bad or out.get("seq"), ensure_ascii=False)[:1500])
+    _ok("B2-C2b 坏 hash、读取失败、证据被改动不复用；反例 1：新执行时读权限失败、超出预算都写成绑定不成立并失败关闭，文件之后再变也不复用，"
+        "恢复后重新检查通过",
+        out["badhash"] == ["D1", "P1", "W1"] and out["readfail"] == (sorted(["D1"] + proj), True) and out["evidence"] == ["D1", "W1"]
+        and out["restored"] == ["D1"] and out["perm"] == (True, True, True, True, True) and out["perm_back"] == (False, "project")
+        and out["perm_real"] == (True, True)
+        and out["budget"][0] == ["P1", "P1n", "P2", "P3", "U1", "W1", "X1"] and out["budget"][1] == ["D1", "P1", "P1n", "P2", "P3",
+                                                                                                      "U1", "W1", "X1"]
+        and out["budget_back"] == ["D1"],
+        json.dumps({k: out[k] for k in ("badhash", "readfail", "evidence", "restored", "perm", "perm_back", "perm_real", "budget",
+                                        "budget_back")}, ensure_ascii=False))
+    _ok("B2-C2b 反例 2：显式坏 schema、列表、null、去掉 schema 的 v2 绑定、非 live 目标用全局 schema 一律拒绝；只有明确的旧格式"
+        "（B1 的两键 binding、B1 之前没有 binding）按全局 goals_sha 兼容，且无关目标变化即失效",
+        out["formats"] == {"bogus": True, "list": True, "null": True, "schema_removed": True, "global_on_exec": True,
+                           "legacy_b1": False, "legacy_pre_b1": False} and out["legacy_global"] is True,
+        json.dumps({k: out[k] for k in ("formats", "legacy_global")}, ensure_ascii=False))
+    _ok("B2-C2b 依赖图：兄弟分支汇合成环被发现，菱形依赖正常；未知依赖与成环都写成绑定不成立并失败关闭",
+        out["cycle"] == [True, ["A2", "B2", "C"]] and out["dep_unbound"] == (True, True, "project", True, True),
+        json.dumps({k: out[k] for k in ("cycle", "dep_unbound")}, ensure_ascii=False))
+    _ok("B2-C2b 运行时审计：计算出的路径读到 affects 之外时退回整个项目；读项目外、换目录、os._exit 丢失审计记录、读环境变量、"
+        "运行时才出现的子进程（静态看不出）、检查期间写入项目都使绑定不成立；对非字面量路径做存在性检查时不收窄；affects 目录里指向 affects 外的链接使绑定不成立",
+        out["runtime"] == {"R1": "project", "R2": "unbound", "R3": "unbound", "R4": "unbound", "R5": "project", "R6": "unbound",
+                           "R8": "unbound"}
+        and out["runtime_ok_flags"] == ["R2", "R3", "R4", "R6", "R8"] and "子进程" in out["runtime_why"]["R8"]
+        and out["write_during"] == (True, True, "tool")
+        and out["aff_link"] == (True, True) and out["aff_link_back"] == ["D1"] and out["na_on_pass"] == "refused"
+        and out["failed_reuse"] == (False, "failed", True),
+        json.dumps({k: out[k] for k in ("runtime", "runtime_ok_flags", "runtime_why", "write_during", "aff_link", "aff_link_back",
+                                        "na_on_pass", "failed_reuse")}, ensure_ascii=False))
+    exp_cl = {"ok": "python+", "dir": "python+", "none": "python-", "dotdot": "python-", "abs": "python-", "no_script": "python-",
+              "link": "python-", "missing": "python-", "not_list": "python-", "unnorm": "python-", "runtime_area": "python-",
+              "literal": "python-", "import_missing": "python-", "import_ok": "python+", "dynamic": "unbound", "env": "unbound",
+              "stat_nonliteral": "python-", "interp_path": "unbound", "wf_tool": "tool", "wf_probes": "tool",
+              "wf_ledger": "tool+project", "wf_doctor": "unbound", "cat": "project", "cat_abs": "unbound", "cat_var": "unbound",
+              "cat_up": "unbound", "git": "unbound", "chain": "unbound", "other": "unbound"}
+    cl_bad = {k: v for k, v in out.get("closure", {}).items() if exp_cl.get(k) != v}
+    _ok("B2-C2b 静态推导：affects 只有规范化、不越界、不经符号链接、覆盖脚本、本地模块与路径字面量时才可能收窄；其余 wf 子命令、git、"
+        "范围外或带变量的参数、命令链与其他命令无法绑定",
+        not cl_bad and len(out.get("closure", {})) == len(exp_cl), json.dumps(cl_bad or out.get("closure"), ensure_ascii=False))
+    _ok("B2-C2b progress 的 ok、layer、reached 在以上全部状态下一致", not bad_consistency,
+        json.dumps(bad_consistency[:10], ensure_ascii=False))
+
+
+def _t_mech_runtime_inputs(_ok):
+    """FIX2：真实解释器、模块、stat 输入及 observer 透明性；仅临时 venv/脚本，不触系统文件。"""
+    import contextlib
+    from . import goals, policy
+    from .selftest import child_env
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+
+        @contextlib.contextmanager
+        def pythonpath(path):
+            old = os.environ.get("PYTHONPATH")
+            os.environ["PYTHONPATH"] = str(path)
+            try:
+                yield
+            finally:
+                if old is None:
+                    os.environ.pop("PYTHONPATH", None)
+                else:
+                    os.environ["PYTHONPATH"] = old
+
+        def make(name, source, cond=None, args=""):
+            a = _inst(td, name)
+            (a.root / "check.py").write_text(source, encoding="utf-8")
+            x = {"id": "E", "title": name, "kind": "exec", "check": "python3 check.py" + args,
+                 "pass": cond or {"exit": 0, "contains": ["GOOD"]}, "means": "fixture", "on_fail": "inspect",
+                 "affects": ["check.py", "input.txt"] if "input.txt" in source else ["check.py"]}
+            (a.wf / "goals.json").write_text(json.dumps({"goals": [x]}), encoding="utf-8")
+            policy.approve(a, "goals", "isolated FIX2 fixture", by="test")
+            return a, x
+
+        def execute(a):
+            goals.run_checks(a, timeout=30, by="test")
+            return json.loads((a.wf / "goals_state.json").read_text(encoding="utf-8"))["E"]
+
+        def current(a):
+            p = goals.progress(a)
+            return p["items"][0]["ok"] and p["reached"]
+
+        def direct(a, x):
+            env = dict(os.environ)
+            env["PATH"] = str(a.root / ".venv/bin") + os.pathsep + env.get("PATH", "")
+            r = subprocess.run(["bash", "-c", x["check"]], cwd=a.root, env=env, capture_output=True, text=True, timeout=30)
+            return goals.judge(x["pass"], r.returncode, r.stdout + r.stderr)[0], r.stdout + r.stderr
+
+        def venv(a):
+            env = child_env(os.environ, td / "venv-local")
+            r = subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(a.root / ".venv")],
+                               env=env, capture_output=True, text=True, timeout=60)
+            if r.returncode:
+                raise RuntimeError(r.stderr[-500:])
+            r = subprocess.run([str(a.root / ".venv/bin/python3"), "-c",
+                                "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                               env=env, capture_output=True, text=True, timeout=30)
+            if r.returncode:
+                raise RuntimeError(r.stderr[-500:])
+            return Path(r.stdout.strip())
+
+        a, x = make("venv-module", "import fixture_dep\nprint(fixture_dep.VALUE)\n")
+        lib = venv(a)
+        dep = lib / "fixture_dep.py"
+        dep.write_text("VALUE = 'GOOD'\n", encoding="utf-8")
+        r = execute(a)
+        normal = r["ok"] and current(a)
+        dep.write_text("VALUE = 'BAD'\n", encoding="utf-8")
+        actual, text = direct(a, x)
+        _ok("C2b FIX2 实际 venv 模块按字节绑定：初始正常、模块改变后不复用，直接运行判据也失败",
+            normal and not current(a) and not actual, text)
+
+        a, x = make("venv-data", "p = '.ve' + 'nv/value.txt'\nprint(open(p).read().strip())\n")
+        venv(a)
+        value = a.root / ".venv/value.txt"
+        value.write_text("GOOD\n", encoding="utf-8")
+        r = execute(a)
+        normal = r["ok"] and current(a)
+        value.write_text("BAD\n", encoding="utf-8")
+        actual, text = direct(a, x)
+        _ok("C2b FIX2 环境目录里的任意实际数据不豁免：初始可绑定，字节变化后 pending 且直接判据失败",
+            normal and not current(a) and not actual, text)
+
+        a, x = make("interpreter", "print('GOOD')\n")
+        entry = a.root / ".venv/bin/python3"
+        entry.parent.mkdir(parents=True)
+        import shlex
+        entry.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n', encoding="utf-8")
+        entry.chmod(0o755)
+        r = execute(a)
+        normal = r["ok"] and current(a)
+        entry.write_text('#!/bin/sh\nprintf "BAD\\n"\n', encoding="utf-8")
+        actual, text = direct(a, x)
+        _ok("C2b FIX2 命令实际解析的解释器入口绑定：同路径入口改字节不复用，未改系统解释器",
+            normal and not current(a) and not actual, text)
+
+        flag = td / "external-flag"
+        a, x = make("external-stat", "import os, sys\nprint('GOOD' if not os.path.exists(sys.argv[1]) else 'BAD')\n",
+                    args=" " + shlex.quote(str(flag)))
+        r = execute(a)
+        normal = r["ok"] and current(a)
+        flag.write_text("present\n", encoding="utf-8")
+        actual, text = direct(a, x)
+        _ok("C2b FIX2 非字面量外部 exists 按实际路径绑定：初始正常，外部文件创建后失效，不能用整项目冒充闭包",
+            normal and not current(a) and not actual, text)
+
+        reuse = []
+        for name, source in (("plain", "print(open('input.txt').read().strip())\n"),
+                             ("pathlib", "from pathlib import Path\nprint(Path('input.txt').read_text().strip())\n")):
+            a, x = make(name, source, {"exit": 0, "contains": ["GOOD"], "not_contains": ["Error in sitecustomize"]})
+            (a.root / "input.txt").write_text("GOOD\n", encoding="utf-8")
+            actual, text = direct(a, x)
+            r = execute(a)
+            (a.root / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+            reuse.append(actual and r["ok"] and r["binding"].get("kind") == "affects" and current(a))
+        _ok("C2b FIX2 observer bootstrap/dump 不污染普通 open 与 pathlib 的 affects：无关文件变化仍可复用，输出判据与直接执行一致",
+            all(reuse), repr(reuse))
+
+        a, x = make("site-error", "print('GOOD')\n",
+                    {"exit": 0, "contains": ["GOOD"], "not_contains": ["missing-required-component"]})
+        (a.root / "sitecustomize.py").write_text("raise ImportError('missing-required-component')\n", encoding="utf-8")
+        with pythonpath(a.root):
+            actual, text = direct(a, x)
+            r = execute(a)
+            evidence = (a.root / r["evidence"]).read_text(encoding="utf-8")
+        _ok("C2b FIX2 原 sitecustomize 内部 ImportError 不吞掉、不替换为 KeyError：真实输出与判据仍失败",
+            not actual and not r["ok"] and "missing-required-component" in evidence and "KeyError" not in evidence,
+            text + evidence)
+
+        a, x = make("site-normal", "print('GOOD')\n")
+        source = a.root / "site-input.txt"
+        source.write_text("GOOD\n", encoding="utf-8")
+        (a.root / "sitecustomize.py").write_text("print(open('site-input.txt').read().strip())\n", encoding="utf-8")
+        with pythonpath(a.root):
+            actual, text = direct(a, x)
+            r = execute(a)
+            normal = r["ok"] and current(a)
+            source.write_text("BAD\n", encoding="utf-8")
+            stale = not current(a)
+        _ok("C2b FIX2 正常 sitecustomize 仍执行，实际读取的项目文件变化使旧结果失效",
+            actual and normal and stale and text.count("GOOD") == 2, text)
+
+        library = td / "external-library"
+        library.mkdir()
+        (library / "fixture_shadow.py").write_text("VALUE = 'GOOD'\n", encoding="utf-8")
+        a, x = make("import-shadow", "import fixture_shadow\nprint(fixture_shadow.VALUE)\n")
+        with pythonpath(library):
+            r = execute(a)
+            normal = r["ok"] and current(a)
+            (a.root / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+            reuse = current(a)
+            (a.root / "fixture_shadow.py").write_text("VALUE = 'BAD'\n", encoding="utf-8")
+            actual, text = direct(a, x)
+            stale = not current(a)
+        _ok("C2b FIX2 模块搜索绑定：外部实际模块正常绑定，无关文件可复用，新建同名遮蔽模块后失效",
+            normal and reuse and stale and not actual, text)
+
+        a, x = make("missing-import", "try:\n import fixture_missing\nexcept ImportError:\n print('GOOD')\nelse:\n print('BAD')\n")
+        r = execute(a)
+        normal = r["ok"] and current(a)
+        (a.root / "fixture_missing.py").write_text("VALUE = 1\n", encoding="utf-8")
+        actual, text = direct(a, x)
+        _ok("C2b FIX2 失败导入也绑定搜索候选：原先缺失的模块新增后失效且直接运行判据失败",
+            normal and not current(a) and not actual, text)
+
+
+def _t_mech_startup_inputs(_ok):
+    """FIX3：仅临时 venv/site/中央缓存；不改宿主解释器配置。"""
+    from . import goals, policy
+    from .selftest import child_env
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+
+        def make(name, source):
+            a = _inst(td, name)
+            (a.root / "check.py").write_text(source, encoding="utf-8")
+            x = {"id": "E", "title": name, "kind": "exec", "check": "python3 check.py",
+                 "pass": {"exit": 0, "contains": ["GOOD"]}, "means": "fixture", "on_fail": "inspect",
+                 "affects": ["check.py"]}
+            (a.wf / "goals.json").write_text(json.dumps({"goals": [x]}), encoding="utf-8")
+            policy.approve(a, "goals", "isolated FIX3 fixture", by="test")
+            env = child_env(os.environ, td / (name + "-local"))
+            subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(a.root / ".venv")],
+                           env=env, check=True, capture_output=True, text=True, timeout=60)
+            py = a.root / ".venv/bin/python3"
+            lib = Path(subprocess.check_output([str(py), "-c", "import site; print(site.getsitepackages()[0])"],
+                                              env=env, text=True, timeout=30).strip())
+            lib.mkdir(parents=True, exist_ok=True)
+            return a, x, py, lib
+
+        def current(a):
+            return goals.progress(a)["reached"]
+
+        def execute(a):
+            goals.run_checks(a, timeout=30, by="test")
+            return current(a)
+
+        def direct(a, x, py):
+            r = subprocess.run([str(py), "check.py"], cwd=a.root, env=dict(os.environ),
+                               capture_output=True, text=True, timeout=30)
+            return goals.judge(x["pass"], r.returncode, r.stdout + r.stderr)[0]
+
+        good, bad = td / "good", td / "bad"
+        for directory, value in ((good, "GOOD"), (bad, "BAD")):
+            directory.mkdir()
+            (directory / "fixture_pth.py").write_text("VALUE = " + repr(value) + "\n", encoding="utf-8")
+        a, x, py, lib = make("pth-switch", "import fixture_pth\nprint(fixture_pth.VALUE)\n")
+        pth = lib / "fixture.pth"
+        pth.write_text(str(good) + "\n", encoding="utf-8")
+        normal = execute(a)
+        (lib / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+        reuse = current(a)
+        pth.write_text(str(bad) + "\n", encoding="utf-8")
+        _ok("C2b FIX3 真实 .pth 路径切换：初始可复用，无关 site 文件不影响，GOOD→BAD 后旧结果失效且直接判据失败",
+            normal and reuse and not current(a) and not direct(a, x, py))
+
+        source = "try:\n import fixture_pth\nexcept ImportError:\n print('GOOD')\nelse:\n print('BAD')\n"
+        a, x, py, lib = make("pth-added", source)
+        normal = execute(a)
+        (lib / "added.pth").write_text(str(good) + "\n", encoding="utf-8")
+        _ok("C2b FIX3 site 的 .pth 候选集合绑定：新增配置不能复用旧缺失导入的 GOOD",
+            normal and not current(a) and not direct(a, x, py))
+
+        a, x, py, lib = make("pth-missing-path", source)
+        missing = td / "missing-pth-target"
+        (lib / "missing.pth").write_text(str(missing) + "\n", encoding="utf-8")
+        normal = execute(a)
+        missing.mkdir()
+        (missing / "fixture_pth.py").write_text("VALUE = 'BAD'\n", encoding="utf-8")
+        _ok("C2b FIX3 .pth 指向的缺失路径也是启动输入：目录和模块新增后失效且直接判据失败",
+            normal and not current(a) and not direct(a, x, py))
+
+        a, x, py, lib = make("venv-config", "print('GOOD')\n")
+        normal = execute(a)
+        cfg = a.root / ".venv/pyvenv.cfg"
+        cfg.write_text(cfg.read_text(encoding="utf-8") + "\n# changed configuration\n", encoding="utf-8")
+        _ok("C2b FIX3 pyvenv.cfg 按实际配置字节绑定，修改后旧机械结果失效",
+            normal and not current(a))
+
+        a, x, py, lib = make("central-cache", "print('GOOD')\n")
+        old = os.environ.get("PYTHONPYCACHEPREFIX")
+        os.environ["PYTHONPYCACHEPREFIX"] = str(td / "central-cache")
+        try:
+            normal = execute(a)
+            rec = json.loads((a.wf / "goals_state.json").read_text(encoding="utf-8"))["E"]
+            files = (rec["binding"].get("runtime") or {}).get("files", [])
+            owned = [r["path"] for r in files if "/wf-goal-audit-" in r["path"]]
+            _ok("C2b FIX3 中央 pycache 下 observer 自有缓存与源码不入闭包，删除临时 audit 后普通脚本仍有效",
+                normal and not owned and direct(a, x, py), repr(owned))
+        finally:
+            if old is None:
+                os.environ.pop("PYTHONPYCACHEPREFIX", None)
+            else:
+                os.environ["PYTHONPYCACHEPREFIX"] = old
+
+        a, x, py, lib = make("pth-code", "print('GOOD')\n")
+        (lib / "code.pth").write_text("import os\n", encoding="utf-8")
+        reached = execute(a)
+        rec = json.loads((a.wf / "goals_state.json").read_text(encoding="utf-8"))["E"]
+        _ok("C2b FIX3 观察前 .pth 执行代码暂失败关闭，不把未观察输入冒充完整闭包",
+            rec["ok"] and not reached and ".pth" in rec["binding"].get("unbound", ""))
+
+
+def _t_mech_disabled_pth(_ok):
+    """FIX4：环境变体只作用于临时夹具；产品不改环境或原检查命令。"""
+    import contextlib
+    from . import goals, policy
+    from .selftest import child_env
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        flag = td / "external-startup-input"
+        flag.write_text("GOOD\n", encoding="utf-8")
+
+        def template(default):
+            return ("import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, '"
+                    + default + "') == 'local'; enabled and __import__('_distutils_hack').add_shim();")
+
+        @contextlib.contextmanager
+        def environment(**values):
+            old = {k: os.environ.get(k) for k in values}
+            try:
+                for k, v in values.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+                yield
+            finally:
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+        def make(name, text):
+            a = _inst(td, name)
+            (a.root / "check.py").write_text("print('GOOD')\n", encoding="utf-8")
+            x = {"id": "E", "title": name, "kind": "exec", "check": "python3 check.py",
+                 "pass": {"exit": 0, "contains": ["GOOD"], "not_contains": ["BAD", "Error in sitecustomize"]},
+                 "means": "fixture", "on_fail": "inspect", "affects": ["check.py"]}
+            (a.wf / "goals.json").write_text(json.dumps({"goals": [x]}), encoding="utf-8")
+            policy.approve(a, "goals", "isolated FIX4 fixture", by="test")
+            env = child_env(os.environ, td / (name + "-local"))
+            subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(a.root / ".venv")],
+                           env=env, check=True, capture_output=True, text=True, timeout=60)
+            py = a.root / ".venv/bin/python3"
+            lib = Path(subprocess.check_output([str(py), "-c", "import site; print(site.getsitepackages()[0])"],
+                                              env=env, text=True, timeout=30).strip())
+            lib.mkdir(parents=True, exist_ok=True)
+            (lib / "_distutils_hack.py").write_text(
+                "def add_shim():\n print('SHIM ' + open(" + repr(str(flag)) + ").read().strip())\n", encoding="utf-8")
+            pth = lib / "distutils-precedence.pth"
+            pth.write_text(text, encoding="utf-8")
+            return a, x, py, pth
+
+        def current(a):
+            return goals.progress(a)["reached"]
+
+        def execute(a):
+            goals.run_checks(a, timeout=30, by="test")
+            rec = json.loads((a.wf / "goals_state.json").read_text(encoding="utf-8"))["E"]
+            return rec, current(a), (a.root / rec["evidence"]).read_text(encoding="utf-8").split("\n", 2)[2]
+
+        def direct(a, x, py):
+            r = subprocess.run([str(py), "check.py"], cwd=a.root, env=dict(os.environ),
+                               capture_output=True, text=True, timeout=30)
+            text = r.stdout + r.stderr
+            return goals.judge(x["pass"], r.returncode, text)[0], text
+
+        for default, values in (("stdlib", (None, "stdlib", "", "other")), ("local", ("stdlib", "", "other"))):
+            results = []
+            for i, value in enumerate(values):
+                with environment(SETUPTOOLS_USE_DISTUTILS=value):
+                    a, x, py, pth = make("disabled-" + default + str(i), template(default) + " \t\r\n")
+                    rec, reached, text = execute(a)
+                    actual, output = direct(a, x, py)
+                    results.append(rec["ok"] and reached and actual and text == output and "SHIM" not in output)
+            _ok("C2b FIX4 完整 " + default + " 模板仅在真实条件为 False 时复用，缺失／空串不混淆，原输出不变",
+                all(results), repr(results))
+
+        with environment(SETUPTOOLS_USE_DISTUTILS=None):
+            a, x, py, pth = make("env-change", template("stdlib") + "\n")
+            rec, reached, text = execute(a)
+            normal = rec["ok"] and reached
+            with environment(SETUPTOOLS_USE_DISTUTILS="local"):
+                stale = not current(a)
+                rec, reached, text = execute(a)
+                flag.write_text("BAD\n", encoding="utf-8")
+                actual, output = direct(a, x, py)
+                active = rec["ok"] and not current(a) and "未禁用" in rec["binding"].get("unbound", "")
+                flag.write_text("GOOD\n", encoding="utf-8")
+            _ok("C2b FIX4 真实环境改为 local 使旧记录失效，启用 shim 后新记录 unbound；外部启动输入确实能改变直接判据",
+                normal and stale and active and not actual and "SHIM BAD" in output)
+
+            a, x, py, pth = make("local-default", template("local") + "\n")
+            rec, reached, text = execute(a)
+            _ok("C2b FIX4 local 模板变量缺失时确实启用，不因文件名或模板已知而放行，原因可读",
+                rec["ok"] and not current(a) and "SHIM GOOD" in text
+                and "观察前输入无法证明" in rec["binding"].get("unbound", ""))
+
+            for name, suffix in (("tail", " print(open(" + repr(str(flag)) + ").read());\n"),
+                                 ("second-line", "\nimport os; print(open(" + repr(str(flag)) + ").read())\n"),
+                                 ("comment-tail", " # only a comment\n"),
+                                 ("assignment-tail", " enabled = False;\n")):
+                a, x, py, pth = make(name, template("stdlib") + "\n")
+                rec, reached, text = execute(a)
+                normal = rec["ok"] and reached
+                pth.write_text(template("stdlib") + suffix, encoding="utf-8")
+                stale = not current(a)
+                rec, reached, text = execute(a)
+                actual_input = True
+                if name in ("tail", "second-line"):
+                    flag.write_text("BAD\n", encoding="utf-8")
+                    actual, output = direct(a, x, py)
+                    actual_input = not actual and "BAD" in output and not current(a)
+                    flag.write_text("GOOD\n", encoding="utf-8")
+                _ok("C2b FIX4 完整匹配边界 " + name + "：先有合法通过，改尾部／第二行后失效且重新检查不放行",
+                    normal and stale and rec["ok"] and not current(a) and actual_input
+                    and "未知执行代码" in rec["binding"].get("unbound", ""))
+
+            a, x, py, pth = make("unknown-later-file", template("stdlib") + "\n")
+            rec, reached, text = execute(a)
+            normal = rec["ok"] and reached
+            (pth.parent / "zz-unknown.pth").write_text("import\tos\n", encoding="utf-8")
+            stale = not current(a)
+            rec, reached, text = execute(a)
+            _ok("C2b FIX4 必须扫描全部 .pth 和全部执行行，合法首文件不能遮住后续未知 import",
+                normal and stale and rec["ok"] and not current(a)
+                and "zz-unknown.pth" in rec["binding"].get("unbound", ""))
+
+            a, x, py, pth = make("standalone-comment", "# standalone\n" + template("stdlib") + "\n# after\n")
+            rec, reached, text = execute(a)
+            normal = rec["ok"] and reached
+            with environment(SETUPTOOLS_USE_DISTUTILS=""):
+                stale = not current(a)
+                rec, reached, text = execute(a)
+                rebound = rec["ok"] and reached
+            _ok("C2b FIX4 独立注释按 site 语义忽略；环境从缺失变为空串虽同为禁用，旧证据仍失效且可重新绑定",
+                normal and stale and rebound)
+
+            a, x, py, pth = make("unused-shim", template("stdlib") + "\n")
+            rec, reached, text = execute(a)
+            (pth.parent / "_distutils_hack.py").write_text("raise RuntimeError('UNEXPECTED SHIM IMPORT')\n", encoding="utf-8")
+            actual, output = direct(a, x, py)
+            _ok("C2b FIX4 禁用右支不主动导入或绑定 shim，未执行模块变化后仍可复用且原检查正常",
+                rec["ok"] and reached and current(a) and actual and text == output == "GOOD\n")
+
+            a, x, py, pth = make("pth-link-mode", template("stdlib") + "\n")
+            rec, reached, text = execute(a)
+            normal = rec["ok"] and reached
+            mode = pth.stat().st_mode & 0o777
+            pth.chmod(mode ^ 0o100)
+            mode_stale = not current(a)
+            pth.chmod(mode)
+            restored = current(a)
+            target = td / "same-template.pth"
+            target.write_text(pth.read_text(encoding="utf-8"), encoding="utf-8")
+            pth.unlink()
+            pth.symlink_to(target)
+            link_stale = not current(a)
+            rec, reached, text = execute(a)
+            _ok("C2b FIX4 认可 .pth 的权限与链接真实去处仍是输入，同字节换链接也失效，重新检查可绑定",
+                normal and mode_stale and restored and link_stale and rec["ok"] and reached)
+
+            a, x, py, pth = make("central-original-site", template("stdlib") + "\n")
+            source = a.root / "site-input.txt"
+            source.write_text("GOOD\n", encoding="utf-8")
+            (a.root / "sitecustomize.py").write_text("print('SITE ' + open('site-input.txt').read().strip())\n",
+                                                    encoding="utf-8")
+            with environment(PYTHONPYCACHEPREFIX=str(td / "central"), PYTHONPATH=str(a.root)):
+                actual, output = direct(a, x, py)
+                rec, reached, text = execute(a)
+                normal = rec["ok"] and reached
+                files = (rec["binding"].get("runtime") or {}).get("files", [])
+                owned = [r["path"] for r in files if "/wf-goal-audit-" in r["path"]]
+                source.write_text("BAD\n", encoding="utf-8")
+                stale = not current(a)
+            _ok("C2b FIX4 禁用模板与中央 pycache 共存，observer 自有文件仍排除，原 sitecustomize 的输出和真实输入保留",
+                normal and actual and text == output and "SITE GOOD" in output and not owned and stale,
+                repr({"normal": normal, "unbound": rec["binding"].get("unbound"), "actual": actual, "same": text == output, "output": output,
+                      "owned": owned, "stale": stale}))
+
+            a, x, py, pth = make("nonstandard-environ",
+                                "import os; os.environ = dict(os.environ)\n" + template("stdlib") + "\n")
+            rec, reached, text = execute(a)
+            _ok("C2b FIX4 无法确认标准 os.environ 前提时失败关闭，不套用模板证明",
+                rec["ok"] and not current(a) and "CPython/site/os" in rec["binding"].get("unbound", ""))
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
          ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals), ("指标 C3", _t_metrics),
          ("指标真实 API C3", _t_metrics_real_api),
          ("指标时间与身份 C3", _t_metrics_time_identity), ("指标只读 C3", _t_metrics_readonly),
-         ("目标空集保护 C2a", _t_goals_empty_guard)]
+         ("目标空集保护 C2a", _t_goals_empty_guard), ("逐目标机械绑定 C2b", _t_mech_v2),
+         ("运行输入与 observer C2b FIX2", _t_mech_runtime_inputs),
+         ("site 启动与中央缓存 C2b FIX3", _t_mech_startup_inputs),
+         ("禁用 distutils 模板 C2b FIX4", _t_mech_disabled_pth)]
 
 
 def run_lane_c(_ok) -> None:
