@@ -540,22 +540,20 @@ def _t_exec_guard(_ok):
 
 
 def _t_update_mutex(_ok):
-    import fcntl
     from . import release
-    from .core import LOCAL, WfError
-    lp = WF_HOME / "local" / "locks" / "self-update.lock"   # 1.8.5：锁改放在工具目录里
-    lp.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(lp, "a+")
+    from .core import WfError
+    from unittest.mock import patch
     msg = ""
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            release.self_update(Path("/nonexistent/collab-wf-9.9.9.zip"))
-        except WfError as e:
-            msg = str(e)
-    finally:
-        fh.close()
-    _ok("1.8.4 安装互斥：已有一个 self-update 在进行时，第二个立即失败、不排队、不安装", "另一个" in msg, msg)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        with patch.object(release, "WF_HOME", root), release._InstallLock(root, "tool"):
+            try:
+                # A nonempty request reaches the real target lock before package I/O.
+                release.self_update(Path("/nonexistent/collab-wf-9.9.9.zip"), review_id="selftest-lock")
+            except WfError as e:
+                msg = str(e)
+    _ok("安装互斥：同 root 的 self-update 在读包前立即失败、不排队、不安装", "install_busy" in msg, msg)
 
 
 def _t_reply_latency(_ok):
@@ -784,23 +782,36 @@ def _t_arbiter(_ok):
 
 
 def _t_review_gate(_ok):
-    from . import anomaly, release
-    from .core import WfError
-    orig = anomaly.transport_cfg
+    from . import anomaly, core, review, release
+    from .core import Instance, WfError
+    from .selftest_review import Env
+    from unittest.mock import patch
     res = []
-    try:
-        for cfg, verdict in (({"review_required": True}, "unavailable"), ({"review_required": True}, "none"),
-                             ({"review_required": True}, "pass"), ({}, "unavailable")):
-            anomaly.transport_cfg = lambda c=cfg: c
-            try:
-                release._review_gate(verdict, "测试")
-                res.append("ok")
-            except WfError:
-                res.append("refused")
-    finally:
-        anomaly.transport_cfg = orig
-    _ok("1.8.8 安装前审查必需（开关）：开启后，没有审查结论（不在场、超时、没配）就不安装；有结论照常；不开启时行为不变",
-        res == ["refused", "refused", "ok", "ok"], str(res))
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        with patch.object(core, "LOCAL", root / "local"), patch.object(anomaly, "LOCAL", root / "local"):
+            env = Env(root)
+            with patch.object(review, "_tool_home", lambda: env.tool):
+                target = env.project("gate")
+                package = env.pkg("gate")
+                before = (target / "app.py").read_bytes()
+                for cfg in ({}, {"review_required": False}, {"review_required": True}):
+                    env.transport.write_text(json.dumps(cfg))
+                    req = review.prepare(target, package, kind="project", author="B")
+                    decision = review.run(req["request_id"])
+                    denied = False
+                    try:
+                        release.apply_zip(Instance(target), package, review_id=req["request_id"])
+                    except WfError:
+                        denied = True
+                    res.append(not decision["allowed"] and "runner_unavailable" in decision["reasons"]
+                               and denied and (target / "app.py").read_bytes() == before)
+                env.set_transport()
+                fresh = review.prepare(target, package, kind="project", author="B")
+                positive = review.run(fresh["request_id"])
+    _ok("安装前审查：无 runner 时始终拒绝、目标不变（review_required 不能旁路）；临时 synthetic runner/verifier 正例仍可审查",
+        all(res) and positive["allowed"] and positive["provenance"]["synthetic"],
+        json.dumps({"negative": res, "positive": positive}, ensure_ascii=False))
 
 
 def _t_heartbeat_no_resend(_ok):
