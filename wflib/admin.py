@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -23,18 +24,141 @@ def _minor(v: str) -> str:
     return ".".join(v.split(".")[:2])
 
 
+# ---------------- B2-B1a：新项目的默认白名单与目标骨架 ----------------
+# 只在新建项目（不是 --adopt）且文件不存在时写入；写入前先准备并校验全部默认材料，任何一项不可用就整次拒绝，
+# 不写任何文件；已有文件一律不覆盖。写出的 policy.json / goals.json 都未经批准，不生成批准记录，因而不授予任何
+# 自动执行能力。门禁与目标判据都是固定常量，项目名永远不进入命令；init 不执行任何门禁命令。
+
+INIT_POLICY_VERSION = "init-policy/1"
+INIT_GATES = (("工具自检", "wf self-check"), ("行为探针", "wf self-check --probes"))
+INIT_DEFAULT_FILES = ("workflow/policy.json", "workflow/goals.json")
+
+
+def init_default_policy() -> dict:
+    """新项目的默认白名单（init-policy/1）。纯函数：每次返回新的 dict，不读时钟、不读写磁盘。
+    allow 为空、授权开关全部关闭；gates 只有两道固定的只读门禁，判据 exit 0。项目冒烟命令未声明时只写说明：
+    那不是“不适用”的正式记录，也不算通过。"""
+    return {
+        "_说明": (f"collab-wf init 默认白名单（{INIT_POLICY_VERSION}）。未经用户批准不生效；allow 为空，驱动器不会自动执行"
+                 "任何命令。gates 是两道固定的只读门禁（工具自检、行为探针），init 不执行它们。项目冒烟命令尚未声明："
+                 "这不是“不适用”的正式记录，也不算通过；声明冒烟命令或按四项记不适用，都要另经用户批准。"),
+        "allow": [],
+        "auto_apply": False,
+        "auto_self_update": False,
+        "auto_new_conversation": False,
+        "gates": [{"name": n, "cmd": c, "pass": {"exit": 0}} for n, c in INIT_GATES],
+    }
+
+
+def _init_defaults(root: Path, name: str, today: str) -> tuple:
+    """写入前准备并校验默认材料。返回 ([(相对路径, 字节)] 待新建, [已存在而保留的相对路径])。
+    需要新建的材料只要有一项不可用（骨架接口缺失、抛错、校验不通过、命令不是固定只读常量）就抛 WfError，此时什么都没写。"""
+    from . import goals, policy
+    fixed = {c for _, c in INIT_GATES}
+    todo, kept = [], []
+    for rel in INIT_DEFAULT_FILES:
+        if os.path.lexists(root / rel):
+            kept.append(rel)   # 已有文件（含链接）一律不碰，字节不变
+            continue
+        if rel.endswith("policy.json"):
+            obj = init_default_policy()
+            bad = [g["cmd"] for g in obj["gates"]
+                   if g["cmd"] not in fixed or not policy.readonly_check(g["cmd"]) or policy.GUARDRAIL.search(g["cmd"])]
+            if bad:
+                raise WfError("默认门禁不是固定的只读命令：" + "、".join(bad) + "；未接入，没有写入任何文件")
+        else:
+            fn = getattr(goals, "default_goals", None)
+            if not callable(fn):
+                raise WfError("目标骨架接口 goals.default_goals 不可用；未接入，没有写入任何文件")
+            try:
+                obj = fn(name, today=today)
+            except Exception as e:   # noqa: BLE001  C 的骨架接口出错：整次拒绝，不假装成功
+                raise WfError(f"目标骨架生成失败（{type(e).__name__}: {e}）；未接入，没有写入任何文件")
+            issues = goals.validate(obj) if isinstance(obj, dict) else ["骨架不是 JSON 对象"]
+            if not issues:
+                if obj.get("_skeleton") != getattr(goals, "SKELETON_VERSION", None):
+                    issues.append(f"骨架版本 {obj.get('_skeleton')!r} 与 goals.SKELETON_VERSION 不一致")
+                for x in obj["goals"]:
+                    if x.get("kind") == "exec" and x.get("check") not in fixed:
+                        issues.append(f"{x.get('id')} 的检查命令不是固定的只读常量：{str(x.get('check'))[:80]}")
+            if issues:
+                raise WfError("目标骨架校验不通过：" + "；".join(issues[:5]) + "；未接入，没有写入任何文件")
+        try:
+            data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        except (TypeError, ValueError) as e:
+            raise WfError(f"{rel} 的默认内容无法序列化（{e}）；未接入，没有写入任何文件")
+        todo.append((rel, data))
+    return todo, kept
+
+
+def _write_new(p: Path, data: bytes) -> bool:
+    """只新建、不覆盖（O_CREAT|O_EXCL）。目标已存在时返回 False；写到一半失败时删掉本次新建的文件再抛出。"""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o644)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except BaseException:
+        _unlink(p)
+        raise
+    return True
+
+
+def _refuse_linked_workflow(wf: Path) -> None:
+    """B2-FIX-B1A：新建项目时 workflow 必须是项目里的普通目录或尚不存在。它是符号链接（指向项目外、项目内或失效）
+    或不是目录时整次拒绝：否则默认白名单、目标与 wf.json 会写到链接指向的位置。只防误用与误配置，
+    不声称能防同一用户在检查之后并发替换目录。--adopt 维持原边界，不经过这里。"""
+    import stat as _st
+    try:
+        st = os.lstat(wf)
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise WfError(f"无法检查 {wf}：{e}；未接入，没有写入任何文件")
+    if _st.S_ISLNK(st.st_mode):
+        raise WfError(f"{wf} 是符号链接（指向 {os.readlink(wf)}）：新建项目不把工作流文件写到链接指向的位置；"
+                      "请改为项目里的普通目录。未接入，没有写入任何文件")
+    if not _st.S_ISDIR(st.st_mode):
+        raise WfError(f"{wf} 已存在但不是目录；未接入，没有写入任何文件")
+
+
 def init_project(root: Path, name=None, adopt=False, turn=None, state=None) -> Instance:
     root = Path(root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
     wf = root / "workflow"
+    if not adopt:
+        _refuse_linked_workflow(wf)   # B2-FIX-B1A：在任何读写、建目录、注册、记事件之前
     if (wf / "wf.json").exists():
         raise WfError(f"{root} 已接入工作流。")
     name = name or root.name
+    if not adopt and (root / "PROJECT.md").exists():
+        raise WfError("目录里已有 PROJECT.md。接入已有项目请加 --adopt。")
+    today = datetime.now().strftime("%Y-%m-%d")
+    # B2-B1a：新建项目在写任何文件之前先准备并校验默认材料；--adopt 维持原边界，不写默认文件
+    defaults, kept = ([], []) if adopt else _init_defaults(root, name, today)
+    made_dirs = [d for d in (root, wf) if not d.exists()] if defaults else []
+    root.mkdir(parents=True, exist_ok=True)
+    created = []
+    if defaults:
+        try:
+            for rel, data in defaults:
+                if _write_new(root / rel, data):
+                    created.append(rel)
+                else:
+                    kept.append(rel)   # 准备之后才出现的同名文件：照样不覆盖
+        except BaseException:
+            for rel in created:   # 不留半套默认材料
+                _unlink(root / rel)
+            for d in reversed(made_dirs):
+                try:
+                    d.rmdir()   # 只删本次新建且已空的目录
+                except OSError:
+                    pass
+            raise
     if not adopt:
-        if (root / "PROJECT.md").exists():
-            raise WfError("目录里已有 PROJECT.md。接入已有项目请加 --adopt。")
         tpl = (WF_HOME / "templates" / "PROJECT.template.md").read_text(encoding="utf-8")
-        today = datetime.now().strftime("%Y-%m-%d")
         (root / "PROJECT.md").write_text(tpl.replace("<项目名>", name).replace("YYYY-MM-DD", today), encoding="utf-8")
         (root / "CHANGELOG.md").write_text(f"# CHANGELOG\n\n## v0.1 — {today}\n- 项目创建\n", encoding="utf-8")
     cfg = {"project": name, "wf_version": _minor(tool_version()), "schema": SCHEMA, "created": now_iso(),
@@ -46,12 +170,12 @@ def init_project(root: Path, name=None, adopt=False, turn=None, state=None) -> I
     if add:
         gi.write_text("\n".join(lines + ["# collab-wf 实例数据（本机运行状态，不进版本库）"] + add) + "\n", encoding="utf-8")
     if (root / ".git").exists():
-        # 只提交接入产生的两个文件，不触碰其他未提交的改动
+        # 只提交接入产生的文件（wf.json、.gitignore，以及本次新建的默认白名单与目标），不触碰其他未提交的改动
         from .core import git_identity
-        git(["add", "--", "workflow/wf.json", ".gitignore"], root)
-        if git(["diff", "--cached", "--quiet"], root, check=False).returncode != 0:
-            git(git_identity() + ["commit", "-q", "-m", f"接入 collab-wf {tool_version()}", "--",
-                                  "workflow/wf.json", ".gitignore"], root)
+        paths = ["workflow/wf.json", ".gitignore"] + created
+        git(["add", "--"] + paths, root)
+        if git(["diff", "--cached", "--quiet", "--"] + paths, root, check=False).returncode != 0:
+            git(git_identity() + ["commit", "-q", "-m", f"接入 collab-wf {tool_version()}", "--"] + paths, root)
     inst = Instance(root)
     st = inst.state
     if adopt:
@@ -61,8 +185,14 @@ def init_project(root: Path, name=None, adopt=False, turn=None, state=None) -> I
         machine.sdef(st["state"])
     st["since"] = now_iso()
     inst.save()
+    extra = {}
+    if not adopt:   # B2-B1a：只增不改的事件字段
+        from . import goals as _goals
+        extra = {"defaults": created, "defaults_kept": kept, "policy_defaults": INIT_POLICY_VERSION
+                 if "workflow/policy.json" in created else None,
+                 "goals_skeleton": getattr(_goals, "SKELETON_VERSION", None) if "workflow/goals.json" in created else None}
     inst.event("adopt" if adopt else "init", to=st["state"], by="executor",
-               reason=f"接入工作流 {tool_version()}" + ("（已有项目，不回填历史事件）" if adopt else ""))
+               reason=f"接入工作流 {tool_version()}" + ("（已有项目，不回填历史事件）" if adopt else ""), **extra)
     register(name, root)
     return inst
 

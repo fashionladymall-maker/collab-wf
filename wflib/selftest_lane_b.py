@@ -1,4 +1,4 @@
-"""B1-B 车道测试：bootstrap 交接材料同源（r2 增加独立审查 R1–R5、r3 增加 R6–R7 的反例）。
+"""B1-B 车道测试：bootstrap 交接材料同源（r2 增加独立审查 R1–R5、r3 增加 R6–R7 的反例）；B2-B1a：init 默认骨架。
 
 覆盖：有版本库时一次固定提交（工具 zip、WORKFLOW.md、模板、VERSION、清单同源，生成期间 HEAD 移动不影响）；
 现场未提交改动只声明、冻结后另出只读覆盖包（hash 对应冻结字节、不可安装、不被正式同步与自动安装选中）；
@@ -906,9 +906,273 @@ def _t_r7_capability(_ok, base: Path):
         res == {"nogit": "refused", "gitdirty": "refused", "gitclean": "ok"}, json.dumps(res, ensure_ascii=False))
 
 
+# ---------------- B2-B1a：新项目的默认白名单与目标骨架 ----------------
+
+def _reg_names() -> list:
+    from .core import load_registry
+    return [p.get("name") for p in (load_registry().get("projects") or [])]
+
+
+def _init_cmds(pol: dict, gl: dict) -> list:
+    return [g.get("cmd") for g in pol.get("gates", [])] + [x.get("check") for x in gl.get("goals", []) if x.get("kind") == "exec"]
+
+
+def _t_b1a_init_new(_ok, base: Path):
+    """新项目：两份默认文件、固定只读门禁 exit 0、未批准、无批准记录；只提交接入产生的文件，不碰用户其他改动。"""
+    import re as _re
+    from . import admin, goals, policy
+    from .core import Instance, read_jsonl
+    name = f"lb-b1a-new-{os.getpid()}"
+    inst = admin.init_project(base / "p1", name)
+    pol = json.loads((inst.wf / "policy.json").read_text(encoding="utf-8"))
+    gl = json.loads((inst.wf / "goals.json").read_text(encoding="utf-8"))
+    fixed = [c for _, c in admin.INIT_GATES]
+    gates_ok = [(g.get("name"), g.get("cmd"), g.get("pass")) for g in pol.get("gates", [])] == \
+        [(n, c, {"exit": 0}) for n, c in admin.INIT_GATES] and fixed == ["wf self-check", "wf self-check --probes"]
+    ps, gs = policy.status(inst, "policy"), policy.status(inst, "goals")
+    ev = [e for e in read_jsonl(inst.events_path) if e.get("type") == "init"]
+    _ok("B2-B1a init 新项目：写出默认 policy.json（allow 空、授权全关、两道固定只读门禁 exit 0）与 goals.json（default-goals/1，"
+        "today 为宿主日期），二者都未批准、没有批准记录，事件记下新建的文件",
+        gates_ok and pol.get("allow") == [] and pol.get("auto_apply") is False and pol.get("auto_self_update") is False
+        and pol.get("auto_new_conversation") is False and all(policy.readonly_check(c) for c in _init_cmds(pol, gl))
+        and goals.validate(gl) == [] and gl.get("_skeleton") == goals.SKELETON_VERSION
+        and bool(_re.fullmatch(r"\d{4}-\d{2}-\d{2}", gl.get("phase", {}).get("since", "")))
+        and not ps["approved"] and not gs["approved"] and not (inst.wf / "approvals.json").exists()
+        and policy.load(Instance(inst.root)) is None and len(ev) == 1
+        and ev[0].get("defaults") == ["workflow/policy.json", "workflow/goals.json"]
+        and ev[0].get("goals_skeleton") == goals.SKELETON_VERSION and ev[0].get("policy_defaults") == admin.INIT_POLICY_VERSION,
+        json.dumps([pol.get("gates"), ps, gs, ev[-1:]], ensure_ascii=False, default=str)[:600])
+    root = base / "p2"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "staged.txt").write_text("用户已暂存\n", encoding="utf-8")
+    _git(root, "add", "staged.txt")
+    (root / "user.txt").write_text("用户未跟踪\n", encoding="utf-8")
+    admin.init_project(root, f"lb-b1a-git-{os.getpid()}")
+    committed = sorted(_git(root, "show", "--name-only", "--format=", "HEAD").splitlines())
+    status = _git(root, "status", "--porcelain")
+    _ok("B2-B1a init 提交：只提交 wf.json、.gitignore 与本次新建的两份默认文件；用户已暂存与未跟踪的文件原样不动",
+        committed == [".gitignore", "workflow/goals.json", "workflow/policy.json", "workflow/wf.json"]
+        and "A  staged.txt" in status and "?? user.txt" in status,
+        json.dumps([committed, status], ensure_ascii=False))
+
+
+def _t_b1a_init_existing(_ok, base: Path):
+    """已有 policy.json / goals.json 字节不变；只缺一份时只新建缺的那份；--adopt 不写默认文件、不调用骨架接口。"""
+    from . import admin, goals
+    from .core import read_jsonl
+    root = base / "e1"
+    (root / "workflow").mkdir(parents=True)
+    mine_p, mine_g = b'{"allow": ["^echo "]}\n', b'{"goals": "user-owned, not even valid"}'
+    (root / "workflow" / "policy.json").write_bytes(mine_p)
+    (root / "workflow" / "goals.json").write_bytes(mine_g)
+    inst = admin.init_project(root, f"lb-b1a-e1-{os.getpid()}")
+    ev = [e for e in read_jsonl(inst.events_path) if e.get("type") == "init"][-1]
+    root2 = base / "e2"
+    (root2 / "workflow").mkdir(parents=True)
+    (root2 / "workflow" / "policy.json").write_bytes(mine_p)
+    admin.init_project(root2, f"lb-b1a-e2-{os.getpid()}")
+    _ok("B2-B1a 已有文件不覆盖：两份都已存在时字节不变、事件记为保留；只有 policy.json 时只新建 goals.json",
+        (root / "workflow" / "policy.json").read_bytes() == mine_p and (root / "workflow" / "goals.json").read_bytes() == mine_g
+        and ev.get("defaults") == [] and ev.get("defaults_kept") == ["workflow/policy.json", "workflow/goals.json"]
+        and (root2 / "workflow" / "policy.json").read_bytes() == mine_p
+        and json.loads((root2 / "workflow" / "goals.json").read_text(encoding="utf-8")).get("_skeleton") == goals.SKELETON_VERSION,
+        json.dumps(ev, ensure_ascii=False, default=str)[:400])
+    root3 = base / "a1"
+    root3.mkdir()
+    (root3 / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+    calls = []
+    with _patched(goals, "default_goals", lambda *a, **k: calls.append(a) or {}):
+        admin.init_project(root3, f"lb-b1a-a1-{os.getpid()}", adopt=True)
+    _ok("B2-B1a --adopt 维持原边界：不写 policy.json / goals.json，也不调用骨架接口",
+        not (root3 / "workflow" / "policy.json").exists() and not (root3 / "workflow" / "goals.json").exists() and calls == [],
+        str(calls))
+
+
+def _t_b1a_init_refuse(_ok, base: Path):
+    """骨架接口缺失、抛错、返回不合格内容时整次拒绝：不建目录、不写任何文件、不注册、不记事件；写到一半失败也不留半套。"""
+    from . import admin, goals
+    from .core import WfError
+    good = goals.default_goals
+    cases = {
+        "接口缺失": None,
+        "抛错": lambda *a, **k: (_ for _ in ()).throw(RuntimeError("测试注入")),
+        "空目标": lambda *a, **k: {"goals": []},
+        "检查命令被改": lambda p, today=None: {**good(p, today=today), "goals": [
+            {**x, "check": "wf self-check; rm -rf ~"} if x.get("kind") == "exec" else x for x in good(p, today=today)["goals"]]},
+        "非固定只读命令": lambda p, today=None: {**good(p, today=today), "goals": [
+            {**x, "check": "cat README.md"} if x.get("kind") == "exec" else x for x in good(p, today=today)["goals"]]},
+        "骨架版本不符": lambda p, today=None: {**good(p, today=today), "_skeleton": "default-goals/0"},
+        "不是对象": lambda *a, **k: ["x"],
+    }
+    res = {}
+    for i, (label, fn) in enumerate(cases.items()):
+        root = base / f"r{i}"
+        name = f"lb-b1a-r{i}-{os.getpid()}"
+        try:
+            if fn is None:
+                saved = goals.__dict__.pop("default_goals")
+                try:
+                    admin.init_project(root, name)
+                finally:
+                    goals.default_goals = saved
+            else:
+                with _patched(goals, "default_goals", fn):
+                    admin.init_project(root, name)
+            res[label] = "接受了"
+        except WfError as e:
+            res[label] = "ok" if (not root.exists() and name not in _reg_names() and "没有写入任何文件" in str(e)) \
+                else f"拒绝但有残留：{e}"
+    root = base / "half"
+    name = f"lb-b1a-half-{os.getpid()}"
+    real = admin._write_new
+    n = [0]
+
+    def flaky(p, data):
+        n[0] += 1
+        if n[0] == 2:
+            raise OSError(28, "测试注入：写第二份时磁盘满")
+        return real(p, data)
+    try:
+        with _patched(admin, "_write_new", flaky):
+            admin.init_project(root, name)
+        res["写到一半"] = "没有失败"
+    except OSError:
+        res["写到一半"] = "ok" if not root.exists() and name not in _reg_names() else \
+            f"有残留：{sorted(str(x.relative_to(root)) for x in root.rglob('*'))}"
+    _ok("B2-B1a 骨架不可用时整次拒绝（缺失、抛错、空目标、命令被改、非固定命令、版本不符、类型不对）、写第二份失败时撤回第一份："
+        "目录、文件、注册与事件都不留",
+        all(v == "ok" for v in res.values()), json.dumps(res, ensure_ascii=False))
+    root = base / "keep"
+    (root / "workflow").mkdir(parents=True)
+    (root / "workflow" / "policy.json").write_bytes(b"{}\n")
+    try:
+        with _patched(goals, "default_goals", cases["抛错"]):
+            admin.init_project(root, f"lb-b1a-keep-{os.getpid()}")
+        kept = "接受了"
+    except WfError:
+        kept = sorted(str(x.relative_to(root)) for x in root.rglob("*"))
+    _ok("B2-B1a 拒绝时已有目录与文件原样保留（不删用户的目录或 policy.json）",
+        kept == ["workflow", "workflow/policy.json"] and (root / "workflow" / "policy.json").read_bytes() == b"{}\n", str(kept))
+
+
+def _t_b1a_init_safe(_ok, base: Path):
+    """恶意项目名不进入任何命令；init 不执行任何门禁或 wf 子进程（只允许 git）。"""
+    import subprocess as sp
+    from . import admin
+    evil = f'evil"; rm -rf ~; $(touch PWNED-{os.getpid()}) `id` | sh #'
+    seen = []
+    real_popen = sp.Popen
+
+    class Spy(real_popen):
+        def __init__(self, args, *a, **k):
+            seen.append(args if isinstance(args, str) else [str(x) for x in args])
+            super().__init__(args, *a, **k)
+    root = base / "evil"
+    root.mkdir()
+    _git(root, "init", "-q")
+    with _patched(sp, "Popen", Spy):
+        inst = admin.init_project(root, evil)
+    pol = json.loads((inst.wf / "policy.json").read_text(encoding="utf-8"))
+    gl = json.loads((inst.wf / "goals.json").read_text(encoding="utf-8"))
+    cmds = _init_cmds(pol, gl)
+    flat = [" ".join(x) if isinstance(x, list) else x for x in seen]
+    pwned = [str(p) for p in Path(base).rglob("PWNED-*")] + [str(p) for p in Path.cwd().glob("PWNED-*")]
+    _ok("B2-B1a 恶意项目名：门禁与目标判据全是固定常量、不含项目名；没有被执行的痕迹",
+        cmds and all(c in [x for _, x in admin.INIT_GATES] for c in cmds) and not any("evil" in c or "PWNED" in c for c in cmds)
+        and not pwned and gl.get("phase", {}).get("scope") == evil,
+        json.dumps([cmds, pwned], ensure_ascii=False))
+    _ok("B2-B1a init 不执行门禁：期间启动的子进程只有 git，没有 wf self-check / wf.py / bin/wf",
+        seen and all((x[0] if isinstance(x, list) else x.split()[0]) == "git" for x in seen)
+        and not any("self-check" in f or "wf.py" in f or "/bin/wf" in f for f in flat),
+        json.dumps(flat[:8], ensure_ascii=False))
+
+
+def _tree_snapshot(top: Path) -> dict:
+    """不跟随链接的完整快照：{相对路径: (类型, 字节或链接目标)}。"""
+    out = {}
+    if not os.path.lexists(top):
+        return out
+    for dp, dns, fns in os.walk(top, followlinks=False):
+        for n in sorted(dns + fns):
+            p = Path(dp) / n
+            rel = str(p.relative_to(top))
+            if os.path.islink(p):
+                out[rel] = ("link", os.readlink(p))
+            elif p.is_dir():
+                out[rel] = ("dir", None)
+            else:
+                out[rel] = ("file", p.read_bytes())
+    return out
+
+
+def _t_b1a_workflow_link(_ok, base: Path):
+    """B2-FIX-B1A：新建项目的 workflow 是符号链接（指向项目外、项目内、失效）或不是目录时，在任何写入之前拒绝；
+    外部目录、项目文件、注册表都不变；普通 workflow 目录照常；--adopt 不写默认文件。"""
+    from . import admin
+    from .core import WfError, read_json, REGISTRY
+    outside = base / "ext-target"   # 项目之外的目录
+    outside.mkdir()
+    (outside / "marker.txt").write_bytes(b"OUTSIDE-UNCHANGED\n")
+    (outside / "sub").mkdir()
+    (outside / "sub" / "keep.bin").write_bytes(bytes(range(64)))
+
+    def setup(tag, kind):
+        root = base / f"proj-{tag}"
+        root.mkdir()
+        (root / "user.txt").write_text("项目里用户的文件\n", encoding="utf-8")
+        if kind == "outside":
+            os.symlink(str(outside), root / "workflow")
+        elif kind == "broken":
+            os.symlink(str(base / "does-not-exist"), root / "workflow")
+        elif kind == "internal":
+            (root / "realwf").mkdir()
+            (root / "realwf" / "x.txt").write_text("内部\n", encoding="utf-8")
+            os.symlink("realwf", root / "workflow")
+        elif kind == "file":
+            (root / "workflow").write_text("不是目录\n", encoding="utf-8")
+        return root
+    res = {}
+    for tag in ("outside", "broken", "internal", "file"):
+        root = setup(tag, tag)
+        name = f"lb-fix-{tag}-{os.getpid()}"
+        before = (_tree_snapshot(outside), _tree_snapshot(root), read_json(REGISTRY, None))
+        try:
+            admin.init_project(root, name)
+            res[tag] = "接受了"
+        except Exception as e:   # noqa: BLE001  只有在写入前给出的 WfError 才算合格的拒绝
+            after = (_tree_snapshot(outside), _tree_snapshot(root), read_json(REGISTRY, None))
+            res[tag] = "ok" if (isinstance(e, WfError) and after == before and "没有写入任何文件" in str(e)) \
+                else f"拒绝方式或结果不对（{type(e).__name__}，前后{'相同' if after == before else '不同'}）：{e}"
+    _ok("B2-FIX-B1A workflow 是链接（指向项目外、失效、项目内）或普通文件时，新建项目在任何写入前拒绝："
+        "外部目录逐字节不变、项目文件与链接不变、注册表不变、不记事件",
+        all(v == "ok" for v in res.values()) and not (outside / "policy.json").exists()
+        and not (outside / "goals.json").exists() and not (outside / "wf.json").exists(),
+        json.dumps(res, ensure_ascii=False))
+    root = base / "plain"
+    (root / "workflow").mkdir(parents=True)
+    inst = admin.init_project(root, f"lb-fix-plain-{os.getpid()}")
+    plain_ok = (inst.wf / "policy.json").is_file() and (inst.wf / "goals.json").is_file() and not os.path.islink(root / "workflow")
+    root = base / "adopt"
+    root.mkdir()
+    (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+    adopt_out = base / "adopt-outside"
+    adopt_out.mkdir()
+    os.symlink(str(adopt_out), root / "workflow")
+    try:
+        admin.init_project(root, f"lb-fix-adopt-{os.getpid()}", adopt=True)
+        adopt_res = "ran"
+    except WfError as e:
+        adopt_res = f"refused：{e}"
+    _ok("B2-FIX-B1A 普通（已存在的空）workflow 目录照常写两份默认文件；--adopt 维持原边界、不写默认白名单与目标",
+        plain_ok and adopt_res == "ran" and not (adopt_out / "policy.json").exists() and not (adopt_out / "goals.json").exists(),
+        json.dumps([plain_ok, adopt_res], ensure_ascii=False))
+
+
 TESTS = [_t_clean, _t_dirty5, _t_freeze_once, _t_head_moved, _t_nogit, _t_failures, _t_compat, _t_short,
          _t_r1_attributes, _t_r1_verify, _t_r2_walk_errors, _t_r3_symlinks_git, _t_r3_symlinks_nogit,
-         _t_r4_publish, _t_r5_short, _t_r6_restore_retry, _t_r7_parent_swap, _t_r7_capability]
+         _t_r4_publish, _t_r5_short, _t_r6_restore_retry, _t_r7_parent_swap, _t_r7_capability,
+         _t_b1a_init_new, _t_b1a_init_existing, _t_b1a_init_refuse, _t_b1a_init_safe, _t_b1a_workflow_link]
 
 
 def run_lane_b(_ok) -> None:
