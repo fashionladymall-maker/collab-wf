@@ -589,8 +589,435 @@ def _t_default_goals(_ok):
         json.dumps([before == after_call, st, p.get("counts"), [i["layer"] for i in p["items"]], no_appr], ensure_ascii=False)[:800])
 
 
+def _mev(seq, turn, type_, actor="driver", **kw):
+    e = {"seq": seq, "ts": f"2026-10-15T00:{seq // 60:02d}:{seq % 60:02d}+00:00", "type": type_, "turn": turn,
+         "state": "X", "actor": actor, "pid": 1}
+    e.update(kw)
+    return e
+
+
+# 合成夹具（不是实景）：三轮按协议关闭（转入 COMPOSE 开始、round_result、下一轮转入 COMPOSE 为边界），当前第 4 轮；
+# 第 2 轮有一次命令行里的人工执行。spec 项为 (轮号, 类型, 字段)，seq 按顺序从 1 编号。
+_M_SPEC = [(1, "transition", {"to": "COMPOSE"}), (1, "round_result", {"ok": True}),
+           (2, "transition", {"to": "COMPOSE"}), (2, "exec", {"actor": "cli", "by": "executor", "cmd": "ls"}),
+           (2, "round_result", {"ok": True}),
+           (3, "transition", {"to": "COMPOSE"}), (3, "round_result", {"ok": True}),
+           (4, "transition", {"to": "COMPOSE"})]
+
+
+def _m_rows(spec=None):
+    return [_mev(i, t, ty, **kw) for i, (t, ty, kw) in enumerate(spec or _M_SPEC, 1)]
+
+
+def _m_turns(closed=(1, 2, 3), current=4, rows=None):
+    """fix2：轮次记录的时间按真实写入顺序取自事件流——发送时刻等于本轮转入 COMPOSE 的时刻，回复落地时刻等于本轮
+    round_result（没有时取本轮最后一条事件）的时刻。"""
+    ev = rows or _m_rows()
+    first = lambda t: next(e["ts"] for e in ev if e["turn"] == t)   # noqa: E731
+    out = []
+    for t in closed:
+        mine = [e for e in ev if e["turn"] == t]
+        rr = [e for e in mine if e["type"] == "round_result"]
+        out += [{"turn": t, "status": "sent", "from": "driver", "ts_sent": first(t)},
+                {"turn": t, "status": "done", "ts_done": (rr or mine)[-1]["ts"]}]
+    if current:
+        out.append({"turn": current, "status": "sent", "from": "driver", "ts_sent": first(current)})
+    return out
+
+
+def _metrics_fixture(inst, rows, state=None, turns=None):
+    """合成夹具（不是实景）：直接写事件流、轮次记录与 state.json。rows/turns 里的字符串原样写成一行（用来造坏行）。"""
+    inst.events_path.write_text("".join((r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)) + "\n"
+                                        for r in rows), encoding="utf-8")
+    if turns is not None:
+        if inst.turns_path.is_dir():
+            inst.turns_path.rmdir()
+        inst.turns_path.write_text("".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in turns),
+                                   encoding="utf-8")
+    if state is not None:
+        inst.state_path.write_text(state if isinstance(state, str) else json.dumps(state), encoding="utf-8")
+
+
+def _m_state(seq=8, turn=4):
+    return {"state": "IDLE", "turn": turn, "seq": seq}
+
+
+def _m_sum(r) -> tuple:
+    m = r["metrics"]["manual_rate"]
+    return (m["value"], m["n"], m["coverage"], m["unknown"], r["window"]["rounds"], r["window"]["denominator_certain"])
+
+
+def _t_metrics(_ok):
+    """B2-C3：metrics.compute 的结构、可证指标与拒绝边界（合成夹具，不是实景）。"""
+    from . import metrics
+    from .core import WfError
+    res = {}
+    with tempfile.TemporaryDirectory() as td:
+        lp = Path(td) / "bridge.jsonl"
+        lp.write_text("", encoding="utf-8")
+        restore = _with_transport(lp)
+        try:
+            a = _inst(td, "lc-m-empty", {"state": "IDLE", "turn": 0})
+            r = metrics.compute(a)
+            res["empty"] = (r["schema"], sorted(r), sorted(r["metrics"]),
+                            all(sorted(m) == ["coverage", "diagnostic", "n", "source", "unknown", "value"]
+                                for m in r["metrics"].values()),
+                            all(m["value"] is None and m["unknown"] and m["n"] == 0 and m["coverage"] is None
+                                for m in r["metrics"].values()),
+                            r["sources"]["events"]["exists"], r["provenance"])
+            b = _inst(td, "lc-m-ok", {"state": "IDLE", "turn": 4})
+            _metrics_fixture(b, _m_rows(), _m_state(), _m_turns())
+            r = metrics.compute(b)
+            evb = b.events_path.read_bytes()
+            res["ok"] = _m_sum(r) + (r["metrics"]["manual_rate"]["diagnostic"]["observed"]["rounds_with_manual"],
+                                     r["sources"]["events"]["sha256"] == hashlib.sha256(evb).hexdigest())
+            res["win"] = _m_sum(metrics.compute(b, first=2, last=3))
+            res["win_cur"] = _m_sum(metrics.compute(b, first=4))
+            # 事件流任何一处不完整：manual_rate 整体 unknown、n=0、coverage 为 None，不按轮局部放过
+            corrupt = {}
+            rows = _m_rows()
+            corrupt["坏JSON行插入"] = (rows[:3] + ['{"seq": 99, broken'] + rows[3:], _m_state(), _m_turns())
+            corrupt["无seq人工行插入"] = (rows[:3] + [json.dumps({"ts": "2026-10-15T00:00:30+00:00", "type": "exec", "turn": 2,
+                                                              "actor": "cli", "by": "executor"})] + rows[3:],
+                                       _m_state(), _m_turns())
+            corrupt["倒序"] = (list(reversed(_m_rows())), _m_state(), _m_turns())
+            dup = _m_rows()
+            dup.insert(5, dict(dup[4]))
+            corrupt["重复seq"] = (dup, _m_state(), _m_turns())
+            gap = _m_rows()
+            del gap[3]
+            corrupt["缺口"] = (gap, _m_state(), _m_turns())
+            for k, mut in (("缺ts", ("ts", None)), ("缺actor", ("actor", None)), ("轮号字符串", ("turn", "x")),
+                           ("轮号布尔", ("turn", True)), ("轮号超前", ("turn", 9)),
+                           ("显式别的项目", ("project", "other-project"))):
+                rows = _m_rows()
+                if mut[1] is None:
+                    del rows[3][mut[0]]
+                else:
+                    rows[3][mut[0]] = mut[1]
+                corrupt[k] = (rows, _m_state(), _m_turns())
+            corrupt["末尾缺失"] = (_m_rows(), _m_state(seq=9), _m_turns())
+            corrupt["state缺失"] = (_m_rows(), None, _m_turns())
+            corrupt["state损坏"] = (_m_rows(), "{not json", _m_turns())
+            corrupt["state无seq"] = (_m_rows(), {"state": "IDLE", "turn": 4}, _m_turns())
+            corrupt["turns坏行"] = (_m_rows(), _m_state(), _m_turns() + ["{bad"])
+            corrupt["turns轮号不在事件流"] = (_m_rows(), _m_state(), _m_turns() + [{"turn": 7, "status": "sent"}])
+            corrupt["turns缺失"] = (_m_rows(), _m_state(), None)
+            corrupt["turns读取错误"] = (_m_rows(), _m_state(), "DIR")
+            res["corrupt"] = {}
+            for k, (rows, stv, trn) in corrupt.items():
+                c = _inst(td, f"lc-m-x{len(res['corrupt'])}", {"state": "IDLE", "turn": 4})
+                _metrics_fixture(c, rows, None, None if trn in (None, "DIR") else trn)
+                if trn == "DIR":
+                    c.turns_path.mkdir()
+                if stv is None:
+                    c.state_path.unlink()
+                else:
+                    c.state_path.write_text(stv if isinstance(stv, str) else json.dumps(stv), encoding="utf-8")
+                r = metrics.compute(c)
+                m = r["metrics"]["manual_rate"]
+                res["corrupt"][k] = (m["value"], m["n"], m["coverage"], m["unknown"], r["window"]["rounds"],
+                                     r["window"]["denominator_certain"], bool(m["diagnostic"]["issues"]),
+                                     r["metrics"]["first_pass_rate"]["diagnostic"]["observed"],
+                                     r["metrics"]["rework_rate"]["diagnostic"]["observed"])
+            # 事件流完整，但某轮不能证明已关闭：留在分母里、不计入样本
+            nc = {}
+            nc["缺round_result"] = ([x for x in _M_SPEC if not (x[0] == 3 and x[1] == "round_result")], None)
+            nc["缺ts_done"] = (_M_SPEC, "drop3")
+            nc["边界后迟到事件"] = (_M_SPEC + [(3, "note", {})], None)
+            nc["不以COMPOSE开始"] = ([(1, "transition", {"to": "COMPOSE"}), (1, "round_result", {"ok": True}),
+                                     (2, "transition", {"to": "COMPOSE"}), (2, "round_result", {"ok": True}),
+                                     (3, "note", {}), (3, "round_result", {"ok": True}), (4, "transition", {"to": "COMPOSE"})],
+                                    None)
+            res["notclosed"] = {}
+            for k, (spec, trn) in nc.items():
+                c = _inst(td, f"lc-m-n{len(res['notclosed'])}", {"state": "IDLE", "turn": 4})
+                rows = _m_rows(spec)
+                trn = _m_turns(rows=rows)
+                if k == "缺ts_done":
+                    trn = [x for x in trn if not (x["turn"] == 3 and "ts_done" in x)]
+                _metrics_fixture(c, rows, _m_state(seq=len(rows)), trn)
+                r = metrics.compute(c)
+                m = r["metrics"]["manual_rate"]
+                res["notclosed"][k] = _m_sum(r) + (m["diagnostic"]["observed"]["rounds_counted"],)
+            # 第 0 轮（接入/引导）不是正式轮
+            z = _inst(td, "lc-m-zero", {"state": "IDLE", "turn": 1})
+            zrows = _m_rows([(0, "init", {}), (1, "transition", {"to": "COMPOSE"})])
+            _metrics_fixture(z, zrows, _m_state(seq=2, turn=1), [{"turn": 1, "status": "sent", "ts_sent": zrows[1]["ts"]}])
+            res["zero"] = _m_sum(metrics.compute(z))
+            # 一次日志不证物理一次发送；排队没有 ready/picked；返工没有事件也不等于没有返工
+            spec = list(_M_SPEC)
+            spec.insert(4, (2, "auto", {"rule": "FP_MISMATCH", "action": "block"}))
+            rows = _m_rows(spec)
+            _metrics_fixture(b, rows, _m_state(seq=len(rows)), _m_turns(rows=rows))
+            lp.write_text("".join(json.dumps(x) + "\n" for x in (
+                [{"action": "send", "turn": t, "project": b.name} for t in (1, 2, 3)]
+                + [{"action": "send", "turn": 1, "project": "other-project"}, {"action": "send", "turn": 2}])) + "{bad\n",
+                encoding="utf-8")
+            r = metrics.compute(b)
+            f, q, w = r["metrics"]["first_pass_rate"], r["metrics"]["queue_share"], r["metrics"]["rework_rate"]
+            res["fp"] = (f["value"], f["unknown"], f["n"], f["coverage"], f["diagnostic"]["observed"]["rounds_with_one_logged_send"],
+                         f["diagnostic"]["observed"]["rounds_with_round_result_ok"],
+                         any("没有 project" in x for x in f["diagnostic"]["issues"]),
+                         any("坏行" in x for x in f["diagnostic"]["issues"]), bool(f["diagnostic"]["why"]))
+            res["queue"] = (q["value"], q["unknown"], q["n"], q["coverage"], "ready" in (q["diagnostic"]["why"] or ""))
+            res["rework"] = (w["value"], w["unknown"], w["n"], w["diagnostic"]["observed"]["known_rework_events_by_round"],
+                             "不代表没有返工" in (w["diagnostic"]["why"] or ""))
+            rej = []
+            for kw in ({"first": True}, {"first": -1}, {"first": "1"}, {"last": 1.0}, {"first": 3, "last": 2}):
+                try:
+                    metrics.compute(b, **kw)
+                    rej.append("accepted")
+                except WfError:
+                    rej.append("refused")
+            res["rej"] = rej
+        finally:
+            restore()
+    _ok("B2-C3 指标结构（合成夹具，不是实景）：schema metrics/1；每项 value/unknown/n/coverage/source/diagnostic；"
+        "空项目一律 unknown、n=0、coverage 为 None",
+        res["empty"] == ("metrics/1", ["metrics", "project", "provenance", "schema", "sources", "window"],
+                         ["first_pass_rate", "manual_rate", "queue_share", "rework_rate"], True, True, False,
+                         "local_records_unattested"), json.dumps(res["empty"], ensure_ascii=False))
+    _ok("B2-C3 人工介入率（合成夹具）：事件流完整、各轮按协议证明已关闭才计入；窗口按轮号闭区间、第 0 轮与当前轮不计；来源带 sha256",
+        res["ok"] == (1 / 3, 3, 1.0, False, [1, 2, 3], True, [2], True)
+        and res["win"] == (0.5, 2, 1.0, False, [2, 3], True) and res["win_cur"] == (None, 0, None, True, [], True)
+        and res["zero"] == (None, 0, None, True, [], True),
+        json.dumps([res["ok"], res["win"], res["win_cur"], res["zero"]], ensure_ascii=False))
+    bad_c = {k: v for k, v in res["corrupt"].items()
+             if v != (None, 0, None, True, [], False, True, {}, {})}
+    _ok("B2-C3 fix1 事件流不完整一律整体 unknown（n=0、coverage 为 None、分母不可证、不给观测计数）：坏 JSON 行或无 seq 人工行插入、"
+        "倒序、重复、缺口、缺 ts 或 actor、错轮号、显式别的项目、末尾缺失、state.json 缺失/损坏/无 seq、轮次记录坏行/不一致/缺失/读取错误",
+        len(res["corrupt"]) == 19 and not bad_c, json.dumps(bad_c or res["corrupt"], ensure_ascii=False)[:1200])
+    nc_expect = {"缺round_result": (0.5, 2, 2 / 3, False, [1, 2, 3], True, [1, 2]),
+                 "缺ts_done": (0.5, 2, 2 / 3, False, [1, 2, 3], True, [1, 2]),
+                 "边界后迟到事件": (0.5, 2, 2 / 3, False, [1, 2, 3], True, [1, 2]),
+                 "不以COMPOSE开始": (0.0, 1, 1 / 3, False, [1, 2, 3], True, [1])}   # 第 2 轮的边界也不成立
+    _ok("B2-C3 fix1 不能证明已关闭的轮次（缺 round_result、缺 ts_done、边界后仍有本轮事件、不以转入 COMPOSE 开始）留在分母里、不计入样本",
+        res["notclosed"] == nc_expect, json.dumps(res["notclosed"], ensure_ascii=False)[:900])
+    _ok("B2-C3 首次通过率：每轮恰好一条发送日志也不证明物理只发一次，value 为 None 只给观测计数；缺 project 与坏行有诊断；"
+        "排队占比没有 ready/picked 协议时 unknown；返工率只给已知事件的观测计数，没有事件不当作没有返工",
+        res["fp"] == (None, True, 0, None, [1, 2, 3], [1, 2, 3], True, True, True)
+        and res["queue"] == (None, True, 0, None, True)
+        and res["rework"] == (None, True, 0, {"2": {"auto:FP_MISMATCH": 1}}, True),
+        json.dumps({k: res[k] for k in ("fp", "queue", "rework")}, ensure_ascii=False))
+    _ok("B2-C3 窗口参数：布尔、负数、字符串、浮点、first 大于 last 都拒绝",
+        res["rej"] == ["refused"] * 5, json.dumps(res["rej"]))
+
+
+def _t_metrics_real_api(_ok):
+    """B2-C3 fix1：用真实 API（Instance.event、machine.go、ops.mark_sent/mark_replied）走出的事件流与轮次记录（内容合成，不是实景）。"""
+    from . import core as _core, machine, metrics, ops
+    old_actor = _core.ACTOR.get("actor")
+    res = {}
+    with tempfile.TemporaryDirectory() as td:
+        lp = Path(td) / "bridge.jsonl"
+        lp.write_text("", encoding="utf-8")
+        restore = _with_transport(lp)
+        try:
+            a = _inst(td, "lc-m-api", None)
+            _core.ACTOR["actor"] = "cli"
+            a.event("init", by="executor")
+            machine.go(a, "COMPOSE", by="executor")
+            res["boot"] = _m_sum(metrics.compute(a))
+            _core.ACTOR["actor"] = "driver"
+            ops.mark_sent(a, by="driver")
+            res["boot_sent"] = _m_sum(metrics.compute(a))
+            for t in (1, 2):
+                if t == 2:
+                    ops.mark_sent(a, by="driver")
+                ops.mark_replied(a, by="driver")
+                machine.go(a, "REVIEW", by="driver")
+                if t == 1:
+                    _core.ACTOR["actor"] = "cli"   # 命令行里的手工执行：人工介入
+                    a.event("exec", cmd="ls", by="executor")
+                    _core.ACTOR["actor"] = "driver"
+                machine.go(a, "VERIFY", by="driver")
+                a.event("round_result", ok=True, by="driver")
+                machine.go(a, "COMPOSE", by="driver")
+            r = metrics.compute(a)
+            res["closed"] = _m_sum(r) + (r["metrics"]["manual_rate"]["diagnostic"]["observed"]["rounds_with_manual"],)
+            st = json.loads(a.state_path.read_text(encoding="utf-8"))
+            res["state"] = (st.get("turn"), st.get("seq"), len(a.events_path.read_text(encoding="utf-8").splitlines()))
+        finally:
+            _core.ACTOR["actor"] = old_actor or "cli"
+            restore()
+    _ok("B2-C3 fix1 真实 API：仅接入与进入第 1 轮时没有可计入的轮次（第 0 轮不算、未关闭的第 1 轮不算）；"
+        "两轮按协议关闭后人工介入率为 1/2、coverage 为 1",
+        res["boot"][:4] == (None, 0, None, True) and res["boot"][4] == []
+        and res["boot_sent"] == (None, 0, None, True, [], True)
+        and res["closed"] == (0.5, 2, 1.0, False, [1, 2], True, [1]) and res["state"][0] == 3 and res["state"][1] == res["state"][2],
+        json.dumps(res, ensure_ascii=False)[:900])
+
+
+def _m_real_round(td, name):
+    """fix2：真实 API 走一轮并进入下一轮 COMPOSE（第 1 轮有一次命令行人工执行）；内容合成，不是实景。"""
+    from . import core as _core, machine, ops
+    old_actor = _core.ACTOR.get("actor")
+    try:
+        a = _inst(td, name, None)
+        _core.ACTOR["actor"] = "cli"
+        a.event("init", by="executor")
+        machine.go(a, "COMPOSE", by="executor")
+        _core.ACTOR["actor"] = "driver"
+        ops.mark_sent(a, by="driver")
+        ops.mark_replied(a, by="driver")
+        machine.go(a, "REVIEW", by="driver")
+        _core.ACTOR["actor"] = "cli"
+        a.event("exec", cmd="ls", by="executor")
+        _core.ACTOR["actor"] = "driver"
+        machine.go(a, "VERIFY", by="driver")
+        a.event("round_result", ok=True, by="driver")
+        machine.go(a, "COMPOSE", by="driver")
+    finally:
+        _core.ACTOR["actor"] = old_actor or "cli"
+    return a
+
+
+def _t_metrics_time_identity(_ok):
+    """B2-C3 fix2：闭合证据的时间与轮次记录的项目身份（真实 API 底稿上只改一处；内容合成，不是实景）。"""
+    from datetime import timedelta
+    from . import metrics
+    from .core import parse_iso
+
+    def jl(p):
+        return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()]
+
+    def wl(p, rows):
+        p.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in rows), encoding="utf-8")
+
+    def sent(rows):
+        return [x for x in rows if x.get("status") == "sent" and x.get("turn") == 1]
+
+    def done(rows):
+        return [x for x in rows if "ts_done" in x and x.get("turn") == 1]
+
+    def ev_ts(a, type_):
+        return next(e["ts"] for e in jl(a.events_path) if e["type"] == type_ and e["turn"] == 1)
+
+    def shift(ts, s):
+        return (parse_iso(ts) + timedelta(seconds=s)).isoformat(timespec="seconds")
+    cases = {
+        "正例": ("turns", lambda a, r: None),
+        "显式本项目": ("turns", lambda a, r: [x.update(project=a.name) for x in r]),
+        "R1 ts_done 非日期": ("turns", lambda a, r: done(r)[0].update(ts_done="not-a-date")),
+        "R2 ts_done 为 true": ("turns", lambda a, r: done(r)[0].update(ts_done=True)),
+        "R3 发送记录缺 ts_sent": ("turns", lambda a, r: sent(r)[0].pop("ts_sent")),
+        "R4 两条记录属于别的项目": ("turns", lambda a, r: [x.update(project="other-project") for x in r[:2]]),
+        "未来 ts_done": ("turns", lambda a, r: done(r)[0].update(ts_done="2031-01-01T00:00:00+00:00")),
+        "数字 ts_done": ("turns", lambda a, r: done(r)[0].update(ts_done=20261015)),
+        "数字串 ts_done": ("turns", lambda a, r: done(r)[0].update(ts_done="20261015")),
+        "逆时序 发送晚于回复": ("turns", lambda a, r: sent(r)[0].update(ts_sent=shift(done(r)[0]["ts_done"], 30))),
+        "发送早于本轮开始": ("turns", lambda a, r: sent(r)[0].update(ts_sent=shift(ev_ts(a, "transition"), -3600))),
+        "回复晚于 round_result": ("turns", lambda a, r: done(r)[0].update(ts_done=shift(ev_ts(a, "round_result"), 60))),
+        "事件未来 ts": ("events", lambda a, r: next(x for x in r if x["type"] == "round_result").update(
+            ts="2031-01-01T00:00:00+00:00")),
+        "事件数字 ts": ("events", lambda a, r: next(x for x in r if x["type"] == "round_result").update(ts=1760000000)),
+    }
+    res = {}
+    with tempfile.TemporaryDirectory() as td:
+        lp = Path(td) / "bridge.jsonl"
+        lp.write_text("", encoding="utf-8")
+        restore = _with_transport(lp)
+        try:
+            for i, (k, (which, mut)) in enumerate(cases.items()):
+                a = _m_real_round(td, f"lc-m-t{i}")
+                p = a.turns_path if which == "turns" else a.events_path
+                rows = jl(p)
+                mut(a, rows)
+                wl(p, rows)
+                r = metrics.compute(a)
+                m = r["metrics"]["manual_rate"]
+                res[k] = _m_sum(r) + ("；".join(m["diagnostic"]["issues"])[:160],)
+        finally:
+            restore()
+    whole = (None, 0, None, True, [], False)
+    closure = (None, 0, 0.0, True, [1], True)
+    exp = {"正例": ((1.0, 1, 1.0, False, [1], True), ""), "显式本项目": ((1.0, 1, 1.0, False, [1], True), ""),
+           "R1 ts_done 非日期": (whole, "ts_done 不是有效时间"), "R2 ts_done 为 true": (whole, "ts_done 不是有效时间"),
+           "R3 发送记录缺 ts_sent": (whole, "没有 ts_sent"), "R4 两条记录属于别的项目": (whole, "别的项目"),
+           "未来 ts_done": (whole, "未来时刻"), "数字 ts_done": (whole, "不是有效时间"), "数字串 ts_done": (whole, ""),
+           "逆时序 发送晚于回复": (closure, "时间先后颠倒"), "发送早于本轮开始": (closure, "早于本轮转入 COMPOSE"),
+           "回复晚于 round_result": (closure, "晚于 round_result"),
+           "事件未来 ts": (whole, "未来时刻"), "事件数字 ts": (whole, "缺少或无效 ts")}
+    bad = {k: v for k, v in res.items() if v[:6] != exp[k][0] or (exp[k][1] not in v[6]) or (bool(exp[k][1]) and not v[6])}
+    # 数字串 "20261015" 可被 fromisoformat 解析为日期：它要么被判为无效时间，要么时序不通过——都不能算满分样本
+    num_str = res.get("数字串 ts_done", (None,) * 7)
+    if num_str[:6] in (whole, closure):
+        bad.pop("数字串 ts_done", None)
+    _ok("B2-C3 fix2 闭合证据的时间与身份：ts_done 非日期、为 true 或数字、发送记录缺 ts_sent、显式别的项目、未来时刻、事件 ts 未来或为数字"
+        "都使整体 unknown（n=0、coverage 为 None、分母不可证）并给出诊断；发送晚于回复、发送早于本轮开始、回复晚于 round_result "
+        "的轮次不计入（coverage 0）；没有 project 或显式本项目的轮次记录照常计入",
+        not bad and len(res) == len(exp), json.dumps(bad or res, ensure_ascii=False)[:1500])
+
+
+def _t_metrics_readonly(_ok):
+    """B2-C3：compute 只读——项目与 local/ 目录前后逐字节、mtime、权限一致；写文件、起进程、适配器调用一律未发生。"""
+    import builtins
+    import subprocess as _sp
+    from . import anomaly, core, metrics
+    from .core import LOCAL
+
+    def snap(*roots):
+        out = {}
+        for root in roots:
+            for p in sorted(Path(root).rglob("*")):
+                stt = p.lstat()
+                out[str(p)] = (stt.st_mode, stt.st_mtime_ns, stt.st_size,
+                               hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None)
+        return out
+    calls = []
+
+    def boom(name):
+        def _f(*a, **k):
+            calls.append(name)
+            raise RuntimeError(f"metrics.compute 不应调用 {name}")
+        return _f
+    real_open = builtins.open
+
+    def ro_open(file, mode="r", *a, **k):
+        if any(c in str(mode) for c in "wax+"):
+            calls.append(f"open({mode})")
+            raise RuntimeError("metrics.compute 不应以写方式打开文件")
+        return real_open(file, mode, *a, **k)
+    with tempfile.TemporaryDirectory() as td:
+        lp = Path(td) / "bridge.jsonl"
+        lp.write_text(json.dumps({"action": "send", "turn": 1, "project": "x"}) + "\n", encoding="utf-8")
+        restore = _with_transport(lp)
+        b = _inst(td, "lc-m-ro", {"state": "IDLE", "turn": 4})
+        _metrics_fixture(b, _m_rows(), _m_state(), _m_turns())
+        LOCAL.mkdir(parents=True, exist_ok=True)
+        before = snap(b.root, LOCAL, td)
+        patches = [(builtins, "open", ro_open), (_sp, "run", boom("subprocess.run")), (_sp, "Popen", boom("subprocess.Popen")),
+                   (anomaly, "call", boom("anomaly.call")), (core, "write_json", boom("write_json")),
+                   (core, "append_jsonl", boom("append_jsonl")), (Path, "write_text", boom("Path.write_text")),
+                   (Path, "write_bytes", boom("Path.write_bytes")), (Path, "mkdir", boom("Path.mkdir")),
+                   (os, "replace", boom("os.replace")), (os, "rename", boom("os.rename")), (os, "remove", boom("os.remove"))]
+        saved = []
+        err = ""
+        try:
+            for mod, name, fn in patches:
+                saved.append((mod, name, getattr(mod, name)))
+                setattr(mod, name, fn)
+            r = metrics.compute(b)
+        except Exception as e:   # noqa: BLE001
+            r, err = None, f"{type(e).__name__}: {e}"
+        finally:
+            for mod, name, v in reversed(saved):
+                setattr(mod, name, v)
+            restore()
+        after = snap(b.root, LOCAL, td)
+        state_mem = dict(b.state)
+    _ok("B2-C3 只读：compute 前后项目、local/ 与临时目录逐字节、mtime、权限一致；没有写文件、建目录、起进程或调用适配器",
+        not err and r is not None and before == after and not calls and r["metrics"]["manual_rate"]["n"] == 3
+        and state_mem.get("turn") == 4,
+        json.dumps([err, calls, sorted(set(before) ^ set(after))[:5],
+                    [k for k in before if k in after and before[k] != after[k]][:5]], ensure_ascii=False)[:800])
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
-         ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals)]
+         ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals), ("指标 C3", _t_metrics),
+         ("指标真实 API C3", _t_metrics_real_api),
+         ("指标时间与身份 C3", _t_metrics_time_identity), ("指标只读 C3", _t_metrics_readonly)]
 
 
 def run_lane_c(_ok) -> None:
