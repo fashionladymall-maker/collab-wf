@@ -1017,7 +1017,7 @@ def _ref_less_locate(ctx):
     定位（transport.json 的 poll_since）时，才返回定位参数；只轮询，不发送、不取或释放发送槽、不清任何外发标记。
     证据二选一：本轮的发送意图（pending/accepted，正文绑定核对通过）；或意图已清（双缺字段）时，_finalize_send 记下的
     last_sent（本轮、本轮证据目录里的正文副本、外发前的意图时刻 sent_ts）。都没有就是真正的 NO_REF，返回 None。"""
-    inst, st = ctx.inst, ctx.st
+    st = ctx.st
     turn = st.get("turn")
     if type(turn) is not int or turn <= 0 or not anomaly.transport_cfg().get("poll_since"):
         return None
@@ -1026,18 +1026,35 @@ def _ref_less_locate(ctx):
         if not (isinstance(intent, dict) and intent.get("turn") == turn and intent.get("status") in ("pending", "accepted")
                 and parse_iso(intent.get("ts")) is not None):
             return None
-        try:
-            return {"since": intent["ts"], "message": _check_attempt(ctx, intent)["file"], "evidence": "send_intent"}
-        except _PermissionError:
-            return None
+        out = _sent_message(ctx, intent.get("message"), turn)
+        return None if out is None else {"since": intent["ts"], "message": out["file"], "evidence": "send_intent"}
     ls = st.get("last_sent")
-    if not isinstance(ls, dict) or ls.get("turn") != turn or parse_iso(ls.get("sent_ts")) is None:
+    if (not isinstance(ls, dict) or ls.get("turn") != turn or parse_iso(ls.get("sent_ts")) is None
+            or not isinstance(ls.get("message"), dict) or ls.get("file") != ls["message"].get("snapshot")
+            or not isinstance(ls.get("snapshot_stat"), list)):
         return None
-    p = Path(str(ls.get("file") or ""))
-    if (p.parent != inst.evidence / f"turn-{turn:03d}" or not re.fullmatch(r"send-[0-9a-f]{32}\.md", p.name)
-            or p.is_symlink() or not p.is_file()):
+    out = _sent_message(ctx, ls["message"], turn, ls["snapshot_stat"])
+    return None if out is None else {"since": ls["sent_ts"], "message": out["file"], "evidence": "last_sent"}
+
+
+def _sent_message(ctx, message, turn, snapshot_stat=None):
+    """B3（S03）：定位前重新核对已外发正文的完整身份：driver-message/1 的项目根、轮次、attempt、副本路径与正文
+    sha256（_check_attempt），源文件路径与内容仍是当时外发的那份（_outgoing_check），以及外发时记下的副本
+    dev/ino/mode/size。任何一项不符返回 None，由调用方按 NO_REF 停下，不改任何标记。"""
+    if not isinstance(message, dict) or not isinstance(message.get("outgoing"), dict):
         return None
-    return {"since": ls["sent_ts"], "message": str(p), "evidence": "last_sent"}
+    try:
+        out = _check_attempt(ctx, {"turn": turn, "message": message})
+        source, _raw, source_sha = _outgoing_check(ctx, message["outgoing"])
+    except _PermissionError:
+        return None
+    if str(source) != message.get("source_file") or source_sha != message.get("source_sha256"):
+        return None
+    if snapshot_stat is not None:
+        s = os.lstat(out["file"])
+        if [s.st_dev, s.st_ino, stat.S_IMODE(s.st_mode), s.st_size] != snapshot_stat:
+            return None
+    return out
 
 
 def h_send(ctx):
@@ -1048,8 +1065,9 @@ def h_send(ctx):
     out = st.get("outgoing") or {}
     turn = st["turn"]
     intent = st.get("send_intent")
-    if intent and (not isinstance(intent, dict) or intent.get("status") not in ("pending", "accepted")
-                   or type(intent.get("turn")) is not int or intent["turn"] != turn):
+    # 字段不存在（None）才是“没有意图”；存在但为空、非 dict、未知状态或轮次不符（{}、[]、0 …）都按已有标记处理
+    if intent is not None and (not isinstance(intent, dict) or intent.get("status") not in ("pending", "accepted")
+                               or type(intent.get("turn")) is not int or intent["turn"] != turn):
         # B3（S02a）：旧轮次、旧协议或未知状态的意图都可能已经外发：保留原意图停下，不当作未发送重试
         return _outgoing_stop(ctx, _OutgoingError("已有发送意图的状态或轮次身份不符，保留原意图，不自动重发"))
     mx = int(ctx.pol.get("shared_max_inflight", 0) or 0)
@@ -1223,6 +1241,11 @@ def _finalize_send(ctx, out, note, immediate=False):
         sent_out = {"file": None}
         ops.add_note(inst, "deviation", "已确认旧发送被接受，但缺少可验证的旧正文；未用当前新草稿补作发送证据", by="driver")
     message = intent.get("message") or {}
+    sent_identity = {}
+    if sent_out.get("file"):   # B3（S03）：外发正文的完整身份与副本元数据，供无 ref 时重新核对后才定位
+        s = os.lstat(sent_out["file"])
+        sent_identity = {"message": json.loads(json.dumps(message)),
+                         "snapshot_stat": [s.st_dev, s.st_ino, stat.S_IMODE(s.st_mode), s.st_size]}
     clear_outgoing = False
     if isinstance(message, dict) and out == message.get("outgoing"):
         try:
@@ -1245,7 +1268,7 @@ def _finalize_send(ctx, out, note, immediate=False):
                   role=sent_out.get("role"), reasons=sent_out.get("reasons"))
     st = inst.state
     st["last_sent"] = {"turn": st["turn"], "file": sent_out.get("file"), "kind": sent_out.get("kind"), "effort": sent_out.get("effort"),
-                       "sent_ts": intent.get("ts")}   # B3（S03）：外发前的意图时刻，供没有 ref 时按时刻定位
+                       "sent_ts": intent.get("ts"), **sent_identity}   # B3（S03）：外发前的意图时刻与正文身份
     st["send_intent"] = None
     if clear_outgoing and st.get("outgoing") == out:
         st["outgoing"] = None

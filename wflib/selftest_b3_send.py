@@ -21,6 +21,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import stat
+
 from . import arbiter, core, driver, machine, policy
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -243,6 +245,9 @@ class B3SendTests(unittest.TestCase):
         self.assertEqual((st["state"], st.get("send_ref"), st.get("send_intent")), ("WAIT_REPLY", None, None))
         self.assertEqual(driver.h_wait_reply(self.ctx(inst, pol))[0], "wait")
         self.assertEqual(driver.h_wait_reply(self.ctx(inst, pol))[0], "progress")
+        self.assertEqual((st["last_sent"]["message"]["schema"], st["last_sent"]["file"]),
+                         ("driver-message/1", st["last_sent"]["message"]["snapshot"]))
+        self.assertEqual(len(st["last_sent"]["snapshot_stat"]), 4)
         argv = self.calls("poll")[0]
         self.assertEqual(argv[argv.index("--since") + 1], st["last_sent"]["sent_ts"])
         self.assertEqual(argv[argv.index("--message") + 1], st["last_sent"]["file"])
@@ -270,6 +275,80 @@ class B3SendTests(unittest.TestCase):
         manual.save()
         r = driver.h_wait_reply(self.ctx(manual, pol))
         self.assertEqual((r[0], self.disk(manual)["await_rule"], self.calls("poll")), ("user", "NO_REF", []))
+
+    # ---------------- A-B3-SEND-FIX: independent review blocks ----------------
+
+    def test_present_but_invalid_intents_stop_without_send_or_lease(self):
+        pol = {"first_poll_after_s": 0, "poll_interval_s": 0, "shared_max_inflight": 10}
+        ts = core.now_iso()
+        cases = {"empty-dict": (1, {}), "empty-list": (1, []), "zero": (1, 0),
+                 "bogus-status": (1, {"status": "bogus", "turn": 1, "ts": ts}),
+                 "old-turn": (2, {"status": "pending", "turn": 1, "ts": ts}),
+                 "missing-status": (1, {"turn": 1, "ts": ts})}
+        for name, (turn, value) in cases.items():
+            inst = self.project("bad-" + name, pol, turn=turn)
+            inst.state["send_intent"] = value
+            inst.save()
+            r = driver.h_send(self.ctx(inst, pol))
+            st = self.disk(inst)
+            self.assertEqual((r[0], st["state"], st["send_intent"]), ("user", "BLOCKED", value), name)
+            self.assertEqual(self.calls("send", "bad-" + name), [], name)
+        arb = self.local / "shared" / "arbiter.json"
+        holders = json.loads(arb.read_text())["holders"] if arb.exists() else []
+        log = (self.local / "shared" / "arbiter.jsonl")
+        events = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+        self.assertEqual([h for h in holders if str(h.get("project", "")).startswith("bad-")], [])
+        self.assertEqual([e for e in events if str(e.get("project", "")).startswith("bad-")], [])
+
+    def test_last_sent_identity_is_reverified_before_locating(self):
+        pol = {"first_poll_after_s": 0, "poll_interval_s": 0, "shared_max_inflight": 10}
+        self.transport(poll_since=True)
+        (self.fake / "strip_ref").write_text("1")
+        for name in ("snapshot-content", "same-name-replacement", "snapshot-mode", "source-content",
+                     "last-sent-turn", "last-sent-path"):
+            proj = "tamper-" + name
+            inst = self.project(proj, pol)
+            self.assertEqual(driver.h_send(self.ctx(inst, pol))[0], "progress", name)
+            st = self.disk(inst)
+            self.assertEqual((st["state"], st.get("send_ref"), st.get("send_intent")), ("WAIT_REPLY", None, None))
+            ls = json.loads(json.dumps(st["last_sent"]))
+            snap, src = Path(ls["file"]), Path(ls["message"]["source_file"])
+            if name == "snapshot-content":
+                snap.write_bytes(snap.read_bytes() + b"tampered\n")
+            elif name == "same-name-replacement":   # identical bytes and mode, different file
+                tmp = snap.with_name(snap.name + ".new")
+                tmp.write_bytes(snap.read_bytes())
+                os.chmod(tmp, stat.S_IMODE(os.lstat(snap).st_mode))
+                os.replace(tmp, snap)
+            elif name == "snapshot-mode":
+                snap.chmod(0o644)
+            elif name == "source-content":
+                src.write_bytes(src.read_bytes() + b"x")
+            else:
+                if name == "last-sent-turn":
+                    ls["turn"] = 2
+                else:
+                    other = snap.with_name("send-" + "0" * 32 + ".md")
+                    other.write_bytes(snap.read_bytes())
+                    other.chmod(0o600)
+                    ls["file"] = str(other)
+                a = core.Instance(inst.root)
+                a.state["last_sent"] = ls
+                a.save()
+            kept = self.disk(inst)
+            r1 = driver.h_wait_reply(self.ctx(inst, pol))
+            a = core.Instance(inst.root)
+            self.assertEqual((r1[0], a.state["state"], a.state.get("await_rule")), ("user", "AWAITING_USER", "NO_REF"), name)
+            machine.resume(a, "test: bypass approval back to waiting", by="test")
+            r2 = driver.h_wait_reply(self.ctx(inst, pol))
+            st = self.disk(inst)
+            holders = [h["lease_id"] for h in json.loads((self.local / "shared/arbiter.json").read_text())["holders"]
+                       if h.get("project") == proj]
+            self.assertEqual((r2[0], st["state"]), ("user", "BLOCKED"), name)
+            self.assertEqual((st["last_sent"], st["send_slot"], holders),
+                             (kept["last_sent"], kept["send_slot"], [kept["send_slot"]["lease_id"]]), name)
+            self.assertEqual((self.calls("poll", proj), len(self.calls("send", proj))), ([], 1), name)
+            self.assertEqual(self.rules(inst, "NO_REF"), ["NO_REF", "NO_REF"], name)
 
     # ---------------- cross-project / old generation / old protocol ----------------
 
