@@ -113,12 +113,27 @@ def _state_of(rec: dict):
     return read_json(Path(root) / "workflow" / "state.json") if root else None
 
 
+def _canon(root) -> str:
+    try:
+        return os.path.realpath(str(root)) if root else ""
+    except (OSError, ValueError):
+        return ""
+
+
+def _same(h, me: dict) -> bool:
+    """B2-A2a：同一项目 = 项目名相同，且两边都有 root、规范化后相同。同名不同目录的、没有 root 的旧记录都按外部持有者处理。"""
+    if not isinstance(h, dict) or h.get("project") != me.get("project"):
+        return False
+    a = _canon(h.get("root"))
+    return bool(a) and a == _canon(me.get("root"))
+
+
 def _live(rec: dict, states) -> str:
     st = _state_of(rec)
     if not st:
         return "unknown"
     s = st.get("state")
-    if s in ("AWAITING_USER", "BLOCKED"):
+    if s in ("AWAITING_USER", "BLOCKED", "QUOTA_WAIT"):   # B2-A2a：等额度时按 return_to 判断，租约期内不当作过期
         s = st.get("return_to") or st.get("blocked_from") or s
     return "live" if st.get("turn") == rec.get("turn") and s in states else "stale"
 
@@ -161,7 +176,7 @@ def acquire(inst, max_inflight: int = 1, lease_s: int = 3600, migrate_legacy: bo
             return {"granted": False, "position": 0, "holder": "（仲裁状态不可读）", "error": str(e), **none}
         keep = []
         for h in s["holders"]:
-            if h.get("project") == me["project"]:
+            if _same(h, me):
                 if h.get("turn") == me["turn"]:
                     keep.append(h)
                 else:
@@ -175,18 +190,22 @@ def acquire(inst, max_inflight: int = 1, lease_s: int = 3600, migrate_legacy: bo
                 continue
             if v == "unknown" and not h.get("unknown_logged"):
                 h["unknown_logged"] = True
-                _log(event="unknown", project=h.get("project"), turn=h.get("turn"), why="读不到持有方的状态，等租约到期再回收")
+                if not h.get("root"):   # B2-A2a：没有 root 的旧记录按外部处理，最多多占到租约期满，不误释放
+                    _log(event="legacy_no_root", project=h.get("project"), turn=h.get("turn"), lease_id=h.get("lease_id"),
+                         why="持有记录没有 root，认不出是不是本项目，按外部持有者等租约到期")
+                else:
+                    _log(event="unknown", project=h.get("project"), turn=h.get("turn"), why="读不到持有方的状态，等租约到期再回收")
             keep.append(h)
         q = []
         for x in s["queue"]:
-            if x.get("project") == me["project"]:
+            if _same(x, me):
                 if x.get("turn") == me["turn"]:
                     q.append(x)
                 continue
             if _live(x, ("SEND",)) == "live" and (secs_since(x.get("since")) or 0) <= lease_s:
                 q.append(x)
         s["holders"], s["queue"] = keep, q
-        mine = next((h for h in keep if h.get("project") == me["project"]), None)
+        mine = next((h for h in keep if _same(h, me)), None)
         if mine is not None:
             if not mine.get("lease_id") and migrate_legacy:
                 mine.update(lease_id=secrets.token_hex(8), attempt=_next_attempt(s, me["project"], me["turn"]),
@@ -198,10 +217,10 @@ def acquire(inst, max_inflight: int = 1, lease_s: int = 3600, migrate_legacy: bo
                 return {"granted": True, "position": 0, "holder": me["project"], **none,
                         "granted_at": mine.get("since"), "reentry": True, "legacy": True}
             return {"granted": True, "position": 0, "holder": me["project"], **_lease(mine), "reentry": True, "legacy": False}
-        new = not any(x.get("project") == me["project"] for x in q)
+        new = not any(_same(x, me) for x in q)
         if new:
             q.append({**me, "since": now_iso()})
-        if len(keep) < max_inflight and q[0].get("project") == me["project"]:
+        if len(keep) < max_inflight and _same(q[0], me):
             x = q.pop(0)
             ts = now_iso()
             h = {**me, "since": ts, "lease_id": secrets.token_hex(8), "attempt": _next_attempt(s, me["project"], me["turn"]),
@@ -211,7 +230,7 @@ def acquire(inst, max_inflight: int = 1, lease_s: int = 3600, migrate_legacy: bo
                  waited_s=int(secs_since(x.get("since")) or 0))
             _save(s)
             return {"granted": True, "position": 0, "holder": me["project"], **_lease(h), "reentry": False, "legacy": False}
-        pos = next(i for i, x in enumerate(q) if x.get("project") == me["project"]) + 1
+        pos = next(i for i, x in enumerate(q) if _same(x, me)) + 1
         holder = "、".join(f"{h.get('project')}#{h.get('turn')}" for h in keep) or "（无）"
         if new:
             _log(event="wait", project=me["project"], turn=me["turn"], holder=holder, position=pos,
@@ -228,6 +247,7 @@ def release(inst, why: str, lease_id=None, turn=None) -> dict:
     没有释放时返回原因（not_held、turn_mismatch、token_mismatch、legacy_holder、token_required、arbiter_unreadable），
     并在 arbiter.jsonl 记 release_miss；不可读时不改写文件。"""
     name = inst.name
+    me = {"project": name, "root": str(inst.root)}   # B2-A2a：只认同名且同一规范目录的记录
     if lease_id and turn is None:
         turn = inst.state.get("turn")
     with _lock():
@@ -235,7 +255,7 @@ def release(inst, why: str, lease_id=None, turn=None) -> dict:
             s = _load()
         except Unreadable:
             return {"released": False, "reason": "arbiter_unreadable"}
-        mine = [h for h in s["holders"] if h.get("project") == name]
+        mine = [h for h in s["holders"] if _same(h, me)]
         if lease_id:
             hit = [h for h in mine if h.get("lease_id") == lease_id and h.get("turn") == turn]
             reason = _token_miss(mine, lease_id)
@@ -260,6 +280,7 @@ def mark_sending(inst, lease_id, turn=None) -> dict:
     驱动器只在 marked=True 之后调用适配器 send；没对上（not_held、turn_mismatch、token_mismatch、legacy_holder）、
     不可读（arbiter_unreadable）或写盘失败（io_error）都返回 False，调用方不得外发。"""
     name = inst.name
+    me = {"project": name, "root": str(inst.root)}   # B2-A2a
     if turn is None:
         turn = inst.state.get("turn")
     with _lock():
@@ -267,7 +288,7 @@ def mark_sending(inst, lease_id, turn=None) -> dict:
             s = _load()
         except Unreadable:
             return {"marked": False, "reason": "arbiter_unreadable"}
-        mine = [h for h in s["holders"] if h.get("project") == name]
+        mine = [h for h in s["holders"] if _same(h, me)]
         hit = next((h for h in mine if lease_id and h.get("lease_id") == lease_id and h.get("turn") == turn), None)
         if hit is None:
             reason = _token_miss(mine, lease_id)
