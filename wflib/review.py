@@ -1,5 +1,5 @@
-"""B2a：独立审查基础设施（review/1）。只新增本模块，尚未接入任何安装路径（release.self_update / apply_zip /
-driver 照旧）；接入由后续 B2b（release）与 A3（driver）按下面冻结的接口完成。在接入之前，本模块的结论不封堵任何现有安装。
+"""独立审查基础设施（review/1）。B2b-1/2/3 为 release apply/update 接入冻结包、目标安装锁、
+最终核验与消费/事务记录；安全回滚基线仍待 B2b-4，A3/A4 另行接线。
 
 一、公开接口（冻结）
   prepare(target, zip_path, *, kind, author=None) -> request
@@ -17,12 +17,16 @@ driver 照旧）；接入由后续 B2b（release）与 A3（driver）按下面�
   final_check(request_id, *, target, extracted_dir=None, now=None) -> decision
       供安装锁内调用（测试前后都可以调）：重核快照、目标 base/配置/rules、来源与结论；给出 extracted_dir 时
       逐个核解包目录（字节与权限；只容忍 __pycache__ 与 *.pyc）。
-  consume(request_id, *, target, extracted_dir, now=None) -> decision
+  consume(request_id, *, target, extracted_dir, now=None, install_context=None) -> decision
       在真正复制文件之前调用：final_check 不通过时抛 WfError；通过时写安装开始记录（第四个时刻 install_started）。
+      release 在目标锁内传 install_context 关联事务与锁；此短锁不覆盖复制/提交，事务 completed 由消费者另核。
   cancel(request_id) -> int          把该请求仍在进行的尝试记为 cancelled，返回条数。
   read_package(zip_path, *, kind=None, protect=None) -> dict    唯一的包解析与安装语义判定（B2b 必须改用它）。
   extract_snapshot(request_id, dest) -> Path   从冻结快照（先核 hash）按解析结果写出文件与权限，返回包的根目录。
   verify_extracted(request_id, root) -> list    解包目录与包内容逐项核对，返回问题列表。
+  load_install_request(request_id, *, target, kind, zip_path=None) -> request
+      只读适配器：核请求、快照、入口 kind/目标与当前全部材料。zip_path 若提供，只作 raw SHA 一致性断言；
+      不作为解包来源。返回的 request 不是安装许可，消费者仍须最终核验与 consume。
 
 二、decision 的键（冻结）
   schema（review-decision/1）、request_id、content_id、phase、state、verdict、allowed、reasons（list）、
@@ -87,7 +91,7 @@ LEVELS = ("platform_verified", "host_attested", "local_invocation", "unknown", "
 REUSE_DAYS = 7
 MAX_PACKAGE_BYTES = 512 * 1024 * 1024
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
-TOOL_PROTECT = [".git/", "local/"]     # 必须与 release.SELF_PROTECT 相同（B2b 接入时改为从同一处取）
+TOOL_PROTECT = [".git/", "local/"]     # release.SELF_PROTECT 直接引用此统一规则
 TOOL_IDENTITY = "collab-wf"
 RULES_PATH = "docs/REVIEW.md"
 
@@ -313,6 +317,9 @@ def read_package(zip_path, *, kind=None, protect=None) -> dict:
         if not e["path"].startswith(top + "/"):
             raise WfError(f"zip 成员不在顶层目录下：{e['path']}")
         rel = e["path"][len(top) + 1:]
+        if any(rel == p or rel.startswith(p + "/")
+               for p in (".git/wf-install", "local/install", "workflow/evidence/install")):
+            raise WfError(f"版本包不得携带宿主安装事务元数据：{rel}")
         x = dict(e, path=rel)
         if e["type"] == "file":
             x["installed"] = _installed(rel, kind, protect)
@@ -1285,12 +1292,59 @@ def status(target, request_id=None, *, content_id=None, phase="review", now=None
 
 # ---------------- 安装锁内复核与消费 ----------------
 
-def extract_snapshot(request_id: str, dest) -> Path:
-    req = _load_request(request_id)
+def _snapshot_package(req: dict) -> dict:
+    """只解析该请求的冻结包；解析后的 raw SHA 与送审安装语义也必须一致。"""
     bad = _snapshot_ok(req)
     if bad:
         raise WfError("冻结快照不可用：" + "、".join(bad))
-    pkg = read_package(_releases() / f"{req['package']['sha256']}.zip")
+    pkg = read_package(_releases() / f"{req['package']['sha256']}.zip",
+                       kind=req["kind"], protect=req["base"]["protect"])
+    rel = pkg["release"] or {}
+    semantics = {"entries": pkg["entries"], "ignored": pkg["ignored"],
+                 "release_json_sha256": rel.get("json_sha256"), "delete": rel.get("delete", []),
+                 "wf_config": rel.get("wf_config", {}), "release_keys": rel.get("keys", [])}
+    expected = {"sha256": pkg["sha256"], "bytes": pkg["bytes"], "top": pkg["top"],
+                "snapshot": f"releases/{pkg['sha256']}.zip", "entries_sha256": _sha(_canon(semantics)),
+                "n_entries": len(pkg["entries"]), "release": rel.get("json_sha256")}
+    if req["package"] != expected:
+        raise WfError("审查请求的冻结包身份或安装语义不符（package_mismatch）")
+    return pkg
+
+
+def load_install_request(request_id: str, *, target, kind, zip_path=None) -> dict:
+    """核实真实消费者的请求/包/目标绑定，不执行审查、不写开始记录，也不授予安装许可。
+    caller ZIP 只允许作为旧调用的 raw SHA 断言；安装字节必须来自 extract_snapshot。"""
+    try:
+        req = _load_request(request_id)
+        if kind not in ("project", "tool") or req["kind"] != kind:
+            raise WfError("安装入口与审查请求 kind 不一致（kind_mismatch）")
+        t = _target(target, kind)
+        ident = {k: t[k] for k in ("kind", "root", "scope", "project", "tool")}
+        if req["target"] != ident:
+            raise WfError("安装目标与审查请求不一致（target_mismatch）")
+        pkg = _snapshot_package(req)
+        if zip_path is not None:
+            raw = _read_bytes(Path(zip_path))
+            if raw is None or _sha(raw) != pkg["sha256"]:
+                raise WfError("调用方 ZIP 与审查请求的冻结包不一致（package_mismatch）")
+        material, side = _material(t, pkg)
+        bad = _material_problems(material["base"], material["rules"])
+        cid = _content_id(material)
+        if (cid != req["content_id"] or req["material_sha256"] != cid
+                or req["base"] != material["base"] or req["rules"] != material["rules"]):
+            bad.append("material_changed")
+        if _sha(_full_diff(t, material, pkg, side)) != req["diff"]["sha256"]:
+            bad.append("diff_changed")
+        if bad:
+            raise WfError("安装请求材料核验失败：" + "；".join(bad[:6]))
+        return req
+    except (OSError, KeyError, TypeError, ValueError) as e:
+        raise WfError(f"安装请求不可用（{type(e).__name__}）：{e}") from e
+
+
+def extract_snapshot(request_id: str, dest) -> Path:
+    req = _load_request(request_id)
+    pkg = _snapshot_package(req)
     root = Path(dest) / pkg["top"]
     root.mkdir(parents=True, exist_ok=False)
     for e in pkg["entries"]:
@@ -1306,11 +1360,18 @@ def extract_snapshot(request_id: str, dest) -> Path:
 
 
 def verify_extracted(request_id: str, root) -> list:
+    if root is None:
+        raise WfError("解包复核需要实际目录（extracted_dir_required）")
+    try:
+        if not stat.S_ISDIR(os.lstat(root).st_mode):
+            return ["extracted_root_unsafe"]
+    except OSError as e:
+        return [f"extracted_root_unknown:{type(e).__name__}"]
     req = _load_request(request_id)
     bad = _snapshot_ok(req)
     if bad:
         return bad
-    pkg = read_package(_releases() / f"{req['package']['sha256']}.zip")
+    pkg = _snapshot_package(req)
     want = {e["path"]: e for e in pkg["entries"] if e["type"] == "file"
             and not ("__pycache__" in e["path"].split("/") or e["path"].endswith(".pyc"))}   # 与安装规则一致：不复制
     rows = _walk_states(Path(root), "", lambda r, d: "__pycache__" in r.split("/") or (not d and r.endswith(".pyc")))
@@ -1345,16 +1406,30 @@ def final_check(request_id: str, *, target, extracted_dir=None, now=None) -> dic
     return d
 
 
-def consume(request_id: str, *, target, extracted_dir, now=None) -> dict:
+def consume(request_id: str, *, target, extracted_dir, now=None, install_context=None) -> dict:
     """在登记审查结果所用的同一把锁内：重算全部结论（final_check）并写安装开始记录。登记 block 与消费因此按锁的先后
     线性排列：先登记的 block 一定被看到；锁释放之前任何结果都登记不进来。"""
+    if extracted_dir is None:
+        raise WfError("消费审查需要实际解包目录（extracted_dir_required）")
     with _Lock():
         d = final_check(request_id, target=target, extracted_dir=extracted_dir, now=now)
         if not d["allowed"]:
             raise WfError("安装前审查未通过，不能安装：" + "；".join(d["reasons"][:6]))
         t = _iso(now or _now())
-        rec = {"schema": "review-install/1", "request_id": request_id, "content_id": d["content_id"],
-               "attempt_id": d["attempt_id"], "install_started": t, "decision": d}
-        _write_new(_reviews() / "installs" / d["content_id"] / f"{secrets.token_hex(8)}.json", _canon(rec), 0o444)
         d["times"]["install_started"] = t
+        rec = {"schema": "review-install/1", "request_id": request_id, "content_id": d["content_id"],
+               "attempt_id": d["attempt_id"], "install_started": t, "decision": d,
+               "decision_sha256": _sha(_canon(d))}
+        if install_context is not None:
+            if not isinstance(install_context, dict):
+                raise WfError("install_context 必须是对象")
+            rec["install_context"] = dict(install_context)
+        path = _reviews() / "installs" / d["content_id"] / f"{secrets.token_hex(8)}.json"
+        _write_new(path, _canon(rec), 0o444)
+        for p in (path, path.parent):
+            fd = os.open(str(p), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
     return d
