@@ -413,8 +413,14 @@ def main(argv=None):
     x.add_argument("--action-text", dest="action_text", default=""); x.add_argument("--ttl", type=int, default=0)
     x = sub.add_parser("watchdog"); x.add_argument("--write", action="store_true")
     x = sub.add_parser("task"); x.add_argument("action", nargs="?", default="list", choices=["list", "done", "cancel", "supersede", "progress"])
-    x.add_argument("tid", nargs="?"); x.add_argument("--note", default="")
-    x.add_argument("--reason", default=""); x.add_argument("--by-task", dest="by_task", default="")   # 1.8.2
+    x.add_argument("tid", nargs="?"); x.add_argument("--note")   # B2-FIX-A1：不给时为 None，用来拒绝不适用的参数
+    x.add_argument("--reason"); x.add_argument("--by-task", dest="by_task")   # 1.8.2
+    x.add_argument("--generation")   # B2-A1：新记录必须带它现在的代次；旧记录不带或写 legacy
+    x.add_argument("--rev", type=int)   # B2-A1：同一代次内的附加校验
+    x.add_argument("--evidence", action="append", default=[])   # B2-A1：done 的证据，项目内文件或 64 位摘要，可多次
+    x.add_argument("--by-generation", dest="by_generation")   # B2-A1：接替者的代次（与 --by-task 一起）
+    xg = x.add_mutually_exclusive_group()
+    xg.add_argument("--interrupted", action="store_true"); xg.add_argument("--resumed", action="store_true")   # B2-A1
     x = sub.add_parser("transport"); x.add_argument("action", nargs="?", default="check", choices=["check", "test"])
     sub.add_parser("effort")
     x = sub.add_parser("decisions"); x.add_argument("--n", type=int, default=40); x.add_argument("--turn", type=int)
@@ -852,42 +858,78 @@ def main(argv=None):
     elif c == "task":
         from wflib import tasks
         inst = _p(args)
-        if args.action == "progress":   # 1.9.0（W88）：检查点，不关闭待办
-            if not args.tid:
-                raise WfError("用法：wf task progress <编号> --note \"做到哪一步、下一步、证据在哪\"")
-            t = tasks.progress(inst, args.tid, args.note)
-            print(f"已记下 {t['id']} 的检查点（共 {len(t['checkpoints'])} 个）；待办仍未关闭")
+        kw = {"generation": args.generation, "expect_rev": args.rev}   # B2-A1：代次必须显式给出，--rev 只是附加校验
+        given = {"<编号>": args.tid is not None, "--note": args.note is not None, "--reason": args.reason is not None,
+                 "--by-task": args.by_task is not None, "--by-generation": args.by_generation is not None,
+                 "--evidence": bool(args.evidence), "--interrupted": args.interrupted, "--resumed": args.resumed,
+                 "--generation": args.generation is not None, "--rev": args.rev is not None}
+        allowed = {"list": set(), "progress": {"<编号>", "--note", "--interrupted", "--resumed", "--generation", "--rev"},
+                   "done": {"<编号>", "--note", "--evidence", "--generation", "--rev"},
+                   "cancel": {"<编号>", "--reason", "--generation", "--rev"},
+                   "supersede": {"<编号>", "--reason", "--by-task", "--by-generation", "--generation", "--rev"}}[args.action]
+        bad = [k for k, on in given.items() if on and k not in allowed]
+        if bad:   # B2-FIX-A1：不适用的参数一律拒绝，不静默忽略、不写
+            raise WfError(f"wf task {args.action} 不接受 {'、'.join(bad)}")
+        if args.action != "list" and not args.tid:
+            raise WfError(f"用法：wf task {args.action} <编号> --generation <代次> …（wf task 列出代次与可照抄的命令）")
+        if args.by_generation is not None and args.by_task is None:
+            raise WfError("--by-generation 要和 --by-task 一起用")
+        t, msg = None, ""
+        if args.action == "progress":   # 1.9.0（W88）：检查点，不关闭待办；B2-A1：分 progress / interrupted / resumed
+            kind = "interrupted" if args.interrupted else "resumed" if args.resumed else "progress"
+            t = tasks.progress(inst, args.tid, args.note, kind=kind, **kw)
+            label = {"interrupted": "“被打断”", "resumed": "“已恢复”"}.get(kind, "")
+            msg = f"已记下 {t['id']} 的{label}检查点（共 {len(t['checkpoints'])} 个）；待办仍未关闭"
         elif args.action in ("cancel", "supersede"):   # 1.8.2（P0-B）：不再需要的待办如实关闭，不用 done 冒充
-            if not args.tid:
-                raise WfError(f"用法：wf task {args.action} <编号> --reason \"原因\""
-                              + ("（可加 --by-task <取代它的待办编号>）" if args.action == "supersede" else ""))
             t = tasks.close(inst, args.tid, "cancelled" if args.action == "cancel" else "superseded", args.reason,
-                            by_task=args.by_task)
+                            by_task=args.by_task or "", by_generation=args.by_generation, **kw)
             left = tasks.open_items(inst)
-            print(f"已{tasks.STATUS_CN[t['status']]} {t['id']}（{t['reason']}）；"
-                  + (f"还有 {len(left)} 项未完成" if left else "没有未完成的待办"))
+            msg = (f"已{tasks.STATUS_CN[t['status']]} {t['id']}（{t['reason']}）；"
+                   + (f"还有 {len(left)} 项未完成" if left else "没有未完成的待办"))
         elif args.action == "done":
-            if not args.tid:
-                raise WfError("用法：wf task done <编号> --note \"结果\"（wf task 列出未完成的待办）")
-            t = tasks.done(inst, args.tid, args.note)
+            t = tasks.done(inst, args.tid, args.note, evidence=args.evidence, **kw)
             left = tasks.open_items(inst)
             tail = ("，驱动器下次运行时自动生成回报" if inst.state.get("await_executor") is not None else
                     "；目标已达成，自动化停在这里，不会自动回报：结果已写进 inbox 的“目标已达成”提示与 wf task，"
                     "需要交给 Claude 时 wf kick --kind report（由证据生成带原文的回报；说明先用 wf note --kind info 写）" if inst.state.get("state") == "DONE" else "")   # 1.6.7；1.7.1 提示改为由证据生成
-            print(f"已完成 {t['id']}；" + (f"还有 {len(left)} 项未完成" if left else "全部待办已完成" + tail))
-        else:
-            rows = inst.state.get("executor_tasks") or []
+            msg = f"已完成 {t['id']}；" + (f"还有 {len(left)} 项未完成" if left else "全部待办已完成" + tail)
+        if t is not None:
             if args.json:
-                out({"tasks": rows})
+                out({"task": t, "commands": tasks.commands(t)})
             else:
-                for t in rows:
-                    sym = {"done": "✓", "open": "○", "cancelled": "✗", "superseded": "↷"}[tasks.status_of(t)]   # 1.8.2
-                    print(f"{sym} {t['id']}  {t['text']}" + (f"  —— {t['note']}" if t.get("note") else "")
-                          + (f"  —— 已{tasks.STATUS_CN[tasks.status_of(t)]}：{t.get('reason')}" if t.get("reason") else ""))
-                    if t.get("checkpoints"):   # 1.9.0（W88）
-                        cp = t["checkpoints"][-1]
-                        print(f"      最近检查点 {str(cp.get('ts'))[:16]}：{str(cp.get('note'))[:120]}")
-                if not rows:
+                print(msg)
+                just = t.get("migrated_from_legacy") and t.get("rev") == 1
+                print(f"代次 {t['generation']} · rev {t['rev']}"
+                      + ("（旧记录已迁移到代次协议：之后的命令都要带 --generation）" if just else ""))
+        else:
+            v = tasks.view(inst)   # B2-A1：列出代次、rev 与可照抄的命令；损坏时照样列出、不给命令
+            if args.json:
+                out(v)
+            else:
+                if v["problem"]:
+                    print(f"⚠ 待办记录损坏：{v['problem']}；修改会被拒绝，请先修复 workflow/state.json（下面不列可执行命令）")
+                txt = lambda x, d: x if isinstance(x, str) and x else d   # noqa: E731  坏数据只读显示，不抛错
+                for t in v["tasks"]:
+                    sym = {"done": "✓", "open": "○", "cancelled": "✗", "superseded": "↷"}.get(t["status_effective"], "?")   # 1.8.2
+                    print(f"{sym} {txt(t.get('id'), '（缺编号）')}  {txt(t.get('text'), '（缺正文）')}"
+                          + (f"  —— {t['note']}" if txt(t.get("note"), "") else "")
+                          + (f"  —— 已{tasks.STATUS_CN[t['status_effective']]}：{t.get('reason')}" if t.get("reason") else ""))
+                    print("      " + ("旧记录（没有代次）：照旧不带 --generation，第一次修改后迁移" if t["legacy"]
+                                      else f"代次 {t.get('generation')} · rev {t.get('rev')}"))
+                    deps = t.get("depends_on")
+                    if deps:
+                        print(f"      依赖 {'、'.join(map(str, deps)) if isinstance(deps, list) else deps}"
+                              + ("（旧引用，未绑定代次）" if t["depends_legacy"] else ""))
+                    cps = t.get("checkpoints")
+                    if isinstance(cps, list) and cps:   # 1.9.0（W88）
+                        cp = cps[-1] if isinstance(cps[-1], dict) else {}
+                        kind = cp.get("kind")   # B2-FIX2-A1：坏数据里 kind 可能是列表或字典，不能拿来查表
+                        label = {"interrupted": "（被打断）", "resumed": "（已恢复）"}.get(kind, "") if isinstance(kind, str) else ""
+                        print(f"      最近检查点 {str(cp.get('ts'))[:16]}{label}：{str(cp.get('note'))[:120]}")
+                    for key in ("done", "resumed", "progress"):
+                        if key in t["commands"]:
+                            print(f"      {t['commands'][key]}")
+                if not v["tasks"]:
                     print("没有执行端待办")
     elif c == "watchdog":
         from wflib import watchdog
