@@ -173,13 +173,39 @@ def _state_roots(root: Path) -> list:
     if local != root / "local":
         roots.append(("wf_local", local))
     reg = local / "registry.json"
-    if reg.is_file() and not reg.is_symlink():
-        for row in json.loads(reg.read_text(encoding="utf-8")).get("projects", []):
-            proj = Path(os.path.realpath(row["root"]))
+    if os.path.lexists(reg):   # an unreadable registry would silently drop project protection: refuse
+        if not stat.S_ISREG(os.lstat(reg).st_mode):
+            raise Refused("registry_not_regular", str(reg))
+        try:
+            doc = json.loads(reg.read_bytes())
+            rows = doc.get("projects", []) if isinstance(doc, dict) else None
+            if not isinstance(rows, list):
+                raise ValueError("projects must be a list")
+            projects = [Path(os.path.realpath(row["root"])) for row in rows]
+        except (ValueError, KeyError, TypeError, UnicodeError, OSError) as e:
+            raise Refused("registry_unreadable", f"{reg}: {e}"[:200]) from None
+        for proj in projects:
             if _overlap(proj, root):
                 raise Refused("project_overlaps_install_root", str(proj))
             roots.append(("project_workflow", proj / "workflow"))
     return roots
+
+
+def _check_snapshot_boundary(snap: Path, root: Path):
+    """The snapshot (manifest, blobs, journal) must neither lie in nor contain any protected root.
+
+    Counterexamples (2026-10-16): a snapshot inside a synthetic WF_LOCAL_DIR was frozen (69 files), and a
+    legitimately frozen snapshot moved into WF_LOCAL_DIR received journal/apply+completed while the plan
+    claimed never_written_by_runner. Checked before any creation, cleanup, code or journal write, against
+    canonical and lexical forms of every protected root.
+    """
+    protected = [("install_root", root)] + _state_roots(root)
+    forms = {Path(os.path.realpath(snap)), Path(os.path.abspath(snap))}
+    for kind, prot in protected:
+        for pf in {Path(os.path.realpath(prot)), Path(os.path.abspath(prot))}:
+            for sf in forms:
+                if _overlap(sf, pf):
+                    raise Refused("snapshot_overlaps_protected_state", f"{kind} {pf} / snapshot {sf}")
 
 
 def _inventory(path: Path) -> dict:
@@ -241,6 +267,7 @@ def freeze(install_root, snapshot_dir, *, review_id=None, package=None) -> dict:
     snap = parent / snap.name
     if _overlap(snap, root):
         raise Refused("snapshot_overlaps_install_root", f"{snap} / {root}")
+    _check_snapshot_boundary(snap, root)
     if os.path.lexists(snap):
         raise Refused("snapshot_dir_exists", str(snap))
     _repo(root)
@@ -459,23 +486,29 @@ def _check_resume_disk(inv, base, base_sha, derived, blobs_dir: Path, snapshot_s
     deletes = {d["path"]: d for d in derived["deletes"]}
     temps = {_temp_rel(snapshot_sha256, base_tree, p): w for p, w in writes.items()}
     concurrent, problems, found = [], [f"non_regular:{p}" for p in inv["non_regular"]], []
-    for rel, (_st, fp) in sorted(inv["code"].items()):
+    for rel, (st, fp) in sorted(inv["code"].items()):
         data = fp.read_bytes()
         if rel in temps:   # a temp this runner registered for exactly one write; must be a prefix of that blob
             if not (blobs_dir / temps[rel]["post"]).read_bytes().startswith(data):
                 problems.append(f"foreign_temp:{rel}")
             found.append(rel)
             continue
-        sha = _sha256(data)
+        # (content, git mode) of every file; type and set are covered by the inventory itself.
+        # Counterexample (2026-10-16): VERSION chmod 0755 outside the writes passed, the restore
+        # commit was made, and only the final status check failed.
+        now = (_sha256(data), "100755" if st.st_mode & 0o100 else "100644")
         if rel in writes:
-            if sha not in (writes[rel]["pre"], writes[rel]["post"]):
+            w = writes[rel]
+            allowed = {(w["post"], w["mode"])} | ({(w["pre"], base[rel][0])} if rel in base else set())
+            if now not in allowed:
                 concurrent.append(rel)
         elif rel in deletes:
-            if sha != deletes[rel]["pre"]:
+            if now != (deletes[rel]["pre"], base[rel][0]):
                 concurrent.append(rel)
         elif rel in base:
-            if sha != base_sha[base[rel][1]]:
-                problems.append(f"content:{rel}")
+            want = (base_sha[base[rel][1]], base[rel][0])
+            if now != want:
+                problems.append(f"{'content' if now[0] != want[0] else 'mode'}:{rel}")
         else:
             problems.append(f"extra:{rel}")
     concurrent += [p for p, w in writes.items() if p not in inv["code"] and w["pre"] is not None]
@@ -601,6 +634,7 @@ def plan(install_root, snapshot_dir, snapshot_sha256) -> dict:
         raise Refused("install_root_identity_mismatch", str(root))
     if _overlap(snap["_dir"], root):
         raise Refused("snapshot_overlaps_install_root", str(snap["_dir"]))
+    _check_snapshot_boundary(snap["_dir"], root)   # plan precedes every apply step, including journal writes
     _repo(root)
     journal = _journal_read(snap["_dir"])
     head = _head(root)
@@ -638,12 +672,20 @@ def plan(install_root, snapshot_dir, snapshot_sha256) -> dict:
     schema = ("unchanged_since_freeze" if not state_diff
               else "unverified: newer code wrote runtime state after freeze; old code compatibility not proven")
     target_id = _target_id(root, ident, head, snapshot_sha256)
+    # Bytecode caches cannot be bound to the frozen source: an unchecked-hash pyc (or a timestamp pyc
+    # with forged header fields) executes without reading the source, and -B/PYTHONDONTWRITEBYTECODE
+    # still read existing caches. They are listed, kept and block "may restart"; code_recovery covers
+    # source files only.
+    caches = [{"path": c, "sha256": _sha256((root / c).read_bytes())} for c in inv["cache"]]
+    blockers = ([] if restored else ["code_recovery_not_already_restored"]) \
+        + (["runtime_state_changed_since_freeze"] if state_diff else []) \
+        + ([f"unbound_bytecode_cache:{len(caches)}"] if caches else [])
     return {
         "result": "plan", "snapshot_sha256": snapshot_sha256, "install_root": str(root), "head": head,
         "frozen": {"git": snap["git"], "version": snap["version"], "files": len(frozen)},
         "target_id": target_id, "plan_sha256": _plan_sha256(snapshot_sha256, target_id, head, derived),
         "writes": derived["writes"], "deletes": derived["deletes"],
-        "inventory": {"code_files": len(inv["code"]), "interpreter_cache_files": len(inv["cache"]),
+        "inventory": {"code_files": len(inv["code"]), "bytecode_cache_unverified": caches,
                       "registered_temps_found": temps},
         "journal": {k: bool(v) if k != "failed" else v for k, v in journal.items()},
         "conclusions": {
@@ -653,11 +695,13 @@ def plan(install_root, snapshot_dir, snapshot_sha256) -> dict:
                                              for s in state_now]},
             "schema_compat": {"status": schema, "changed_since_freeze": state_diff},
             "restart": {"auto_start": False,
-                        "status": ("operator_may_restart_old_code" if restored and not state_diff
-                                   else "not_established"),
-                        "requires": ["code_recovery == already_restored",
+                        "status": "operator_may_restart_old_code" if not blockers else "not_established",
+                        "blockers": blockers,
+                        "requires": ["code_recovery == already_restored (source files, bytes and exec bit)",
                                      "schema_compat == unchanged_since_freeze, or an explicit review of every "
                                      "changed runtime state file against the old code",
+                                     "no Python bytecode cache below the install root: caches are not bound to "
+                                     "the frozen source and are never deleted by the runner",
                                      "no driver/board process from the newer code still running (not checked)"]},
         },
         "external_gate": snap.get("external_gate") or {"status": "none_recorded", "enforced_by_old_host": False},

@@ -11,8 +11,10 @@ install root and two projects; no credentials, no adapter, nothing is started.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import py_compile
 import shutil
 import signal
 import subprocess
@@ -555,6 +557,124 @@ class FirstUpgradeRecoveryTests(unittest.TestCase):
         self.assertEqual((frozen["manifest_check"]["mismatch"], frozen["manifest_check"]["unlisted"],
                           frozen["manifest_check"]["version_matches"]), ([], [], True))
         self.assertEqual(len(sha), 64)
+
+    # ---------------- B3-MAIN-UPGRADE-FIX2-20261016-1 ----------------
+
+    def call(self, cmd, snap, sha, target=None):
+        args = [cmd, "--install-root", str(self.root), "--snapshot-dir", str(snap), "--snapshot-sha256", sha]
+        rc, out, r = self.tool(*(args + (["--confirm-target", target] if target else [])))
+        return rc, out
+
+    def test_snapshot_never_overlaps_protected_state(self):
+        """Both directions, at freeze, plan and apply, before any creation or journal write."""
+        def refused_freeze(snap):
+            snap.parent.mkdir(parents=True, exist_ok=True)
+            before = self.everything()
+            rc, out, _ = self.tool("freeze", "--install-root", str(self.root), "--snapshot-dir", str(snap))
+            return (rc, out["code"], snap.exists(), self.everything() == before)
+        want = (2, "snapshot_overlaps_protected_state", False, True)
+        self.assertEqual(refused_freeze(self.local / "snaps" / "first-upgrade"), want)          # inside WF_LOCAL
+        self.assertEqual(refused_freeze(self.base / "p1" / "workflow" / "snap"), want)          # inside project workflow
+        saved = self.env["WF_LOCAL_DIR"]
+        self.env["WF_LOCAL_DIR"] = str(self.snap / "wf-local")                                  # WF_LOCAL inside snapshot
+        try:
+            self.assertEqual(refused_freeze(self.snap), want)
+        finally:
+            self.env["WF_LOCAL_DIR"] = saved
+        sha = self.freeze()
+        self.upgrade()
+        upgraded = self.git("rev-parse", "HEAD")
+        target = self.plan(sha)["target_id"]
+        current = self.snap
+        for moved in (self.local / "moved-snapshot", self.base / "p2" / "workflow" / "moved-snapshot"):
+            current.rename(moved)
+            current = moved
+            before = self.everything()
+            got = (self.call("plan", moved, sha)[1]["code"], self.call("apply", moved, sha, target)[1]["code"])
+            self.assertEqual((got, (moved / "journal").exists(), self.everything(), self.git("rev-parse", "HEAD")),
+                             (("snapshot_overlaps_protected_state",) * 2, False, before, upgraded), str(moved))
+        current.rename(self.snap)
+        self.env["WF_LOCAL_DIR"] = str(self.snap / "wf-local")
+        try:
+            before = self.everything()
+            got = (self.call("plan", self.snap, sha)[1]["code"], self.call("apply", self.snap, sha, target)[1]["code"])
+            self.assertEqual((got, self.everything()), (("snapshot_overlaps_protected_state",) * 2, before))
+        finally:
+            self.env["WF_LOCAL_DIR"] = saved
+        rc, out, r = self.apply(sha, self.plan(sha)["target_id"])
+        self.assertEqual((rc, out["result"]), (0, "restored"), r.stdout[-1500:])
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), OLD_TREE)
+
+    def test_unbound_bytecode_cache_is_reported_kept_and_blocks_restart(self):
+        mark = "executed-unbound-bytecode"
+        sha = self.freeze()
+        self.upgrade()
+        p = self.plan(sha)
+        self.assertEqual(self.apply(sha, p["target_id"])[1]["result"], "restored")
+        src = self.root / "wflib" / "driver.py"
+        marked = self.base / "driver_with_synthetic_marker.py"
+        marked.write_bytes(src.read_bytes() + b"\nB3_SYNTHETIC_UNBOUND_MARKER = print('" + mark.encode() + b"')\n")
+        cfile = Path(importlib.util.cache_from_source(str(src)))
+        cfile.parent.mkdir(exist_ok=True)
+        py_compile.compile(str(marked), cfile=str(cfile), dfile=str(src), doraise=True,
+                           invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        pyc = cfile.read_bytes()
+        frozen = {r["path"]: r["sha256"] for r in json.loads((self.snap / "manifest.json").read_bytes())["files"]}
+        self.assertEqual((int.from_bytes(pyc[4:8], "little"), hashlib.sha256(src.read_bytes()).hexdigest()),
+                         (1, frozen["wflib/driver.py"]))   # unchecked hash-based cache; source is the frozen source
+
+        def imports(*flags):
+            r = subprocess.run([sys.executable, *flags, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import wflib.driver",
+                                str(self.root)], cwd=str(self.base), env=self.env, capture_output=True, text=True, timeout=120)
+            return mark in r.stdout
+        self.assertEqual((imports(), imports("-B")), (True, True))   # real execution; -B still reads the cache
+        before = self.everything()
+        c = self.plan(sha)
+        listed = {x["path"]: x["sha256"] for x in c["inventory"]["bytecode_cache_unverified"]}
+        rc, out, _ = self.apply(sha, p["target_id"])
+        self.assertEqual((c["conclusions"]["code_recovery"], c["conclusions"]["restart"]["status"],
+                          any(b.startswith("unbound_bytecode_cache:") for b in c["conclusions"]["restart"]["blockers"]),
+                          listed.get(str(cfile.relative_to(self.root))), rc, out["result"],
+                          out["conclusions"]["restart"]["status"], cfile.read_bytes() == pyc, self.everything() == before),
+                         ("already_restored", "not_established", True, hashlib.sha256(pyc).hexdigest(), 0,
+                          "already_restored", "not_established", True, True))
+        self.assertEqual(self.wf("self-check", check=False).returncode, 0)   # the old self-check cannot see it
+        for d in sorted(self.root.rglob("__pycache__")):   # operator decision, never the runner
+            shutil.rmtree(d)
+        self.assertFalse(imports("-B"))
+        blockers = self.plan(sha)["conclusions"]["restart"]["blockers"]
+        self.assertFalse(any(b.startswith("unbound_bytecode_cache") for b in blockers), blockers)
+
+    def test_resume_precheck_binds_content_and_mode_of_every_file(self):
+        sha = self.freeze()
+        self.upgrade()
+        upgraded = self.git("rev-parse", "HEAD")
+        p = self.plan(sha)
+        rc, _, r = self.apply(sha, p["target_id"], script=KILL_AFTER_3)
+        self.assertEqual(rc, -signal.SIGKILL, r.stderr[-800:])
+        writes = json.loads((self.snap / "journal" / "apply.json").read_bytes())["writes"]
+        self.assertNotIn("VERSION", {w["path"] for w in writes})
+        version = self.root / "VERSION"
+        version.chmod(0o755)   # mode only, outside the planned writes
+        before = self.everything()
+        p_code, p_detail = self.refused("plan", sha)
+        a_code, _ = self.refused("apply", sha, p["target_id"])
+        self.assertEqual((p_code, "mode:VERSION" in p_detail, a_code, self.everything(), self.git("rev-parse", "HEAD")),
+                         ("blocked_unexplained_change", True, "blocked_unexplained_change", before, upgraded))
+        version.chmod(0o644)
+        done = next(w for w in writes if w["mode"] == "100644" and (self.root / w["path"]).exists()
+                    and hashlib.sha256((self.root / w["path"]).read_bytes()).hexdigest() == w["post"])
+        planned = self.root / done["path"]
+        planned.chmod(0o755)   # post content with an exec bit the plan does not prove
+        before = self.everything()
+        got = (self.refused("plan", sha)[0], self.refused("apply", sha, p["target_id"])[0])
+        self.assertEqual((got, self.everything(), self.git("rev-parse", "HEAD")),
+                         (("blocked_concurrent_change",) * 2, before, upgraded))
+        planned.chmod(0o644)
+        rc, out, r = self.apply(sha, p["target_id"])
+        self.assertEqual((rc, out["result"]), (0, "restored"), r.stdout[-1500:])
+        self.assertEqual((self.git("rev-parse", "HEAD^{tree}"), oct(version.stat().st_mode & 0o777)), (OLD_TREE, "0o644"))
+        self.assertEqual(self.wf("self-check", check=False).returncode, 0)
 
 
 if __name__ == "__main__":
