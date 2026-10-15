@@ -440,82 +440,211 @@ def _turn_starts(turns):
     return sorted((at, t) for t, at in ((t, _parse_stamp(v)) for t, v in first.items()) if at is not None)
 
 
-def _transaction_rows(inst, reader, *, tool_root, turns, bound):
+_TX_RECORDS = {"baseline.json": ("baseline/1", None), "prepared.json": ("install_tx/1", "prepared"),
+               "started.json": ("install_tx/1", "started"), "completed.json": ("install_completed/1", "completed"),
+               "failed.json": ("install_tx/1", "failed"), "partial.json": ("install_tx/1", "partial"),
+               "recovered.json": ("install_recovered/1", "recovered")}
+_RESTORE_RECORDS = {"prepared.json": ("install_restore/1", "prepared"),
+                    "completed.json": ("install_restore/1", "completed"),
+                    "partial.json": ("install_restore/1", "partial")}
+_LINKED_RECORDS = {"started.json", "completed.json", "failed.json", "partial.json"}
+_STORE_PARTS = (("project", ("workflow", "evidence", "install")), ("tool", ("local", "install")))
+
+
+class _StoreReader:
+    """Transaction-store view over the strict history reader.
+
+    Capture: an ``unsupported`` or ``unreadable`` problem on a store path
+    (symlink, non-directory, special member, permission) becomes an explicit,
+    recorded fault instead of aborting the window. Replay: those faults come
+    from the frozen descriptor and every other read goes to the frozen reader
+    unchanged, so capture and replay see the same facts without disk access.
+    Any other problem (``changed``, ``corrupt``, ...) still propagates.
+    """
+
+    def __init__(self, reader, faults=None):
+        self._reader, self._replay = reader, faults is not None
+        self._faults = {(f["op"], f["path"]): dict(f) for f in (faults or [])}
+
+    def _read(self, op, path):
+        key = (op, str(Path(path).absolute()))
+        if key in self._faults:
+            return dict(self._faults[key])
+        try:
+            return getattr(self._reader, op)(path)
+        except _InputProblem as exc:
+            if self._replay or exc.state not in ("unsupported", "unreadable"):
+                raise
+            self._faults[key] = {"fault": True, "op": op, "path": key[1], "state": exc.state, "detail": exc.detail}
+            return dict(self._faults[key])
+
+    def directory(self, path):
+        return self._read("directory", path)
+
+    def bytes(self, path):
+        return self._read("bytes", path)
+
+    @property
+    def faults(self):
+        return [self._faults[key] for key in sorted(self._faults)]
+
+    def revalidate(self):
+        """Capture only: every recorded fault must still be the same fault."""
+        for (op, path), fault in self._faults.items():
+            try:
+                (_directory_source if op == "directory" else _file_source)(path)
+            except _InputProblem as exc:
+                if (exc.state, exc.detail) == (fault["state"], fault["detail"]):
+                    continue
+            raise _InputProblem("changed", path, "transaction store fault changed before freeze")
+
+
+def _is_fault(value):
+    return isinstance(value, dict) and value.get("fault") is True
+
+
+def _transaction_stores(inst, store_reader, *, tool_root):
+    """Explicit state of both target-owned stores; never a silent skip."""
+    stores = []
+    for kind, parts in _STORE_PARTS:
+        path = Path(str(inst.root if kind == "project" else tool_root)).joinpath(*parts)
+        listing = store_reader.directory(path)
+        if _is_fault(listing):
+            stores.append({"store": kind, "path": str(path), "state": "fault",
+                           "fault": {"state": listing["state"], "detail": listing["detail"]}, "members": []})
+        else:
+            stores.append({"store": kind, "path": str(path), "state": listing.get("state"),
+                           "members": [list(m) for m in listing.get("members", [])
+                                       if m[0].startswith(("tx-", "restore-"))]})
+    return stores
+
+
+def _transaction_record_problems(job, txid, name, doc, prepared):
+    """Shape of one sealed record against the writer's protocol."""
+    import re
+    table = _TX_RECORDS if job == "install" else _RESTORE_RECORDS
+    if name not in table:
+        return ["transaction_record_unknown:" + name]
+    schema, state = table[name]
+    id_field = "tx_id" if job == "install" else "restore_id"
+    problems = []
+    if doc.get("schema") != schema:
+        problems.append(f"transaction_record_schema:{name}")
+    if state is not None and doc.get("state") != state:
+        problems.append(f"transaction_record_field:{name}:state")
+    if doc.get(id_field) != txid:
+        problems.append(f"transaction_record_field:{name}:{id_field}")
+    if name == "prepared.json":
+        stamp = doc.get("lock") if job == "install" else doc.get("prepared_at")
+        stamp = stamp.get("acquired_at") if job == "install" and isinstance(stamp, dict) else \
+            (stamp if job == "restore" else None)
+        if _parse_stamp(stamp) is None:
+            problems.append("transaction_record_field:prepared.json:" + ("lock" if job == "install" else "prepared_at"))
+    elif name in _LINKED_RECORDS and prepared is not None and doc.get("prepared_sha256") != prepared.get("body_sha256"):
+        problems.append(f"transaction_record_field:{name}:prepared_sha256")
+    if job == "install" and not re.fullmatch(r"tx-[0-9a-f]{32}", txid) \
+            or job == "restore" and not re.fullmatch(r"restore-[0-9a-f]{32}", txid):
+        problems.append("transaction_id_invalid")
+    return problems
+
+
+def _transaction_rows(inst, store_reader, *, stores, turns, bound):
     """Every target-owned install/restore transaction not covered by a provider row.
 
-    Both stores (project ``workflow/evidence/install`` and tool
-    ``local/install``) are enumerated through the strict capture/frozen reader.
-    Rows never carry a reference: ``failed`` for failed/partial records,
-    ``corrupt`` for unreadable/unsealed records, otherwise ``unknown`` (even a
-    completed transaction without an exec receipt). The attempt is attributed
-    to a round by its own start time (``prepared.lock.acquired_at`` or
-    ``prepared_at``); unparsable or missing times are ``time_unknown``.
+    Rows never carry a reference. Records are read through the strict
+    capture/frozen reader, must be sealed (B's ``body_sha256`` check) and must
+    match the writer's protocol (schema, state, id, prepared link, start time).
+    Any problem makes the row ``corrupt``; otherwise ``failed`` for a
+    failed/partial record and ``unknown`` for everything else (a completed
+    transaction without an exec receipt is still unknown). The attempt is
+    attributed to a round by its validated start time; store and directory
+    faults become corrupt, time-unknown rows.
     """
     from .review import _canon, _sha
     starts = _turn_starts(turns)
     rows = []
-    for kind, root, parts in (("project", inst.root, ("workflow", "evidence", "install")),
-                              ("tool", tool_root, ("local", "install"))):
-        store = Path(str(root)).joinpath(*parts)
-        listing = reader.directory(store)
-        if listing.get("state") != "present":
+
+    def row(kind, txid, job, state, problems, records=(), anchor=None, at=None):
+        earlier = [(start, t) for start, t in starts if at is not None and start <= at]
+        attribution = "time_unknown" if at is None else ("turn" if earlier else "before_first_turn")
+        rows.append({"seq": None, "turn": max(earlier)[1] if earlier else None, "reference": None, "state": state,
+                     "diagnostics": [TRANSACTION_DIAGNOSTIC] + problems,
+                     "transaction": {"schema": TRANSACTION_SCHEMA, "store": kind, "id": txid, "job": job,
+                                     "records": list(records), "attempt_at": anchor, "attribution": attribution}})
+
+    for store in stores:
+        kind, path = store["store"], Path(store["path"])
+        if store["state"] == "fault":
+            row(kind, None, None, "corrupt",
+                [f"transaction_store_{store['fault']['state']}:{store['fault']['detail']}"])
             continue
-        for name, member_type, _mode in listing.get("members", []):
-            if not name.startswith(("tx-", "restore-")):
-                continue
+        for name, member_type, _mode in store["members"]:
             job = "install" if name.startswith("tx-") else "restore"
             if job == "install" and (kind, name) in bound:
                 continue
-            records, problems, anchor = [], [], None
             if member_type != "dir":
-                problems.append("transaction_member_not_directory")
-            else:
-                for record, record_type, _rmode in reader.directory(store / name).get("members", []):
-                    if not record.endswith(".json"):
-                        continue
-                    if record_type != "file":
-                        problems.append("transaction_record_not_file:" + record)
-                        continue
-                    raw = reader.bytes(store / name / record)
-                    try:
-                        doc = _strict_json(raw, store / name / record) if raw is not None else None
-                    except _InputProblem:
-                        doc = None
-                    if doc is None or doc.get("body_sha256") != _sha(_canon(
-                            {k: v for k, v in doc.items() if k != "body_sha256"})):
-                        problems.append("transaction_record_corrupt:" + record)
-                        continue
-                    records.append({"record": record, "state": doc.get("state")})
-                    if record == "prepared.json":
-                        value = (doc.get("lock") or {}).get("acquired_at") if job == "install" \
-                            else doc.get("prepared_at")
-                        anchor = value if isinstance(value, str) else None
-            at = _parse_stamp(anchor)
-            earlier = [(start, t) for start, t in starts if at is not None and start <= at]
-            turn = max(earlier)[1] if earlier else None
-            attribution = "time_unknown" if at is None else ("turn" if earlier else "before_first_turn")
-            state = "corrupt" if any(p.startswith(("transaction_record_corrupt", "transaction_record_not_file",
-                                                   "transaction_member")) for p in problems) \
-                else "failed" if any(r["state"] in ("failed", "partial") for r in records) else "unknown"
-            rows.append({"seq": None, "turn": turn, "reference": None, "state": state,
-                         "diagnostics": [TRANSACTION_DIAGNOSTIC] + problems,
-                         "transaction": {"schema": TRANSACTION_SCHEMA, "store": kind, "id": name, "job": job,
-                                         "records": records, "attempt_at": anchor, "attribution": attribution}})
+                row(kind, name, job, "corrupt", ["transaction_member_not_directory"])
+                continue
+            listing = store_reader.directory(path / name)
+            if _is_fault(listing):
+                row(kind, name, job, "corrupt", [f"transaction_directory_{listing['state']}:{listing['detail']}"])
+                continue
+            docs, problems = {}, []
+            for record, record_type, _rmode in listing.get("members", []):
+                if not record.endswith(".json"):
+                    continue
+                if record_type != "file":
+                    problems.append("transaction_record_not_file:" + record)
+                    continue
+                raw = store_reader.bytes(path / name / record)
+                if _is_fault(raw):
+                    problems.append(f"transaction_record_{raw['state']}:{record}")
+                    continue
+                try:
+                    doc = _strict_json(raw, path / name / record) if raw is not None else None
+                except _InputProblem:
+                    doc = None
+                if doc is None or doc.get("body_sha256") != _sha(_canon(
+                        {k: v for k, v in doc.items() if k != "body_sha256"})):
+                    problems.append("transaction_record_corrupt:" + record)
+                    continue
+                docs[record] = doc
+            prepared_problems = _transaction_record_problems(job, name, "prepared.json", docs["prepared.json"], None) \
+                if "prepared.json" in docs else None
+            if "prepared.json" not in docs and not any(p.endswith(":prepared.json") for p in problems):
+                problems.append("transaction_record_missing:prepared.json")
+            prepared = docs.get("prepared.json") if prepared_problems == [] else None
+            for record, doc in docs.items():
+                problems.extend(prepared_problems if record == "prepared.json"
+                                else _transaction_record_problems(job, name, record, doc, prepared))
+            anchor = None
+            if prepared is not None:
+                anchor = prepared["lock"]["acquired_at"] if job == "install" else prepared["prepared_at"]
+            records = [{"record": record, "state": doc.get("state")} for record, doc in docs.items()]
+            state = "corrupt" if problems else \
+                "failed" if any(r["state"] in ("failed", "partial") for r in records) else "unknown"
+            row(kind, name, job, state, problems, records, anchor, _parse_stamp(anchor))
     return rows
 
 
 def _transaction_summary(history):
-    """Window-independent transaction facts; time-unknown attempts always block."""
+    """Window-independent transaction facts: corrupt or time-unknown rows always block."""
     rows = [row for row in (history or {}).get("entries", []) if isinstance(row.get("transaction"), dict)]
-    unknown_time = [row for row in rows if row["transaction"].get("attribution") == "time_unknown"]
+    why = []
+    if any(row["state"] == "corrupt" for row in rows):
+        why.append("install_transaction_corrupt")
+    if any(row["transaction"].get("attribution") == "time_unknown" for row in rows):
+        why.append("install_transaction_time_unknown")
     return {"schema": TRANSACTIONS_SCHEMA,
+            "stores": [{k: v for k, v in store.items() if k != "members"}
+                       for store in (history or {}).get("transaction_stores", [])],
             "unbound": [{"store": row["transaction"]["store"], "id": row["transaction"]["id"],
                          "state": row["state"], "turn": row["turn"],
                          "attribution": row["transaction"]["attribution"]} for row in rows],
-            "why": ["install_transaction_time_unknown"] if unknown_time else []}
+            "why": why}
 
 
-def _bound_histories(inst, events, reader, *, local, tool_root, turns=()):
+def _bound_histories(inst, events, reader, *, local, tool_root, turns=(), store_reader=None):
     """Provider-bound receipts plus explicit unknown rows for unreferenced tries.
 
     Every structured invocation is first bound by ``exec_binding`` and
@@ -580,8 +709,12 @@ def _bound_histories(inst, events, reader, *, local, tool_root, turns=()):
     rows.sort(key=lambda row: row["seq"])   # stable: same-seq references keep receipt order
     bound = {(row["reference"]["target"]["kind"], row["reference"]["tx_id"])
              for row in rows if isinstance(row.get("reference"), dict)}
-    rows.extend(_transaction_rows(inst, reader, tool_root=tool_root, turns=turns, bound=bound))
-    return {"schema": provided["schema"], "entries": rows}
+    store_reader = store_reader if store_reader is not None else _StoreReader(reader)
+    stores = _transaction_stores(inst, store_reader, tool_root=tool_root)
+    rows.extend(_transaction_rows(inst, store_reader, stores=stores, turns=turns, bound=bound))
+    return {"schema": provided["schema"], "entries": rows,
+            "transaction_stores": [{k: v for k, v in store.items() if k != "members"} for store in stores],
+            "transaction_faults": store_reader.faults}
 
 
 def _install_try(event, histories, history_entries):
@@ -1195,10 +1328,12 @@ class _FrozenInputs:
         inputs = self.descriptor["review_inputs"]
         if inputs.get("schema") != "live-install-history/1":
             return None
-        replay = _bound_histories(inst, events, FrozenReader(self, inputs["reader"]),
+        frozen = FrozenReader(self, inputs["reader"])
+        replay = _bound_histories(inst, events, frozen,
                                   local=inputs["host"]["local"], tool_root=inputs["host"]["tool_root"],
-                                  turns=self.jsonl(inst.turns_path))
-        if replay != {"schema": inputs["schema"], "entries": inputs["entries"]}:
+                                  turns=self.jsonl(inst.turns_path),
+                                  store_reader=_StoreReader(frozen, faults=inputs.get("transaction_faults", [])))
+        if replay != {k: inputs.get(k) for k in ("schema", "entries", "transaction_stores", "transaction_faults")}:
             raise _InputProblem("corrupt", "install_history", "stored history differs from frozen replay")
         return replay
 
@@ -1401,24 +1536,30 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
                       "excluded": "latest_pending" if t == max(sent) and t not in done else None}
                      for t in sorted(sent)]
         git_inputs = _git_inputs(fresh.root, [h["ts"] for h in hist if h.get("status") in ("pushed", "unchanged")])
-        history_reader = None
-        review_inputs = {"state": "unavailable", "reason": "install_history_unavailable"}
-        if _history_required(events):
-            from .core import WF_HOME
-            from .live_history import CaptureReader
+        from .core import WF_HOME
+        from .live_history import CaptureReader
 
-            def history_directory(path):
-                desc = _directory_source(path)
-                previous = next((row for row in directories if row["path"] == desc["path"]), None)
-                if previous is not None and previous != desc:
-                    raise _InputProblem("changed", path, "history selector changed during collection")
-                if previous is None:
-                    directories.append(desc)
-                return desc
+        def history_directory(path):
+            desc = _directory_source(path)
+            previous = next((row for row in directories if row["path"] == desc["path"]), None)
+            if previous is not None and previous != desc:
+                raise _InputProblem("changed", path, "history selector changed during collection")
+            if previous is None:
+                directories.append(desc)
+            return desc
 
-            history_reader = CaptureReader(lambda path: source(path, "bytes", required=False), history_directory)
+        history_reader = CaptureReader(lambda path: source(path, "bytes", required=False), history_directory)
+        store_reader = _StoreReader(history_reader)
+        # Both transaction stores are always listed through the strict reader;
+        # their frozen listings (or recorded faults) decide the history gate,
+        # so an exec-less transaction opens history even without any exec.
+        stores = _transaction_stores(fresh, store_reader, tool_root=WF_HOME)
+        review_inputs = {"state": "unavailable", "reason": "install_history_unavailable",
+                         "transaction_stores": [{k: v for k, v in store.items() if k != "members"}
+                                                for store in stores]}
+        if _history_required(events) or any(store["state"] == "fault" or store["members"] for store in stores):
             review_inputs = _bound_histories(fresh, events, history_reader, local=LOCAL, tool_root=WF_HOME,
-                                             turns=turns)
+                                             turns=turns, store_reader=store_reader)
             review_inputs.update(host={"local": str(Path(LOCAL).absolute()), "tool_root": str(Path(WF_HOME).absolute())},
                                  reader=history_reader.descriptor)
         trust_inputs = None
@@ -1448,8 +1589,8 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
             descriptor["trust_inputs"] = trust_inputs
         # Re-read bytes and member boundaries; no after-the-fact hash can be
         # paired with data evaluated earlier. No global ACID/ABA claim is made.
-        if history_reader is not None:
-            history_reader.revalidate()
+        history_reader.revalidate()
+        store_reader.revalidate()
         for desc in sources:
             current, data = _file_source(desc["path"])
             current["format"] = desc["format"]

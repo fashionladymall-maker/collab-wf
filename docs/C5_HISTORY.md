@@ -182,7 +182,8 @@ and one denial reason, e.g. `production_trust_registry_absent`,
 `production_trust_history_synthetic`,
 `production_trust_platform_mismatch`, `production_trust_model_mismatch`.
 Reasons are ordered: historical reasons first, then exec-less transaction
-reasons (`install_transaction_time_unknown`), then trust reasons, so an
+reasons (`install_transaction_corrupt`, `install_transaction_time_unknown`),
+then trust reasons, so an
 explicitly synthetic history still reports `synthetic_install_history`.
 
 The registry is a frozen input of every modern window
@@ -252,41 +253,78 @@ apply attribution do not depend on these unknown rows.
 
 An installation attempt can exist only in a target-owned transaction store,
 for example a driver's in-process `release.apply_zip` that writes `prepared`
-and then fails on a real review block, with no exec and no event. Whenever the
-history protocol runs, `_bound_histories` therefore also enumerates both
-stores through the same strict capture/frozen reader: the project's
-`workflow/evidence/install` and the tool's `<tool_root>/local/install`. Every
-`tx-*` or `restore-*` that no provider row references becomes its own row:
+and then fails on a real review block, with no exec and no event. Every
+capture therefore lists both stores through the strict capture reader: the
+project's `workflow/evidence/install` and the tool's `<tool_root>/local/install`.
+The frozen listings decide the history gate together with the exec gate: a
+store containing any `tx-*`/`restore-*` member, or a store fault, opens the
+history protocol even in a window with no exec at all. Without either,
+`review_inputs` stays `unavailable` but records `transaction_stores` (each
+`present`/`absent`), and the frozen listings make a later transaction
+invalidate that window.
 
-- `seq=null`, `reference=null`, diagnostic
-  `install_transaction_without_exec_receipt`, plus a `transaction` object
-  (`install-transaction/1`: store, id, job `install|restore`, sealed record
-  states, `attempt_at`, `attribution`);
-- state `failed` when a `failed`/`partial` record exists, `corrupt` when a
-  `*.json` record is unreadable, not a file, or fails the same `body_sha256`
-  seal check B applies, otherwise `unknown` (a `completed` transaction without
-  a receipt is still unknown; no reference is derived from it);
-- the attempt is attributed by its own start time (`prepared.lock.acquired_at`
-  for `tx-*`, `prepared_at` for `restore-*`) to the round whose first send it
-  follows, rounds running until the next send (`turns.jsonl`, also frozen).
+Every transaction no provider row references becomes its own row: `seq=null`,
+`reference=null`, diagnostic `install_transaction_without_exec_receipt`, and a
+`transaction` object (`install-transaction/1`: store, id, job
+`install|restore`, record states, `attempt_at`, `attribution`). No reference is
+derived from it. Each `*.json` record must be a regular file, strict JSON,
+sealed with B's `body_sha256`, and match the writer's protocol:
 
+| job | record | schema | state | id |
+|---|---|---|---|---|
+| install | `baseline.json` | `baseline/1` | — | `tx_id` |
+| install | `prepared.json` | `install_tx/1` | `prepared` | `tx_id`, `lock.acquired_at` timezone-aware |
+| install | `started`/`failed`/`partial.json` | `install_tx/1` | same as name | `tx_id`, `prepared_sha256` |
+| install | `completed.json` | `install_completed/1` | `completed` | `tx_id`, `prepared_sha256` |
+| install | `recovered.json` | `install_recovered/1` | `recovered` | `tx_id` |
+| restore | `prepared.json` | `install_restore/1` | `prepared` | `restore_id`, `prepared_at` timezone-aware |
+| restore | `completed`/`partial.json` | `install_restore/1` | same as name | `restore_id`, `prepared_sha256` |
+
+Directory names must be `tx-<32 hex>` or `restore-<32 hex>`. Any deviation is
+explicit and makes the row `corrupt`: `transaction_record_unknown:<name>`,
+`transaction_record_schema:<name>`, `transaction_record_field:<name>:<field>`
+(state, id, lock/prepared_at, prepared_sha256), `transaction_record_missing:
+prepared.json`, `transaction_record_corrupt:<name>` (JSON or seal),
+`transaction_record_not_file:<name>`, `transaction_id_invalid`,
+`transaction_member_not_directory`. A bad start field is never treated as an
+ordinary unknown time. Otherwise the row is `failed` for a failed/partial
+record and `unknown` for everything else (a completed transaction without an
+exec receipt is still unknown).
+
+Store paths are read through `live._StoreReader`. At capture, an
+`unsupported` or `unreadable` problem (symlinked store, a store that is not a
+directory, a symlinked or special member, permission errors) is recorded as a
+fault in `review_inputs.transaction_faults` and becomes a corrupt row:
+`transaction_store_<state>:<detail>` (for example `symlink directory`,
+`NotADirectoryError`), `transaction_directory_<state>:<detail>`, or
+`transaction_record_<state>:<name>`. Frozen replay reproduces these faults
+from the descriptor and reads everything else through the frozen reader, so
+it opens no file; fresh revalidation and the freeze check re-probe each fault
+and report `changed` when it no longer holds. Other problems still abort the
+collection. A symlinked member makes its whole store a fault.
+
+The attempt is attributed by its validated start time to the round whose first
+send it follows, rounds running until the next send (`turns.jsonl`, frozen).
 Rows attributed to an evaluated round block authorization through the window
 rule (`install_history:failed|unknown|corrupt`) and count in criterion 4:
 `attempts.unbound_transactions`, `total`, and `failed`/`unknown`, with status
-`attempt_failed` and the transaction ids in the explanation. A transaction
-whose start time is missing or unparsable is `time_unknown` and always blocks
-(`install_transactions.why = ["install_transaction_time_unknown"]`,
-`install-transactions/1`). Transactions before the first round are listed but
-do not block. The tool store is shared by every project on the host, so a tool
-install performed through another project's exec during this window is
-unbound here and blocks this window conservatively. Goals re-evaluate and
-compare `install_transactions` like the other derived facts.
+`attempt_failed` and the transaction ids in the explanation. Independent of the
+window, any corrupt row (`install_transaction_corrupt`) or time-unknown row
+(`install_transaction_time_unknown`) blocks (`install_transactions`,
+`install-transactions/1`, which also lists the store states). Transactions
+before the first round are listed but do not block. The tool store is shared
+by every project on the host, so a tool install performed through another
+project's exec during this window is unbound here and blocks this window
+conservatively. Goals re-evaluate and compare `install_transactions` like the
+other derived facts.
 
-Boundaries: the inventory runs whenever the history protocol runs (structured
-receipts or a classified legacy/inner exec). A window with neither stays
-collection-only with authorization unavailable, and its report does not list
-exec-less transactions. Capture uses the process `WF_HOME` as tool root, so a
-fixture that does not isolate `WF_HOME` sees that host's real tool store.
+Boundaries: when B's provider already reads a store for a bound history, it
+reads it strictly, so a store fault there still aborts that collection as
+before. A direct non-snapshot `live.check` without structured receipts keeps
+the legacy reporting path and does not list exec-less transactions; the
+collection used by goals does. Capture uses the process `WF_HOME` as tool
+root, so a fixture that does not isolate `WF_HOME` sees that host's real tool
+store.
 
 `live._legacy_install` tokenizes with a quote-aware shell lexer and recognizes direct
 `wf`/`wf.py` invocations (any path, including `python3 '<space path>/wf.py'`),

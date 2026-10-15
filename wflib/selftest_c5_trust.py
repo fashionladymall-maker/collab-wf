@@ -318,10 +318,13 @@ class TransactionInventoryTests(_Fixture):
         sealed(lost / "failed.json", {"schema": "install_tx/1", "state": "failed", "tx_id": lost.name})
         result = self.evaluate(inst)
         row = next(r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction"))
-        self.assertEqual((row["turn"], row["state"], row["transaction"]["attribution"]), (None, "failed", "time_unknown"))
+        self.assertEqual((row["turn"], row["state"], row["transaction"]["attribution"], row["diagnostics"]),
+                         (None, "corrupt", "time_unknown",
+                          [live.TRANSACTION_DIAGNOSTIC, "transaction_record_missing:prepared.json"]))
         self.assertTrue(result["history_authorization"]["eligible"])
-        self.assertEqual(result["install_transactions"]["why"], ["install_transaction_time_unknown"])
-        self.assertEqual(result["reason"], "install_transaction_time_unknown")
+        self.assertEqual(result["install_transactions"]["why"],
+                         ["install_transaction_corrupt", "install_transaction_time_unknown"])
+        self.assertEqual(result["reason"], "install_transaction_corrupt；install_transaction_time_unknown")
         for path in sorted(lost.iterdir()):
             path.unlink()
         lost.rmdir()
@@ -351,6 +354,79 @@ class TransactionInventoryTests(_Fixture):
                 if r.get("transaction")}
         self.assertEqual((rows[bad.name]["state"], rows[bad.name]["diagnostics"]),
                          ("corrupt", [live.TRANSACTION_DIAGNOSTIC, "transaction_record_corrupt:prepared.json"]))
+
+
+def prepared_body(txid, **change):
+    body = {"schema": "install_tx/1", "state": "prepared", "tx_id": txid,
+            "lock": {"acquired_at": core.now().isoformat()}}
+    body.update(change)
+    return body
+
+
+class TransactionProtocolTests(_Fixture):
+    def test_record_shapes_are_validated_not_crashing(self):
+        """Seal is not enough: schema/state/id/lock/link must match the writer."""
+        import shutil
+        inst = self.fixture()
+        self.write_registry(self.registration())
+        self.assertEqual(self.evaluate(inst)["authorization"], "available")
+        store = inst.evidence / "install"
+        tx = "tx-" + "e" * 32
+        restore = "restore-" + "e" * 32
+        cases = [
+            ("lock-string", tx, {"prepared.json": prepared_body(tx, lock="not-an-object")},
+             "transaction_record_field:prepared.json:lock"),
+            ("lock-empty", tx, {"prepared.json": prepared_body(tx, lock={})}, "transaction_record_field:prepared.json:lock"),
+            ("lock-naive", tx, {"prepared.json": prepared_body(tx, lock={"acquired_at": "2026-10-15T00:00:00"})},
+             "transaction_record_field:prepared.json:lock"),
+            ("schema", tx, {"prepared.json": prepared_body(tx, schema="install_tx/9")},
+             "transaction_record_schema:prepared.json"),
+            ("state", tx, {"prepared.json": prepared_body(tx, state="completed")},
+             "transaction_record_field:prepared.json:state"),
+            ("tx_id", tx, {"prepared.json": prepared_body("tx-" + "f" * 32)}, "transaction_record_field:prepared.json:tx_id"),
+            ("unknown-record", tx, {"prepared.json": prepared_body(tx),
+                                    "mystery.json": {"schema": "install_tx/1", "state": "prepared", "tx_id": tx}},
+             "transaction_record_unknown:mystery.json"),
+            ("unlinked-failed", tx, {"prepared.json": prepared_body(tx),
+                                     "failed.json": {"schema": "install_tx/1", "state": "failed", "tx_id": tx,
+                                                     "prepared_sha256": "0" * 64}},
+             "transaction_record_field:failed.json:prepared_sha256"),
+            ("baseline-schema", tx, {"prepared.json": prepared_body(tx),
+                                     "baseline.json": {"schema": "baseline/9", "tx_id": tx}},
+             "transaction_record_schema:baseline.json"),
+            ("bad-id", "tx-" + "Z" * 32, {"prepared.json": prepared_body("tx-" + "Z" * 32)}, "transaction_id_invalid"),
+            ("restore-time", restore, {"prepared.json": {"schema": "install_restore/1", "state": "prepared",
+                                                         "restore_id": restore}},
+             "transaction_record_field:prepared.json:prepared_at"),
+        ]
+        for label, name, records, diagnostic in cases:
+            for record, body in records.items():
+                sealed(store / name / record, body)
+            snap = live._capture_inputs(inst, rounds=1)
+            result = live._evaluate_snapshot(snap)
+            row = next(r for r in result["window_inputs"]["review_inputs"]["entries"]
+                       if (r.get("transaction") or {}).get("id") == name)
+            self.assertEqual(row["state"], "corrupt", label)
+            self.assertIn(diagnostic, row["diagnostics"], label)
+            self.assertIsNone(row["reference"], label)
+            self.assertIn("install_transaction_corrupt", result["install_transactions"]["why"], label)
+            self.assertEqual(result["authorization"], "unavailable", label)
+            if label == "lock-string":
+                # A bad field is never an ordinary unknown time that could be ignored.
+                self.assertEqual((row["turn"], row["transaction"]["attribution"]), (None, "time_unknown"))
+                self.assertEqual(result["reason"], "install_transaction_corrupt；install_transaction_time_unknown")
+                from unittest.mock import patch
+                with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")):
+                    self.assertEqual(live._evaluate_snapshot(snap), result)
+            shutil.rmtree(store / name)
+        # A record that is a directory is explicit, too.
+        (store / tx / "prepared.json").mkdir(parents=True)
+        row = next(r for r in self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"]
+                   if (r.get("transaction") or {}).get("id") == tx)
+        self.assertEqual((row["state"], row["diagnostics"]),
+                         ("corrupt", [live.TRANSACTION_DIAGNOSTIC, "transaction_record_not_file:prepared.json"]))
+        shutil.rmtree(store / tx)
+        self.assertEqual(self.evaluate(inst)["authorization"], "available")
 
 
 def live_history_reader(inst):
@@ -472,7 +548,7 @@ class LegacyEntryTests(_Fixture):
                              ("unknown", None, [live.INNER_REVIEW_DIAGNOSTIC], "inner_review"), kind)
         self.assertIn("install_history:unknown", result["history_authorization"]["why"])
 
-    def legacy_only_fixture(self):
+    def legacy_only_fixture(self, legacy=None):
         """Same live window as the C5 fixture but with no structured receipt."""
         from datetime import timedelta
         from .selftest_review import _git
@@ -484,7 +560,7 @@ class LegacyEntryTests(_Fixture):
         for kind, fields in (("reply_binding", {"receipt": "ok", "deliveries": "ok"}),
                              ("reply_checked", {}), ("round_result", {"ok": True})):
             inst.event(kind, by="driver", **fields)
-        legacy = {
+        legacy = legacy if legacy is not None else {
             "project": "wf apply legacy.zip",
             "tool_failed": shlex.join([sys.executable, "/space path/wf.py", "self-update", "legacy.zip"]),
             "drill": shlex.join([sys.executable, "/space path/wf.py", "drill", "review", "--kind", "block",
@@ -617,6 +693,124 @@ class LegacyEntryTests(_Fixture):
             self.assertIsNone(live._legacy_install(command), command)
         unparsable = live._legacy_install("wf apply 'x.zip")
         self.assertEqual((unparsable["parsed"], unparsable["kind"], unparsable["argument"]), (False, None, None))
+
+
+class ExeclessWindowTests(_Fixture):
+    legacy_only_fixture = LegacyEntryTests.legacy_only_fixture
+    blocked_after_prepare = TransactionInventoryTests.blocked_after_prepare
+
+    def ordinary(self):
+        """Pre-receipt round whose only exec is ``true`` (no receipt, no legacy entry)."""
+        inst, seqs = self.legacy_only_fixture({"plain": "true"})
+        self.assertFalse(live._history_required(live._strict_log(inst.events_path.read_bytes(), inst.events_path)))
+        return inst
+
+    def test_ordinary_window_lists_execless_failed_transaction(self):
+        inst = self.ordinary()
+        before = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(before)
+        self.assertEqual(before.descriptor["review_inputs"],
+                         {"state": "unavailable", "reason": "install_history_unavailable",
+                          "transaction_stores": [
+                              {"store": "project", "path": str(inst.evidence / "install"), "state": "absent"},
+                              {"store": "tool", "path": str(self.env.tool / "local" / "install"), "state": "absent"}]})
+        self.assertEqual(next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)["status"],
+                         "not_applicable")
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+        self.blocked_after_prepare(inst)
+        # The frozen store listing gates history: the old window is now stale.
+        self.assertFalse(live._revalidate_inputs(inst, before.descriptor)["valid"])
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        inputs = snap.descriptor["review_inputs"]
+        self.assertEqual(inputs["schema"], "live-install-history/1")
+        self.assertIs(snap.descriptor["complete"], False)
+        rows = [r for r in inputs["entries"] if r.get("transaction")]
+        self.assertEqual([(r["seq"], r["turn"], r["reference"], r["state"], r["transaction"]["store"])
+                          for r in rows], [(None, 1, None, "failed", "project")])
+        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(criterion["status"], "attempt_failed")
+        self.assertEqual(criterion["attempts"], {"total": 1, "ok": 0, "timeout": 0, "unknown": 0,
+                                                 "unbound_transactions": 1, "failed": 1})
+        self.assertIn(rows[0]["transaction"]["id"], criterion["why"])
+        self.assertEqual(result["authorization"], "unavailable")
+        self.assertIn("install_history:failed", result["history_authorization"]["why"])
+        self.assertEqual([s["state"] for s in result["install_transactions"]["stores"]], ["present", "absent"])
+        from unittest.mock import patch
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")), \
+             patch.object(Path, "resolve", side_effect=AssertionError("replay resolved a path")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertTrue(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        verified = self.run_goal(inst)
+        self.assertIs(verified["granted"], False)
+
+    def test_store_and_record_faults_are_explicit(self):
+        import shutil
+        from unittest.mock import patch
+        inst = self.ordinary()
+
+        def store_row(result):
+            rows = [r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("transaction")]
+            self.assertEqual(len(rows), 1, rows)
+            self.assertIn("install_transaction_corrupt", result["install_transactions"]["why"])
+            self.assertEqual(result["authorization"], "unavailable")
+            return rows[0]
+
+        # Tool store is a symlink.
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        tool_store = self.env.tool / "local" / "install"
+        tool_store.parent.mkdir(parents=True, exist_ok=True)
+        tool_store.symlink_to(elsewhere, target_is_directory=True)
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        row = store_row(result)
+        self.assertEqual((row["transaction"]["store"], row["state"], row["diagnostics"]),
+                         ("tool", "corrupt", [live.TRANSACTION_DIAGNOSTIC, "transaction_store_unsupported:symlink directory"]))
+        self.assertEqual(result["install_transactions"]["stores"][1]["state"], "fault")
+        with patch.object(live, "_directory_source", side_effect=AssertionError("replay listed disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        tool_store.unlink()
+        # Project store is not a directory.
+        store = inst.evidence / "install"
+        store.write_text("not a directory")
+        row = store_row(self.evaluate(inst))
+        self.assertEqual(row["diagnostics"],
+                         [live.TRANSACTION_DIAGNOSTIC, "transaction_store_unreadable:NotADirectoryError"])
+        store.unlink()
+        # A transaction directory with a symlinked record.
+        tx = store / ("tx-" + "f" * 32)
+        tx.mkdir(parents=True)
+        (tx / "prepared.json").symlink_to(elsewhere)
+        row = store_row(self.evaluate(inst))
+        self.assertEqual((row["transaction"]["id"], row["diagnostics"]),
+                         (tx.name, [live.TRANSACTION_DIAGNOSTIC, "transaction_directory_unsupported:directory member type"]))
+        (tx / "prepared.json").unlink()
+        # An unreadable record (fault injected at capture only) replays from
+        # the frozen fault without touching disk, and fresh revalidation sees
+        # that the fault no longer holds.
+        sealed(tx / "prepared.json", prepared_body(tx.name))
+        original = live._file_source
+        target = str(tx / "prepared.json")
+
+        def unreadable(path):
+            if str(path) == target:
+                raise live._InputProblem("unreadable", path, "PermissionError")
+            return original(path)
+
+        with patch.object(live, "_file_source", unreadable):
+            snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        row = store_row(result)
+        self.assertEqual(row["diagnostics"], [live.TRANSACTION_DIAGNOSTIC, "transaction_record_unreadable:prepared.json"])
+        self.assertEqual(snap.descriptor["review_inputs"]["transaction_faults"],
+                         [{"fault": True, "op": "bytes", "path": target, "state": "unreadable", "detail": "PermissionError"}])
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        readable = [r for r in self.evaluate(inst)["window_inputs"]["review_inputs"]["entries"] if r.get("transaction")]
+        self.assertEqual((readable[0]["state"], readable[0]["transaction"]["attribution"]), ("unknown", "turn"))
+        shutil.rmtree(store)
 
 
 if __name__ == "__main__":
