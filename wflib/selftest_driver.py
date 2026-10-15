@@ -23,6 +23,20 @@ def _user(_wf, env, proj, kind, *cmd):
     code = next((it["code"] for it in items if it["kind"] == kind or it["kind"].startswith(kind + ":")), "NONE")
     return _wf(env, proj, *cmd, "--code", code, "--said", "测试：用户原话")
 
+def _task_generation(_wf, env, proj, tid):
+    """B2-A1：像执行端一样，先用 wf --json task 取该编号现在的代次，再带着它修改。
+    取不到（没有这项、旧记录没有代次、输出不是 JSON）时返回 None；调用处仍会带一个对不上的代次，命令随后被拒绝，不改走旧记录。"""
+    rc, o = _wf(env, proj, "--json", "task")
+    try:
+        data, _ = json.JSONDecoder().raw_decode(o[o.index("{"):])
+    except ValueError:
+        return None
+    for t in data.get("tasks") or []:
+        if str(t.get("id", "")).upper() == str(tid).upper() and t.get("generation"):
+            return t["generation"]
+    return None
+
+
 def _reply(cmds, checklist, directives, effort="medium"):
     code = "\n".join(cmds)
     items = "\n".join(f"{i}. {c}" for i, c in enumerate(checklist, 1)) or "无"
@@ -391,7 +405,8 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     rc, o = _wf(env, et, "run")
     waiting = _state(et)["state"] == "WAIT_SCHEDULE"
     rc, oa = _wf(env, et, "--json", "ask")
-    rc6, o6 = _wf(env, et, "task", "done", "T1-1", "--note", "测试：已接上")
+    g6 = _task_generation(_wf, env, et, "T1-1")   # B2-A1：新记录必须带它现在的代次
+    rc6, o6 = _wf(env, et, "task", "done", "T1-1", "--generation", g6 or "未取到代次", "--note", "测试：已接上")
     rc7, o7 = _wf(env, et, "run")
     sent5 = sorted((fake / "inbox").glob("*-etask-*.md"))
     last5 = sent5[-1].read_text(encoding="utf-8") if sent5 else ""
@@ -447,7 +462,8 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _ok("1.6.7 ② 待办登记不改变目标达成：仍进入 DONE（退出码 30），不等待、不发送；explain 先说待办、交给执行端",
         rc7 == 30 and s7["state"] == "DONE" and s7.get("await_executor") is None and _sent("dtask") == n7
         and "需要：执行端" in oe7 and "执行端待办" in oe7, o7 + oe7)
-    rc8, o8 = _wf(env, dt, "task", "done", tid7, "--note", "测试：DONE 下已做完")
+    g8 = _task_generation(_wf, env, dt, tid7)   # B2-A1：新记录必须带它现在的代次
+    rc8, o8 = _wf(env, dt, "task", "done", tid7, "--generation", g8 or "未取到代次", "--note", "测试：DONE 下已做完")
     rc9, o9 = _wf(env, dt, "run")
     rc, oa9 = _wf(env, dt, "--json", "ask")
     _ok("1.6.7 ③ DONE 下待办做完：wf task done 说明不会自动回报，结果写进“目标已达成”提示；仍停在 DONE、不发送",

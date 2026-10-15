@@ -1079,12 +1079,13 @@ def _t_v166_tasks(_ok):
         inst.save()
         a1 = tasks.add(inst, 5, d["executor_tasks"])
         a2 = tasks.add(inst, 5, d["executor_tasks"])   # 同一项不重复登记
-        t = tasks.done(inst, "t5-1", "已改好")
+        gen = {x["id"]: x["generation"] for x in a1}   # B2-A1：新记录按代次修改，代次取自刚登记返回的条目
+        t = tasks.done(inst, "t5-1", "已改好", generation=gen["T5-1"])
         left = [x["id"] for x in tasks.open_items(inst)]
         errs = 0
-        for tid in ("T5-1", "T9-9"):
+        for tid in ("T5-1", "T9-9"):   # B2-A1：带上正确代次，拒绝只能来自原本的原因（已完成、空说明、没有这项）
             try:
-                tasks.done(inst, tid, "")
+                tasks.done(inst, tid, "", generation=gen.get(tid))
             except WfError:
                 errs += 1
         notes = (inst.turn_dir() / "notes.jsonl").read_text(encoding="utf-8")

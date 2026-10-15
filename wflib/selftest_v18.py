@@ -61,22 +61,25 @@ def _t_tasks_close(_ok):
     from .core import WfError
     with tempfile.TemporaryDirectory() as td:
         inst = _inst(td, "v180-t", {"state": "VERIFY", "turn": 7})
-        tasks.add(inst, 7, {"1": "改同步程序", "2": "解冻另一个项目", "3": "回报"})
-        tasks.done(inst, "T7-2", "已解冻")
+        added = tasks.add(inst, 7, {"1": "改同步程序", "2": "解冻另一个项目", "3": "回报"})
+        gen = {x["id"]: x["generation"] for x in added}   # B2-A1：新记录按代次修改，代次取自刚登记返回的条目
+        tasks.done(inst, "T7-2", "已解冻", generation=gen["T7-2"])
         errs = []
-        for fn in (lambda: tasks.close(inst, "T7-1", "cancelled", ""),
-                   lambda: tasks.close(inst, "T7-2", "cancelled", "已被边界取代"),
-                   lambda: tasks.done(inst, "T7-3", "")):
+        # B2-A1：每次都带上正确代次，拒绝只能来自原本的原因（缺原因、已完成不能取消、缺结果），不是缺代次
+        for fn in (lambda: tasks.close(inst, "T7-1", "cancelled", "", generation=gen["T7-1"]),
+                   lambda: tasks.close(inst, "T7-2", "cancelled", "已被边界取代", generation=gen["T7-2"]),
+                   lambda: tasks.done(inst, "T7-3", "", generation=gen["T7-3"])):
             try:
                 fn()
                 errs.append(False)
             except WfError:
                 errs.append(True)
-        c = tasks.close(inst, "T7-1", "cancelled", "改由新的待办承接")
-        s = tasks.close(inst, "T7-2", "superseded", "用户边界：该项目不恢复", by_task="T8-1")
+        c = tasks.close(inst, "T7-1", "cancelled", "改由新的待办承接", generation=gen["T7-1"])
+        # 接替者 T8-1 尚未登记，没有代次可绑定：只给 by_task，不给 by_generation（不默认绑定任何一条）
+        s = tasks.close(inst, "T7-2", "superseded", "用户边界：该项目不恢复", by_task="T8-1", generation=gen["T7-2"])
         again = False
         try:
-            tasks.done(inst, "T7-1", "又做了")
+            tasks.done(inst, "T7-1", "又做了", generation=gen["T7-1"])   # 带正确代次：拒绝来自“已取消”
         except WfError:
             again = True
         left = [t["id"] for t in tasks.open_items(inst)]
@@ -934,11 +937,11 @@ def _t_task_progress(_ok):
     from .core import WfError
     with tempfile.TemporaryDirectory() as td:
         a = _inst(td, "v190-p", {"state": "VERIFY", "turn": 3})
-        tasks.add(a, 3, {"1": "长任务"})
-        t = tasks.progress(a, "T3-1", "做完第一步；下一步核对日志；证据在 outputs/x.txt")
+        gen = {x["id"]: x["generation"] for x in tasks.add(a, 3, {"1": "长任务"})}   # B2-A1：代次取自刚登记返回的条目
+        t = tasks.progress(a, "T3-1", "做完第一步；下一步核对日志；证据在 outputs/x.txt", generation=gen["T3-1"])
         empty = False
         try:
-            tasks.progress(a, "T3-1", "")
+            tasks.progress(a, "T3-1", "", generation=gen["T3-1"])   # 带正确代次：拒绝来自空检查点
         except WfError:
             empty = True
         still_open = [x["id"] for x in tasks.open_items(a)] == ["T3-1"]
