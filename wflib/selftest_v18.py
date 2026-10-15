@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .core import WF_HOME
+from .selftest_send_fixtures import send_context, send_host
 
 REPLY6 = ("【本轮结论】\n测试。\n\n【本机执行】\n无\n\n【本轮回报清单】\n无\n\n【需要用户决定】\n无\n\n"
           "【下一轮建议档位】\nhigh\n\n【驱动指令】\n发布：无\n之后：回报\n")
@@ -556,6 +557,7 @@ def _t_update_mutex(_ok):
     _ok("安装互斥：同 root 的 self-update 在读包前立即失败、不排队、不安装", "install_busy" in msg, msg)
 
 
+@send_host("_inst")
 def _t_reply_latency(_ok):
     from datetime import datetime, timedelta, timezone
     from . import anomaly, driver
@@ -576,19 +578,22 @@ def _t_reply_latency(_ok):
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_text("【回报 · 第 3 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
                 a.state["outgoing"] = {"turn": 3, "file": str(f), "kind": "report", "effort": "high"}
+                # A current pending attempt retains its original checked snapshot.
+                a.state["send_intent"]["message"] = driver._prepare_send(
+                    send_context(a, pol, time.time() + 60), a.state["outgoing"])
                 a.save()
                 return a
             fake.data = {"status": "none"}
             a = mk("v185-a", 200)
-            r1 = driver.h_send(driver.Ctx(a, pol, time.time() + 60))
+            r1 = driver.h_send(send_context(a, pol, time.time() + 60))
             ra = parse_iso(a.state.get("retry_at"))
             res["gap"] = (ra - datetime.now(timezone.utc)).total_seconds() if ra else None
             b = mk("v185-b", 4000)
-            driver.h_send(driver.Ctx(b, pol, time.time() + 60))
+            driver.h_send(send_context(b, pol, time.time() + 60))
             res["late"] = b.state.get("state")
             fake.data = {"status": "done", "ref": "R3"}
             c = mk("v185-c", 300)
-            r3 = driver.h_send(driver.Ctx(c, pol, time.time() + 60))
+            r3 = driver.h_send(send_context(c, pol, time.time() + 60))
             pa = parse_iso(c.state.get("poll_after"))
             res["pickup"] = (pa - datetime.now(timezone.utc)).total_seconds() if pa else None
             res["c_state"] = c.state.get("state")
@@ -717,6 +722,7 @@ def _t_delivery_check(_ok):
         r[0] == "" and "不符" in r[1] and "没有送达" in r[2] and "没有写在交付行里" in r[2], json.dumps(r, ensure_ascii=False))
 
 
+@send_host("_inst")
 def _t_arbiter(_ok):
     from . import anomaly, arbiter, driver
     from .core import Instance, LOCAL
@@ -743,7 +749,7 @@ def _t_arbiter(_ok):
         d.save()
         try:
             anomaly.call = lambda op, args, timeout=None, env_extra=None: calls.append(op) or {"code": 0, "raw": "", "data": {}}
-            r = driver.h_send(driver.Ctx(d, {"shared_max_inflight": 1}, time.time() + 60))
+            r = driver.h_send(send_context(d, {"shared_max_inflight": 1}, time.time() + 60))
         finally:
             anomaly.call = orig
     ok = (g1["granted"] and not g2["granted"] and g2["position"] == 1 and not g3["granted"] and g3["position"] == 2
@@ -814,6 +820,7 @@ def _t_review_gate(_ok):
         json.dumps({"negative": res, "positive": positive}, ensure_ascii=False))
 
 
+@send_host("_inst")
 def _t_heartbeat_no_resend(_ok):
     from . import anomaly, driver
     orig, calls = anomaly.call, []
@@ -839,11 +846,11 @@ def _t_heartbeat_no_resend(_ok):
                 a.save()
                 pol = {"send_unknown_wait": True}
                 n0 = len(calls)
-                r1 = driver.h_send(driver.Ctx(a, pol, time.time() + 60))
+                r1 = driver.h_send(send_context(a, pol, time.time() + 60))
                 kept = (a.state.get("send_intent") or {}).get("status") == "pending"
                 a.state.pop("retry_at", None)
                 a.save()
-                r2 = driver.h_send(driver.Ctx(a, pol, time.time() + 60))
+                r2 = driver.h_send(send_context(a, pol, time.time() + 60))
                 res.append([code, r1[0], kept, r2[0], a.state.get("state"), calls[n0:].count("send")])
     finally:
         anomaly.call = orig
@@ -970,6 +977,7 @@ def _t_task_progress(_ok):
         len(t.get("checkpoints") or []) == 1 and empty and still_open, str([t.get("checkpoints"), empty, still_open]))
 
 
+@send_host("_inst")
 def _t_send_code4(_ok):
     from . import anomaly, driver
     orig, calls = anomaly.call, []
@@ -988,11 +996,11 @@ def _t_send_code4(_ok):
             f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
             a.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
             a.save()
-            r1 = driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+            r1 = driver.h_send(send_context(a, {"send_unknown_wait": True}, time.time() + 60))
             kept = (a.state.get("send_intent") or {}).get("status") == "pending"
             a.state.pop("retry_at", None)
             a.save()
-            r2 = driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+            r2 = driver.h_send(send_context(a, {"send_unknown_wait": True}, time.time() + 60))
     finally:
         anomaly.call = orig
     _ok("1.9.0 发送暂时性错误：按结果不明保留意图、提示“再核对，不重发”，确认已送达就接上，只发一次",
@@ -1100,6 +1108,7 @@ def _t_actor_restore(_ok):
         before == "cli" and after == "cli" and after_err == "cli", str([before, after, after_err]))
 
 
+@send_host("_inst")
 def _t_send_meta_poll(_ok):
     # 1.9.4（审查 concerns）：发送结果不明、之后经轮询确认送达时，也记下发出消息的 uuid（适配器在 poll 里给出 message_uuid）
     from . import anomaly, driver
@@ -1122,10 +1131,10 @@ def _t_send_meta_poll(_ok):
                 f.write_text("【回报 · 第 2 轮 · v0.1】档位：high\n\n正文\n", encoding="utf-8")
                 a.state["outgoing"] = {"turn": 2, "file": str(f), "kind": "report", "effort": "high"}
                 a.save()
-                driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+                driver.h_send(send_context(a, {"send_unknown_wait": True}, time.time() + 60))
                 a.state.pop("retry_at", None)
                 a.save()
-                driver.h_send(driver.Ctx(a, {"send_unknown_wait": True}, time.time() + 60))
+                driver.h_send(send_context(a, {"send_unknown_wait": True}, time.time() + 60))
                 mp = a.turn_dir(2) / "send_meta.json"
                 out[case] = json.loads(mp.read_text(encoding="utf-8")) if mp.exists() else None
         finally:
