@@ -1014,10 +1014,127 @@ def _t_metrics_readonly(_ok):
                     [k for k in before if k in after and before[k] != after[k]][:5]], ensure_ascii=False)[:800])
 
 
+def _t_goals_empty_guard(_ok):
+    """B2-C2a：空集保护——至少一个可执行目标才可能达成；all_exec 为空集、目标未批准、可执行目标未通过时人工验收不就绪；
+    默认骨架批准且两条机械判据通过后验收正常就绪、确认后达成。只在临时目录里，不执行真实判据命令。"""
+    from . import asks, goals, policy
+    from .core import WfError
+
+    def mk(td, name, gl):
+        inst = _inst(td, name, {"state": "IDLE", "turn": 1})
+        (inst.wf / "goals.json").write_text(json.dumps(gl, ensure_ascii=False), encoding="utf-8")
+        return inst
+
+    def item(p, gid):
+        return next(i for i in p["items"] if i["id"] == gid)
+
+    def confirm(inst, gid):
+        try:
+            goals.confirm(inst, gid, "测试")
+            return "confirmed"
+        except WfError as e:
+            return "refused:" + str(e)[:60]
+
+    def pend(inst):
+        return [str(x.get("kind")) for x in asks.pending(inst)]
+
+    def fake_pass(inst, gids):
+        """合成的机械记录（不是执行判据命令）：按当前 goals_sha 写入通过记录。"""
+        cur = policy.status(inst, "goals")["current"]
+        gs = {gid: {"ok": True, "why": [], "ts": "2026-10-15T00:00:00+00:00", "exit": 0, "goals_sha": cur} for gid in gids}
+        (inst.wf / "goals_state.json").write_text(json.dumps(gs), encoding="utf-8")
+    E = lambda gid, chk: {"id": gid, "title": gid, "kind": "exec", "check": chk, "pass": {"exit": 0}, "means": "m", "on_fail": "f"}   # noqa: E731
+    M = lambda gid, **kw: dict({"id": gid, "title": gid, "kind": "manual", "means": "m", "on_fail": "f"}, **kw)   # noqa: E731
+    res = {}
+    with tempfile.TemporaryDirectory() as td:
+        a = mk(td, "c2a-empty", {"goals": []})
+        r0 = goals.progress(a)["reached"]
+        policy.approve(a, "goals", "测试", by="test")
+        p = goals.progress(a)
+        res["empty"] = (r0, p["approved"], p["reached"], p["total"])
+
+        b = mk(td, "c2a-manual", {"goals": [M("U1", depends_on="all_exec"), M("U2")]})
+        policy.approve(b, "goals", "测试", by="test")
+        u1 = item(goals.progress(b), "U1")
+        res["manual_allexec"] = (u1.get("ready"), u1["ok"], "空集" in u1["detail"], "confirm:U1" in pend(b),
+                                 confirm(b, "U1").startswith("refused"), confirm(b, "U2"))
+        p = goals.progress(b)
+        res["manual_allexec_after"] = (p["reached"], item(p, "U1")["ok"], item(p, "U2")["ok"], p["done"], p["total"])
+
+        c = mk(td, "c2a-manual2", {"goals": [M("U2"), M("U3")]})
+        policy.approve(c, "goals", "测试", by="test")
+        res["manual_all_confirmed"] = (confirm(c, "U2"), confirm(c, "U3"))
+        p = goals.progress(c)
+        res["manual_all_confirmed_p"] = (p["done"], p["total"], p["approved"], p["reached"])
+
+        d = mk(td, "c2a-fail", {"goals": [E("E1", "false"), M("U1", depends_on="all_exec")]})
+        policy.approve(d, "goals", "测试", by="test")
+        goals.run_checks(d, by="test")
+        u1 = item(goals.progress(d), "U1")
+        res["exec_fail"] = (u1.get("ready"), u1["ok"], "E1" in u1["detail"], "confirm:U1" in pend(d),
+                            confirm(d, "U1").startswith("refused"), goals.progress(d)["reached"])
+
+        e = mk(td, "c2a-pass", {"goals": [E("E1", "true"), M("U1", depends_on="all_exec")]})
+        policy.approve(e, "goals", "测试", by="test")
+        goals.run_checks(e, by="test")
+        u1 = item(goals.progress(e), "U1")
+        res["exec_pass"] = (u1.get("ready"), "confirm:U1" in pend(e), confirm(e, "U1"), goals.progress(e)["reached"])
+
+        f = mk(td, "c2a-unapproved", {"goals": [E("E1", "true"), M("U1", depends_on="all_exec")]})
+        fake_pass(f, ["E1"])
+        p = goals.progress(f)
+        u1 = item(p, "U1")
+        res["unapproved"] = (item(p, "E1")["ok"], u1.get("ready"), "尚未批准" in u1["detail"], p["reached"],
+                             "confirm:U1" in pend(f), confirm(f, "U1").startswith("refused"))
+
+        h = mk(td, "c2a-contains", {"goals": [{"id": "E1", "title": "旧判据", "kind": "exec", "check": "echo ok",
+                                               "pass": {"contains": ["ok"]}, "means": "m", "on_fail": "f"}]})
+        policy.approve(h, "goals", "测试", by="test")
+        goals.run_checks(h, by="test")
+        p = goals.progress(h)
+        res["contains_only"] = (item(p, "E1")["ok"], p["reached"], goals.judge({"contains": ["ok"]}, 3, "ok")[0])
+
+        k = _inst(td, "c2a-default", {"state": "IDLE", "turn": 1})
+        (k.wf / "goals.json").write_text(json.dumps(goals.default_goals(k.name, today="2026-10-15"), ensure_ascii=False),
+                                         encoding="utf-8")
+        acc0 = item(goals.progress(k), "BASE-ACCEPT")
+        policy.approve(k, "goals", "测试", by="test")
+        acc1 = item(goals.progress(k), "BASE-ACCEPT")
+        fake_pass(k, ["BASE-SELF", "BASE-PROBES"])
+        p = goals.progress(k)
+        acc2, smoke = item(p, "BASE-ACCEPT"), item(p, "BASE-SMOKE")
+        pend_k = pend(k)
+        res["default"] = (acc0.get("ready"), acc1.get("ready"), "BASE-SELF" in acc1["detail"], acc2.get("ready"),
+                          smoke.get("ready", True), "confirm:BASE-ACCEPT" in pend_k, "confirm:BASE-SMOKE" in pend_k,
+                          p["reached"], confirm(k, "BASE-SMOKE"), confirm(k, "BASE-ACCEPT"))
+        p = goals.progress(k)
+        res["default_done"] = (p["done"], p["total"], p["reached"])
+    _ok("B2-C2a 空目标即使批准也不达成；只有人工目标时即使全部确认也不达成",
+        res["empty"] == (False, True, False, 0) and res["manual_all_confirmed"] == ("confirmed", "confirmed")
+        and res["manual_all_confirmed_p"] == (2, 2, True, False), json.dumps({k: res[k] for k in (
+            "empty", "manual_all_confirmed", "manual_all_confirmed_p")}, ensure_ascii=False))
+    _ok("B2-C2a depends_on=all_exec 在没有可执行目标时不就绪、不通知、确认被前置保护拒绝，也不算完成；其他人工目标照常确认",
+        res["manual_allexec"] == (False, False, True, False, True, "confirmed")
+        and res["manual_allexec_after"] == (False, False, True, 1, 2),
+        json.dumps({k: res[k] for k in ("manual_allexec", "manual_allexec_after")}, ensure_ascii=False))
+    _ok("B2-C2a 可执行目标未通过、或目标未批准时人工验收不就绪、不通知、不能确认；可执行目标通过后照常就绪、确认后达成",
+        res["exec_fail"] == (False, False, True, False, True, False)
+        and res["exec_pass"] == (True, True, "confirmed", True)
+        and res["unapproved"] == (True, False, True, False, False, True),
+        json.dumps({k: res[k] for k in ("exec_fail", "exec_pass", "unapproved")}, ensure_ascii=False))
+    _ok("B2-C2a 旧的只含 contains 的判据语义不变：没有 exit 条件时不要求退出码，可执行目标通过即可达成",
+        res["contains_only"] == (True, True, True), json.dumps(res["contains_only"]))
+    _ok("B2-C2a 默认骨架不是永久禁用：未批准与机械判据未通过时验收不就绪；批准且两条机械判据通过（合成记录）后验收就绪并通知，"
+        "冒烟仍按人工规则；两项确认后达成",
+        res["default"] == (False, False, True, True, True, True, True, False, "confirmed", "confirmed")
+        and res["default_done"] == (4, 4, True), json.dumps({k: res[k] for k in ("default", "default_done")}, ensure_ascii=False))
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
          ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals), ("指标 C3", _t_metrics),
          ("指标真实 API C3", _t_metrics_real_api),
-         ("指标时间与身份 C3", _t_metrics_time_identity), ("指标只读 C3", _t_metrics_readonly)]
+         ("指标时间与身份 C3", _t_metrics_time_identity), ("指标只读 C3", _t_metrics_readonly),
+         ("目标空集保护 C2a", _t_goals_empty_guard)]
 
 
 def run_lane_c(_ok) -> None:
