@@ -20,10 +20,23 @@ from .projectmd import parse_project_md, validate
 from . import fidelity, review
 
 
+def _boundary(operation):
+    return review._boundary(operation, code="install_boundary")
+
+
+@_boundary("enumerate_transactions")
+def _install_jobs(directory, prefix):
+    # Path.glob can hide a failed scandir as an empty store. An unreadable store
+    # is unknown, never evidence that no pending transaction exists.
+    with os.scandir(directory) as entries:
+        return sorted((Path(entry.path) for entry in entries if entry.name.startswith(prefix)), key=str)
+
+
 def _digest(obj) -> str:
     return review._sha(review._canon(obj))
 
 
+@_boundary("install_store")
 def _install_store(root: Path, kind: str, *, create=True) -> Path:
     """目标自有的元数据，不能随调用方 LOCAL 切换；每级目录均拒绝链接。"""
     root = Path(root).resolve(strict=True)
@@ -47,6 +60,7 @@ def _install_store(root: Path, kind: str, *, create=True) -> Path:
     return cur
 
 
+@_boundary("record_new")
 def _record_new(path: Path, body: dict) -> dict:
     """append-only、hash 封装、fsync；记录失败绝不等价于成功。调用者持目标锁。"""
     doc = dict(body, body_sha256=_digest(body))
@@ -64,6 +78,7 @@ def _record_new(path: Path, body: dict) -> dict:
     return doc
 
 
+@_boundary("read_record")
 def _read_record(path: Path) -> dict:
     if not stat.S_ISREG(os.lstat(path).st_mode):
         raise WfError(f"安装记录类型不符：{path}")
@@ -77,12 +92,14 @@ def _read_record(path: Path) -> dict:
 class _InstallLock:
     """先取目标锁，再进 review.consume 的短锁；持至结果核验与终态记录完成。"""
 
+    @_boundary("lock_init")
     def __init__(self, root, kind, *, recovery=False):
         self.root = Path(root).resolve(strict=True)
         self.kind = kind
         self.recovery = recovery
         self.fd = None
 
+    @_boundary("lock_enter")
     def __enter__(self):
         import fcntl
         try:
@@ -123,6 +140,7 @@ class _InstallLock:
             raise WfError("目标 .git 不允许符号链接（install_git_changed）")
         return Path(git(["rev-parse", "--absolute-git-dir"], self.root).stdout.strip()).resolve(strict=True)
 
+    @_boundary("lock_verify")
     def verify(self):
         at_root = os.lstat(self.root)
         if (at_root.st_dev, at_root.st_ino) != self.root_identity or self._gitdir() != self.gitdir:
@@ -143,6 +161,7 @@ class _InstallLock:
             if (st_dir.st_dev, st_dir.st_ino) != self.store_identity:
                 raise WfError("安装元数据目录已变")
 
+    @_boundary("lock_check_incomplete")
     def _check_incomplete(self):
         if git(["ls-files", "--", "workflow/evidence/install", "local/install"], self.root).stdout.strip():
             raise WfError("安装元数据不得被 Git 跟踪（install_metadata_tracked）")
@@ -152,7 +171,7 @@ class _InstallLock:
             if os.path.lexists(path):
                 stores[kind] = _install_store(self.root, kind, create=False)
         for kind, directory in stores.items():
-            for job in sorted(directory.glob("restore-*")):
+            for job in _install_jobs(directory, "restore-"):
                 if not stat.S_ISDIR(os.lstat(job).st_mode):
                     raise WfError("回滚事务目录类型损坏（install_incomplete）")
                 prepared = _read_record(job / "prepared.json")
@@ -173,7 +192,7 @@ class _InstallLock:
                 else:
                     if not self.recovery:
                         raise WfError(f"上次回滚未闭合（install_incomplete）：{job.name}")
-            for p in sorted(directory.glob("tx-*")):
+            for p in _install_jobs(directory, "tx-"):
                 if not stat.S_ISDIR(os.lstat(p).st_mode):
                     raise WfError("安装事务目录类型损坏（install_incomplete）")
                 if os.path.lexists(p / "recovered.json"):
@@ -223,6 +242,7 @@ class _InstallLock:
                             or rec["actual"].get("tree_sha256") != _digest(rec["actual"]["files"])):
                         raise WfError(f"安装完成证据不符（install_incomplete）：{p.name}")
 
+    @_boundary("lock_activate")
     def activate(self):
         if self.store is None:
             self.store = _install_store(self.root, self.kind)
@@ -230,12 +250,16 @@ class _InstallLock:
             self.verify()
             self._check_incomplete()
         return self
+
+    @_boundary("lock_exit")
     def __exit__(self, *a):
         import fcntl
         if self.fd is not None:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
-            self.fd = None
+            fd, self.fd = self.fd, None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def _inventory(root: Path, kind, protect) -> list:
@@ -253,6 +277,7 @@ def _config_bytes(cfg) -> bytes:
     return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+@_boundary("fresh_instance")
 def _fresh_instance(root: Path, req=None) -> Instance:
     inst = Instance(root)
     raw = inst.cfg_path.read_bytes()
@@ -264,6 +289,7 @@ def _fresh_instance(root: Path, req=None) -> Instance:
     return inst
 
 
+@_boundary("install_plan")
 def _install_plan(req, pkg, src, root, kind, cfg=None, archive=None) -> dict:
     """按 copy → delete → 配置/归档的真实顺序构建结果，包含未被包覆盖的原树。"""
     protect = req["base"]["protect"]
@@ -357,6 +383,7 @@ def _refs(root):
     return refs
 
 
+@_boundary("snapshot")
 def _snapshot(lock, directory, protect):
     """只保存安装可写树；保护树不复制、不用于恢复，控制文件另作身份核验。"""
     rows = _inventory(lock.root, lock.kind, protect)
@@ -434,6 +461,7 @@ def _new_baseline(lock, path, tx_id, req):
         "verified_at": review._iso(review._now()), "source": "preinstall-verified", "status": "verified"})
 
 
+@_boundary("verify_snapshot")
 def _verify_snapshot(root, directory, identity, rows):
     commit = identity.get("commit", "")
     if (not isinstance(commit, str) or len(commit) != 40
@@ -473,6 +501,7 @@ def _verify_snapshot(root, directory, identity, rows):
             raise WfError("恢复清单与 Git tree 不符（rollback_target_unverified）")
 
 
+@_boundary("verified_baseline")
 def _verified_baseline(lock, path, kind=None):
     baseline = _read_record(path / "baseline.json")
     target = baseline.get("target", {})
@@ -501,6 +530,7 @@ def _verified_baseline(lock, path, kind=None):
     return baseline
 
 
+@_boundary("select_restore_target")
 def _select_restore_target(lock, selector):
     """标签只是已登记身份的名称；未登记 commit、任意新标签及移动标签均无授权。"""
     directory = _install_store(lock.root, lock.kind, create=False)
@@ -510,14 +540,14 @@ def _select_restore_target(lock, selector):
         commit = git(["rev-parse", "--verify", ref + "^{commit}"], lock.root).stdout.strip()
         if git(["show-ref", "--verify", "--quiet", "refs/tags/" + str(selector)],
                lock.root, check=False).returncode == 0:
-            for recorded_path in directory.glob("tx-*"):
+            for recorded_path in _install_jobs(directory, "tx-"):
                 for name in ("baseline.json", "completed.json"):
                     if os.path.lexists(recorded_path / name):
                         recorded = _read_record(recorded_path / name)
                         old = recorded.get("refs", {}).get(str(selector))
                         if old is not None and old != commit:
                             raise WfError("标签已偏离登记身份（rollback_target_unverified）")
-    for path in sorted(directory.glob("tx-*")):
+    for path in _install_jobs(directory, "tx-"):
         baseline = _verified_baseline(lock, path)
         candidates = [(baseline["baseline_id"], baseline["identity"], baseline["paths"], baseline,
                        baseline["refs"], baseline["target"]["protect"])]
@@ -549,6 +579,7 @@ def _select_restore_target(lock, selector):
     raise WfError("目标没有完整安装/基线授权（rollback_target_unverified）")
 
 
+@_boundary("restore_snapshot")
 def _restore_snapshot(lock, selected, protect, message, *, preflight=False):
     """先完成全部 nofollow/protect 预检，再写精确快照；不执行 checkout。"""
     lock.verify()
@@ -645,6 +676,7 @@ def _restore_file(path, data, mode):
             temp.unlink()
 
 
+@_boundary("recover_tx")
 def _recover_tx(lock, path):
     baseline = _verified_baseline(lock, path)
     protect = baseline["target"]["protect"]
@@ -861,6 +893,7 @@ def _copy_tree(src: Path, dst: Path, protect, skip=("RELEASE.json",), written=No
     return written
 
 
+@_boundary("delete")
 def _delete(root: Path, rels, protect, done=None) -> list:
     done = [] if done is None else done
     if os.environ.get("WF_TEST_FAIL_DELETE"):
@@ -924,6 +957,7 @@ def _restart_hints(inst: Instance, changed) -> list:
 
 # ---------------- 项目 ----------------
 
+@_boundary("apply_zip")
 def apply_zip(inst: Instance, zip_path=None, by="executor", *, review_id=None) -> dict:
     if not review_id:
         raise WfError("安装需要 review_id（unreviewed_install）")
@@ -1019,7 +1053,7 @@ def _pending_restores(lock):
         directory = lock.root / ("local/install" if kind == "tool" else "workflow/evidence/install")
         if not os.path.lexists(directory):
             continue
-        for path in directory.glob("restore-*"):
+        for path in _install_jobs(directory, "restore-"):
             if not os.path.lexists(path / "completed.json"):
                 out.append((path, _read_record(path / "prepared.json")))
     return out
@@ -1032,7 +1066,7 @@ def _public_restore(lock, selector, protect, message):
     for kind in ("project", "tool"):
         directory = lock.root / ("local/install" if kind == "tool" else "workflow/evidence/install")
         if os.path.lexists(directory):
-            pending_installs.extend(p for p in directory.glob("tx-*") if not any(
+            pending_installs.extend(p for p in _install_jobs(directory, "tx-") if not any(
                 os.path.lexists(p / n) for n in ("completed.json", "failed.json", "recovered.json")))
     if pending_installs and (pending_installs != [path] or not selected["is_baseline"]):
         raise WfError("须先恢复未闭合安装自身的基线（install_incomplete）")
@@ -1089,6 +1123,7 @@ def _public_restore(lock, selector, protect, message):
         raise
 
 
+@_boundary("restore_tree")
 def restore_tree(repo: Path, ref: str, message: str, protect=(), *, kind=None) -> tuple:
     """兼容 helper 也必须查目标自有安装授权并持锁；普通 commit 不构成许可。"""
     kind = kind or ("project" if (Path(repo) / "workflow/wf.json").is_file() else "tool")
@@ -1096,6 +1131,7 @@ def restore_tree(repo: Path, ref: str, message: str, protect=(), *, kind=None) -
         return _public_restore(lock, ref, list(protect), message)
 
 
+@_boundary("rollback")
 def rollback(inst: Instance, to: str, by="executor", *, baseline_id=None) -> dict:
     root = Path(inst.root).resolve(strict=True)
     with _InstallLock(root, "project", recovery=True) as lock:
@@ -1302,6 +1338,7 @@ def _hold_update_lock() -> None:
     _UPDATE_LOCK.append(fh)
 
 
+@_boundary("self_update")
 def self_update(zip_path=None, skip_test=False, allow_same=False, auto=False, *, review_id=None) -> dict:
     if not review_id:
         raise WfError("安装需要 review_id（unreviewed_install）")
@@ -1422,6 +1459,7 @@ def _restart_board() -> bool:
         return False
 
 
+@_boundary("self_rollback")
 def self_rollback(tag: str, *, baseline_id=None) -> dict:
     with _InstallLock(WF_HOME, "tool", recovery=True) as lock:
         selector = baseline_id or tag

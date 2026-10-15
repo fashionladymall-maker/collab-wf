@@ -66,6 +66,7 @@
 from __future__ import annotations
 
 import difflib
+from functools import wraps
 import hashlib
 import json
 import os
@@ -103,6 +104,42 @@ _SELF_CLAIM_KEYS = ("provenance", "raw_path", "verified", "model_verified", "rev
 
 
 # ---------------- 基础工具 ----------------
+
+_BOUNDARY_ERRORS = (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError,
+                    subprocess.SubprocessError)
+
+
+def _boundary(operation, *, code="review_boundary", decision=False):
+    """真实 I/O/持久结构边界：保留拒绝，保留 cause；不拦截进程中断。"""
+    def decorate(fn):
+        @wraps(fn)
+        def guarded(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except WfError:
+                raise
+            except _BOUNDARY_ERRORS as exc:
+                reason = f"{code}:{operation}:{type(exc).__name__}"
+                if decision:
+                    rid = kwargs.get("request_id") or (args[1] if len(args) > 1 else None)
+                    try:
+                        req = _load_request(rid)
+                    except (WfError, *_BOUNDARY_ERRORS):
+                        pass
+                    else:
+                        return {"schema": SCHEMA_DECISION, "request_id": req["request_id"],
+                                "content_id": req["content_id"], "phase": kwargs.get("phase", "review"),
+                                "state": "none", "verdict": None, "allowed": False, "reasons": [reason],
+                                "provenance": {"level": "unavailable", "synthetic": False,
+                                               "model_claimed": None, "model_verified": None,
+                                               "reviewer_identity": None, "verifier_sha256": None},
+                                "times": {k: None for k in ("review_started", "review_completed",
+                                                            "result_registered", "install_started")},
+                                "expires_at": None, "attempt_id": None, "diagnostics": [reason]}
+                raise WfError(f"{reason}: {exc}") from exc
+        return guarded
+    return decorate
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -153,7 +190,7 @@ def _check_id(rx, value, label) -> str:
 def _read_bytes(p: Path):
     try:
         return Path(p).read_bytes()
-    except OSError:
+    except FileNotFoundError:
         return None
 
 
@@ -182,18 +219,26 @@ def _write_atomic(p: Path, data: bytes) -> None:
 class _Lock:
     """宿主状态（尝试状态、按内容的登记）的短临界区。"""
 
+    @_boundary("lock_acquire")
     def __enter__(self):
         import fcntl
         p = _reviews() / ".lock"
         p.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(p, "a+")
-        fcntl.flock(self.f, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except BaseException:
+            self.f.close()
+            raise
         return self
 
+    @_boundary("lock_release")
     def __exit__(self, *a):
         import fcntl
-        fcntl.flock(self.f, fcntl.LOCK_UN)
-        self.f.close()
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+        finally:
+            self.f.close()
 
 
 # ---------------- 包解析（唯一的安装语义） ----------------
@@ -242,6 +287,7 @@ def _installed(rel: str, kind, protect) -> bool:
     return not core.matches_protect(rel, protect or [])
 
 
+@_boundary("read_package")
 def read_package(zip_path, *, kind=None, protect=None) -> dict:
     """解析一个版本包并给出完整的安装语义。返回：
     {sha256, bytes, top, entries:[{path, type: file|dir, mode, size, sha256, installed}], ignored:[成员名],
@@ -783,6 +829,7 @@ def _load_request(rid: str) -> dict:
     return doc
 
 
+@_boundary("prepare")
 def prepare(target, zip_path, *, kind, author=None) -> dict:
     t = _target(target, kind)
     snap, sha = _freeze(zip_path)
@@ -848,15 +895,24 @@ def _index_path(cid: str) -> Path:
 
 def _index(cid: str) -> dict:
     b = _read_bytes(_index_path(cid))
+    if b is None:
+        return {}
     try:
-        doc = json.loads(b.decode("utf-8")) if b else {}
+        doc = json.loads(b.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         doc = {"corrupt": True}
-    return doc if isinstance(doc, dict) else {"corrupt": True}
+    if (not isinstance(doc, dict) or doc.get("content_id") != cid or any(
+            not isinstance(doc.get(key), list)
+            or any(not isinstance(item, str) or not pattern.fullmatch(item) for item in doc[key])
+            for key, pattern in (("requests", _RID), ("attempts", _AID)))):
+        return {"corrupt": True}
+    return doc
 
 
 def _index_add(cid: str, request_id=None, attempt_id=None) -> None:
     doc = _index(cid)
+    if doc.get("corrupt"):
+        raise WfError("review_index_corrupt: refusing to replace damaged index")
     doc.setdefault("requests", [])
     doc.setdefault("attempts", [])
     if request_id and request_id not in doc["requests"]:
@@ -879,7 +935,15 @@ def _load_attempt(aid: str):
         doc = json.loads(b.decode("utf-8")) if b else None
     except (UnicodeDecodeError, ValueError):
         return None
-    return doc if isinstance(doc, dict) and doc.get("schema") == SCHEMA_ATTEMPT and doc.get("attempt_id") == aid else None
+    if not (isinstance(doc, dict) and doc.get("schema") == SCHEMA_ATTEMPT and doc.get("attempt_id") == aid):
+        return None
+    if (any(not isinstance(doc.get(key, {}), dict) for key in ("times", "files", "sent", "runner", "verifier"))
+            or not isinstance(doc.get("diagnostics", []), list)):
+        return None
+    for key in ("files", "sent"):
+        if any(not isinstance(value, dict) for value in doc.get(key, {}).values()):
+            return None
+    return doc
 
 
 def _save_attempt(doc: dict) -> None:
@@ -901,6 +965,7 @@ def _attempts_of(cid: str, problems=None) -> list:
     return out
 
 
+@_boundary("cancel")
 def cancel(request_id: str) -> int:
     req = _load_request(request_id)
     n = 0
@@ -991,6 +1056,7 @@ def _last_json(b: bytes):
     return (obj if isinstance(obj, dict) else None), last
 
 
+@_boundary("run")
 def run(request_id: str, *, timeout_s=None) -> dict:
     req = _load_request(request_id)
     pre = _snapshot_ok(req)
@@ -1267,6 +1333,7 @@ def _safe_request(rid):
         return None
 
 
+@_boundary("status", decision=True)
 def status(target, request_id=None, *, content_id=None, phase="review", now=None) -> dict:
     if phase not in ("review", "install"):
         raise WfError(f"phase 只能是 review 或 install，不是 {phase!r}")
@@ -1311,6 +1378,7 @@ def _snapshot_package(req: dict) -> dict:
     return pkg
 
 
+@_boundary("load_install_request")
 def load_install_request(request_id: str, *, target, kind, zip_path=None) -> dict:
     """核实真实消费者的请求/包/目标绑定，不执行审查、不写开始记录，也不授予安装许可。
     caller ZIP 只允许作为旧调用的 raw SHA 断言；安装字节必须来自 extract_snapshot。"""
@@ -1342,6 +1410,7 @@ def load_install_request(request_id: str, *, target, kind, zip_path=None) -> dic
         raise WfError(f"安装请求不可用（{type(e).__name__}）：{e}") from e
 
 
+@_boundary("extract_snapshot")
 def extract_snapshot(request_id: str, dest) -> Path:
     req = _load_request(request_id)
     pkg = _snapshot_package(req)
@@ -1359,6 +1428,7 @@ def extract_snapshot(request_id: str, dest) -> Path:
     return root
 
 
+@_boundary("verify_extracted")
 def verify_extracted(request_id: str, root) -> list:
     if root is None:
         raise WfError("解包复核需要实际目录（extracted_dir_required）")
@@ -1396,6 +1466,7 @@ def verify_extracted(request_id: str, root) -> list:
     return problems
 
 
+@_boundary("final_check")
 def final_check(request_id: str, *, target, extracted_dir=None, now=None) -> dict:
     d = status(target, request_id, phase="install", now=now)
     if extracted_dir is not None:
@@ -1406,6 +1477,7 @@ def final_check(request_id: str, *, target, extracted_dir=None, now=None) -> dic
     return d
 
 
+@_boundary("consume")
 def consume(request_id: str, *, target, extracted_dir, now=None, install_context=None) -> dict:
     """在登记审查结果所用的同一把锁内：重算全部结论（final_check）并写安装开始记录。登记 block 与消费因此按锁的先后
     线性排列：先登记的 block 一定被看到；锁释放之前任何结果都登记不进来。"""
