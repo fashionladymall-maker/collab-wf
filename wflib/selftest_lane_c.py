@@ -2344,6 +2344,105 @@ def _t_c2c_collection(_ok):
                 (LOCAL / "transport.json").write_bytes(saved_transport)
 
 
+def _t_c5_materials(_ok):
+    """The C5 preparatory reader freezes files but cannot attest an install."""
+    from . import live
+    from types import SimpleNamespace
+    old_local = live.LOCAL
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td).resolve()
+        tool, project, local = root / "tool", root / "project", root / "local"
+        project.mkdir()
+        local.mkdir()
+        tool.mkdir()
+        inst = SimpleNamespace(root=project, name="c5-synthetic")
+        live.LOCAL = local
+        try:
+            collect = lambda: live.collect_install_materials(inst, tool_root=tool)
+            absent = collect()
+            _ok("C5 材料：缺失安装源显式 absent，采集不写目录、不授予",
+                absent["state"] == "collected" and absent["authorization"] == "unavailable"
+                and absent["descriptor"]["complete"] is False
+                and all(d["state"] == "absent" for d in absent["descriptor"]["directories"])
+                and list(local.iterdir()) == [])
+            tx = tool / "local/install/tx-synthetic"
+            tx.mkdir(parents=True)
+            history = tx / "prepared.json"
+            history.write_text('{"schema":"install_tx/1","state":"prepared","synthetic":true}')
+            blob = tx / "blobs/raw"
+            blob.parent.mkdir()
+            blob.write_bytes(b"\x00raw baseline bytes")
+            review = local / "reviews/content/example/index.json"
+            review.parent.mkdir(parents=True)
+            review.write_text('{"requests":[],"attempts":[],"synthetic":true}')
+            verifier = local / "verifier.py"
+            verifier.write_text("# synthetic verifier bytes only; never executed\n")
+            (local / "transport.json").write_text(json.dumps(
+                {"review_verifier": {"path": str(verifier), "sha256": "0" * 64, "synthetic": True}}))
+            good = collect()
+            paths = {s["path"] for s in good["descriptor"]["sources"]}
+            _ok("C5 材料：真实文件读取覆盖安装记录、baseline blob、review 索引、当前配置及 verifier 字节",
+                {str(history), str(blob), str(review), str(verifier)} <= paths
+                and good["documents"][str(history)]["state"] == "prepared")
+            _ok("C5 材料：相同源重复采集完全稳定", collect() == good)
+            keep = blob.read_bytes()
+            blob.write_bytes(keep + b"changed")
+            _ok("C5 材料：baseline blob 改变使材料摘要失效",
+                collect()["materials_sha256"] != good["materials_sha256"])
+            blob.write_bytes(keep)
+            extra = tx / "late.json"
+            extra.write_text('{"state":"late","synthetic":true}')
+            _ok("C5 材料：新增 late/failed 来源重新枚举，不能沿用旧文件列表",
+                collect()["materials_sha256"] != good["materials_sha256"]
+                and str(extra) in collect()["documents"])
+            extra.unlink()
+            before = history.read_bytes()
+            history.write_bytes(b'{"state":"prepared","state":"completed"}')
+            try:
+                collect()
+                state = "unexpected_success"
+            except live._InputProblem as e:
+                state = e.state
+            _ok("C5 材料：坏 JSON 重复键返回 corrupt", state == "corrupt", state)
+            history.write_bytes(before)
+            link = tx / "linked"
+            link.symlink_to(blob)
+            try:
+                collect()
+                state = "unexpected_success"
+            except live._InputProblem as e:
+                state = e.state
+            _ok("C5 材料：真实文件 symlink 保持 unsupported", state == "unsupported", state)
+            link.unlink()
+            original = live._file_source
+            changed = []
+
+            def mutate_after_read(path):
+                value = original(path)
+                if str(path) == str(history) and not changed:
+                    changed.append(True)
+                    history.write_bytes(before + b" ")
+                return value
+            try:
+                live._file_source = mutate_after_read
+                try:
+                    collect()
+                    state = "unexpected_success"
+                except live._InputProblem as e:
+                    state = e.state
+                _ok("C5 材料：首次读取后的漂移在冻结复核中返回 changed", state == "changed", state)
+            finally:
+                live._file_source = original
+                history.write_bytes(before)
+            history.write_text('{"granted":true,"allowed":true,"synthetic":true}')
+            forged = collect()
+            _ok("C5 材料：自报 granted/allowed 只作为原始材料保留，授权仍 unavailable",
+                forged["documents"][str(history)]["granted"] is True
+                and forged["authorization"] == "unavailable" and forged["descriptor"]["complete"] is False)
+        finally:
+            live.LOCAL = old_local
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
          ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals), ("指标 C3", _t_metrics),
          ("指标真实 API C3", _t_metrics_real_api),
@@ -2352,7 +2451,8 @@ TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景
          ("运行输入与 observer C2b FIX2", _t_mech_runtime_inputs),
          ("site 启动与中央缓存 C2b FIX3", _t_mech_startup_inputs),
          ("禁用 distutils 模板 C2b FIX4", _t_mech_disabled_pth),
-         ("严格冻结采集与共同周期 C2c-1", _t_c2c_collection)]
+         ("严格冻结采集与共同周期 C2c-1", _t_c2c_collection),
+         ("只读安装历史材料 C5", _t_c5_materials)]
 
 
 def run_lane_c(_ok) -> None:
