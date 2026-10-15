@@ -1736,8 +1736,8 @@ def h_review(ctx):
                 return _to_report(ctx) if r[0] == "report" else r
             for f in policy.release_findings(inst, src, ctx.pol):
                 findings.append(f"版本包 {f['file']}：{f['why']}")
-            if anomaly.transport_cfg().get("review"):
-                findings += _independent_review(ctx, src, cand[0])
+            # Mandatory installation review runs after baseline gates and dirty
+            # worktree saving in h_apply, against the final frozen material.
         if not ctx.pol.get("auto_apply", True):
             findings.append(f"版本包 {rel}：policy 设定落地版本需要用户批准")
         st["release_path"] = cand[0]
@@ -1917,16 +1917,26 @@ def h_apply(ctx):
         return "progress", "没有待落地的版本"
     gates = ctx.pol.get("gates") or []
     prev = inst.version()
-    base = _run_gates(ctx, gates, "baseline") if gates else {}
     try:
-        before = {k: {"approved": policy.status(inst, k)["approved"], "sha": policy.sha256(inst.wf / f"{k}.json")}
-                  for k in ("policy", "goals")}
-        _save_dirty(ctx)   # 1.6.1：工作区里未经交付的改动先存成一个提交（含疑似密钥时不存，照旧停下）
-        r = release.apply_zip(inst, Path(path), by="driver")
+        from .driver_review import Attempt
+        with Attempt(inst, path) as attempt:
+            base = _run_gates(ctx, gates, "baseline") if gates else {}
+            before = {k: {"approved": policy.status(inst, k)["approved"], "sha": policy.sha256(inst.wf / f"{k}.json")}
+                      for k in ("policy", "goals")}
+            _save_dirty(ctx)   # Finish baseline writes before freezing review.
+            configured_timeout = int(anomaly.transport_cfg().get("review_timeout_s") or 900)
+            rid = attempt.reviewed_request(timeout_s=max(1, min(configured_timeout, int(ctx.time_left()))))
+            r = release.apply_zip(inst, Path(path), by="driver", review_id=rid)
+            attempt.complete(r)
         _auto_approve_neutral(ctx, before, r.get("version"))
-    except WfError as e:
-        res = _anomaly(ctx, {"source": "apply", "text": str(e)}, str(e).splitlines()[0])
-        return _to_report(ctx) if res[0] == "report" else res
+    except (WfError, OSError, ValueError, TypeError) as e:
+        # This mandatory gate cannot be converted into automatic retry/report by
+        # project anomaly rules, or approved through the old optional adapter.
+        text = f"安装审查/安装未闭合：{e}"
+        machine.go(inst, "BLOCKED", by="driver", reason=text, blocked_from="APPLY", block_reason=text)
+        inst.state["needs_text"] = text
+        inst.save()
+        return "user", text
     st = inst.state
     st.pop("release_path", None)
     if gates:

@@ -47,6 +47,8 @@ def _reply(cmds, checklist, directives, effort="medium"):
 
 def run(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     print("  —— 驱动器 ——", flush=True)
+    from .selftest_driver_review import run as run_review_consumer
+    run_review_consumer(_ok)
     fake = tmp / "fake"
     (fake / "replies").mkdir(parents=True)
     ft = tmp / "ft.py"
@@ -58,7 +60,11 @@ def run(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
         w.chmod(0o755)
     local = Path(env["WF_LOCAL_DIR"])
     local.mkdir(parents=True, exist_ok=True)
+    from .selftest import _synthetic_review_host
+    _synthetic_review_host(env, tmp)
+    review_cfg = json.loads((local / "transport.json").read_text())
     (local / "transport.json").write_text(json.dumps({
+        **review_cfg, "driver_review": {"schema": "driver-review/1", "author": "selftest"},
         "send": str(tmp / "t-send"), "poll": str(tmp / "t-poll"), "quota": str(tmp / "t-quota"),
         "model": "test-model", "timeout_s": 30, "env": {"FAKE_DIR": str(fake)}}))
 
@@ -174,7 +180,8 @@ def run(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
 
     # 回退与暂停
     rc, o = _wf(env, p, "undo", "--note", "测试回退")
-    _ok("undo：回退到上一个版本并暂停", rc == 0 and _state(p).get("paused") and not (p / "done.txt").exists(), o)
+    _ok("undo：控制配置已改变时拒绝旧目标，保持当前交付并暂停",
+        rc != 0 and "rollback_protected" in o and _state(p).get("paused") and (p / "done.txt").exists(), o)
     rc, o = _wf(env, p, "run")
     _ok("暂停时驱动器不做任何事（退出码 20）", rc == 20 and "暂停" in o, o)
     _user(_wf, env, p, "unpause", "unpause")
@@ -546,10 +553,8 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _ok("1.6.8 下一轮干净且目标仍达成：照常进入 DONE（退出码 30）", rc9 == 30 and _state(df)["state"] == "DONE", o9)
 
     # C. 独立审查适配器认为应阻止 → 停下等用户
-    rv = tmp / "t-review"
-    rv.write_text('#!/bin/sh\necho \'{"verdict": "block", "model": "test-reviewer", "notes": ["测试：发现问题"]}\'\n')
-    rv.chmod(0o755)
-    (local / "transport.json").write_text(json.dumps({**tcfg, "review": str(rv)}))
+    behavior = Path(tcfg["review"]).with_name("behavior.json")
+    behavior.write_text(json.dumps({"verdict": "block", "model": "test-reviewer"}))
     r = setup("rev", base_pol)
     _wf(env, r, "kick", "--message", str(task))
     _wf(env, r, "run")
@@ -562,6 +567,7 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     rc, o = _wf(env, r, "run")
     _ok("独立审查认为应阻止：不落地，停下等用户并注明审查模型", rc == 20 and "test-reviewer" in o
         and not (r / "app.py").exists(), o)
+    behavior.write_text("{}")
     (local / "transport.json").write_text(json.dumps(tcfg))
 
     # D. 全局限速
