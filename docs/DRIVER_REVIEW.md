@@ -33,11 +33,13 @@ root、project name、created 身份、轮次、包 SHA、content_id 与基准 h
 恢复时先核对目标安装事务及实际版本。若仍需安装，修复宿主配置后显式执行：
 
 ```bash
+wf force APPLY --reason "已核对安装记录，重新送审"
 wf review prepare package.zip --kind project --author 作者车道 --json
 wf review run 新request_id
 wf apply package.zip --review-id 新request_id
 ```
 
-CLI 会重新核对并消费这个新请求；成功后进入执行阶段。也可以让作者在新轮次
+恢复到 APPLY 必须先于 prepare，以固定送审时的目标状态。CLI 会重新核对并消费
+这个新请求；成功后进入执行阶段。也可以让作者在新轮次
 重新交付。旧意图保留作证据，不需要删除它来恢复。若安装事务未闭合，先按安装器
 诊断恢复该事务基线；新的审查请求不代替事务恢复。

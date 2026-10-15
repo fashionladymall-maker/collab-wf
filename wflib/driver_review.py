@@ -202,7 +202,8 @@ class Attempt:
 
     def recovery(self, text):
         return (f"{text}（driver_review_incomplete，request_id={self.request_id or '尚未登记'}）。"
-                "核对目标安装记录并修复配置后，可显式执行 wf review prepare <zip> --kind project --author <lane> --json，"
+                "核对目标安装记录并修复配置后，先显式执行 wf force APPLY --reason \"已核对安装记录，重新送审\"，"
+                "再 wf review prepare <zip> --kind project --author <lane> --json，"
                 "再 wf review run <新ID>，最后 wf apply <zip> --review-id <新ID>；或让作者重新交付到新轮次。")
 
     def complete(self, result):
