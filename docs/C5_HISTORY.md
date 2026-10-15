@@ -245,9 +245,8 @@ its legacy rows block authorization. Window `complete` is true only when
 structured receipts exist, so such a window is collected but explicitly
 incomplete. Pre-receipt events are classified from the event command, which
 ops truncates to 300 characters; structured invocations use the full metadata
-command. A direct `live.check` without structured receipts keeps the
-non-snapshot reporting path; its report is identical because criterion 4 and
-apply attribution do not depend on these unknown rows.
+command. Direct `live.check` routing is described under install transactions
+below.
 
 ## Install transactions without exec receipts
 
@@ -318,13 +317,34 @@ project's exec during this window is unbound here and blocks this window
 conservatively. Goals re-evaluate and compare `install_transactions` like the
 other derived facts.
 
+### Direct `live.check`
+
+A direct `live.check` uses the same frozen collection as goals
+(`_capture_inputs` → `_evaluate_snapshot`) whenever the window has history
+facts, so it lists the same unbound transactions, criterion-4 counts and
+decision (`live._direct_history_route`):
+
+- `strict`: a structured receipt exists, or a transaction store holds a
+  `tx-*`/`restore-*` member or cannot be listed. A capture problem returns the
+  explicit `input_problem` report; it never falls back to a report that omits
+  the transaction.
+- `legacy`: only classified legacy/inner exec commands. If strict capture is
+  impossible, the legacy report is returned with
+  `authorization = {state: unavailable, why: [install_history_uncollected],
+  input_problem}`.
+- otherwise (an ordinary window without transactions) the report is
+  unchanged.
+
+The store listing used for routing is not evaluated; the frozen listing is.
+On the frozen path with history, the report carries
+`authorization` (`live-report-authorization/1`: `state`, ordered `why`,
+`unbound_transactions`), identical for direct and snapshot use and bound into
+`report_sha256`.
+
 Boundaries: when B's provider already reads a store for a bound history, it
 reads it strictly, so a store fault there still aborts that collection as
-before. A direct non-snapshot `live.check` without structured receipts keeps
-the legacy reporting path and does not list exec-less transactions; the
-collection used by goals does. Capture uses the process `WF_HOME` as tool
-root, so a fixture that does not isolate `WF_HOME` sees that host's real tool
-store.
+before. Capture and routing use the process `WF_HOME` as tool root, so a
+fixture that does not isolate `WF_HOME` sees that host's real tool store.
 
 `live._legacy_install` tokenizes with a quote-aware shell lexer and recognizes direct
 `wf`/`wf.py` invocations (any path, including `python3 '<space path>/wf.py'`),
@@ -336,11 +356,18 @@ options and the `apply` (project), `self-update` (tool) and `drill review`
 targets, numeric file-descriptor prefixes, comments and here-document bodies
 as non-commands, skips reserved words (`if`/`then`/`do`/`{`/`!` …), splits on
 unquoted newlines, and recursively checks `$(...)` and backquote bodies,
-including those inside double quotes and unquoted here-documents. A command
+including those inside double quotes and unquoted here-documents. Function
+definitions (`name() {...}`, `name() (...)`, `function name {...}`) do not run:
+their bodies, including substitutions and here-documents inside them, count
+only where the function is invoked later in the same command (also through
+`$(name)`, `eval` or another function). A function shadows a command of the
+same name, including `wf`; `command`, `env`, `exec` and other wrappers bypass
+functions. A command
 that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
 unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
 diagnostic only; no installation reference is derived from a basename or
-command string. Scripts, aliases, functions and variables are not classified. Criterion 4 counts tool references and legacy tool entries; the legacy
+command string. Scripts, aliases, variables and functions defined outside the
+command (for example in a sourced file) are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
 report path reads the parsed first package operand and reports
 `旧版安装命令无法解析（unknown）` when none exists. A missing legacy package or
 review result is frozen as an absent source and reported (`没有记录` /

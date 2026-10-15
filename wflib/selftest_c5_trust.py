@@ -152,9 +152,10 @@ class ProductionTrustTests(_Fixture):
         self.assertEqual(live._evaluate_snapshot(snap), before)
         self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
         self.assertNotEqual(self.item(inst)["layer"], "verified")
-        # A recreated file is a new identity: the old grant stays invalid until
-        # a fresh collection is committed.
-        self.registry.write_bytes(raw)
+        # A registry written again (here with different bytes, so the check does
+        # not depend on inode reuse) keeps the old grant invalid until a fresh
+        # collection is committed.
+        self.registry.write_bytes(raw + b" ")
         self.assertFalse(self.item(inst)["collection"]["valid"])
         self.assertIs(self.run_goal(inst)["granted"], True)
         self.assertEqual(self.item(inst)["layer"], "verified")
@@ -635,6 +636,20 @@ class LegacyEntryTests(_Fixture):
         self.assertIs(verified["granted"], False)
         self.assertIn("install_history:unknown", verified["why"])
 
+    def test_uncalled_function_definition_is_not_an_install(self):
+        """Real ops.run_exec: defining (not calling) a function that mentions wf."""
+        inst = self.fixture()
+        self.assertTrue(self.evaluate(inst)["report"]["summary"]["passed_strict"])
+        rc = ops.run_exec(inst, "helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary", by="driver")
+        self.assertEqual(rc, 0)
+        seq = live._strict_log(inst.events_path.read_bytes(), inst.events_path)[-1]["seq"]
+        result = self.evaluate(inst)
+        self.assertFalse([r for r in result["window_inputs"]["review_inputs"]["entries"] if r.get("seq") == seq])
+        criterion = next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(criterion["attempts"], {"total": 1, "ok": 1, "timeout": 0, "unknown": 0, "failed": 0})
+        self.assertTrue(result["report"]["summary"]["passed_strict"])
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+
     def test_pre_receipt_events_and_classifier(self):
         reader = SimpleNamespace(bytes=lambda path: None,
                                  directory=lambda path: {"state": "absent", "members": []})
@@ -679,6 +694,13 @@ class LegacyEntryTests(_Fixture):
             "wf apply r.zip > log 2>&1": ("project", "r.zip"),
             "cat <<EOF\n$(wf apply here.zip)\nEOF": ("project", "here.zip"),
             "echo x # note\nwf apply after.zip": ("project", "after.zip"),
+            "helper() { wf self-update used.zip; }; helper": ("tool", "used.zip"),
+            "function h { wf apply fn.zip; }\nh": ("project", "fn.zip"),
+            'f() { echo "$(wf apply sub.zip)"; }; f': ("project", "sub.zip"),
+            'f() { wf apply out.zip; }; echo "$(f)"': ("project", "out.zip"),
+            "g() { f; }; f() { wf apply late.zip; }; g": ("project", "late.zip"),
+            "wf() { echo shadow; }; command wf apply real.zip": ("project", "real.zip"),
+            "f() ( wf apply paren.zip ); f > log": ("project", "paren.zip"),
         }
         for command, (kind, argument) in positives.items():
             got = live._legacy_install(command)
@@ -689,7 +711,11 @@ class LegacyEntryTests(_Fixture):
                         "echo ';' wf apply x.zip", "echo '&&' wf self-update y.zip", "printf '%s\\n' '|' wf apply x",
                         "echo hi > wf apply x.zip", "make # wf apply x.zip", "cat <<'EOF'\nwf apply x.zip\nEOF",
                         "cat <<EOF\nwf apply x.zip\nEOF", 'echo "a; wf apply x.zip"', "echo a\\;wf apply x",
-                        "cat <<< wf apply x"):
+                        "cat <<< wf apply x",
+                        "helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary",
+                        "function helper { wf apply x.zip; }", "f() ( wf apply x.zip )",
+                        'f() { echo "$(wf apply x.zip)"; }', "f() {\ncat <<EOF\n$(wf apply x.zip)\nEOF\n}",
+                        "wf() { echo shadow; }; wf apply x.zip", "helper; helper() { wf apply x.zip; }"):
             self.assertIsNone(live._legacy_install(command), command)
         unparsable = live._legacy_install("wf apply 'x.zip")
         self.assertEqual((unparsable["parsed"], unparsable["kind"], unparsable["argument"]), (False, None, None))
@@ -744,6 +770,83 @@ class ExeclessWindowTests(_Fixture):
         verified = self.run_goal(inst)
         self.assertIs(verified["granted"], False)
 
+    def direct_matches_frozen(self, legacy):
+        from unittest.mock import patch
+        inst, _ = self.legacy_only_fixture(legacy)
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        self.assertEqual(sum(e["type"] == "exec" for e in events), len(legacy))
+        self.assertIsNone(live._direct_history_route(inst, events))
+        before = live._capture_inputs(inst, rounds=1)
+        direct = live.check(inst, rounds=1)
+        self.assertEqual(direct, live._evaluate_snapshot(before)["report"])
+        self.assertNotIn("authorization", direct)   # ordinary window: unchanged legacy report
+        self.blocked_after_prepare(inst)
+        self.assertIs(live._revalidate_inputs(inst, before.descriptor)["valid"], False)
+        self.assertEqual(live._direct_history_route(inst, events), "strict")
+        calls = []
+        original = live._capture_inputs
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        with patch.object(live, "_capture_inputs", counted):
+            direct = live.check(inst, rounds=1)
+        self.assertEqual(len(calls), 1)   # the same frozen collection, no second path
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        self.assertEqual(direct, result["report"])
+        criterion = next(c for c in direct["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(criterion["status"], "attempt_failed")
+        self.assertEqual(criterion["attempts"], {"total": 1, "ok": 0, "timeout": 0, "unknown": 0,
+                                                 "unbound_transactions": 1, "failed": 1})
+        unbound = direct["authorization"]["unbound_transactions"]
+        self.assertEqual([(u["store"], u["state"], u["turn"], u["attribution"]) for u in unbound],
+                         [("project", "failed", 1, "turn")])
+        self.assertIn(unbound[0]["id"], criterion["why"])
+        self.assertEqual(direct["authorization"]["state"], "unavailable")
+        self.assertIn("install_history:failed", direct["authorization"]["why"])
+        self.assertFalse(direct["summary"]["passed_strict"])
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")), \
+             patch.object(live, "_directory_source", side_effect=AssertionError("replay listed disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        return inst
+
+    def test_direct_check_zero_exec_window_lists_execless_transaction(self):
+        self.direct_matches_frozen({})
+
+    def test_direct_check_true_only_window_lists_execless_transaction(self):
+        inst = self.direct_matches_frozen({"plain": "true"})
+        # A transaction window never falls back to a report that omits it.
+        cfg = json.loads(self.env.transport.read_bytes())
+        adapter = Path(cfg["log"])
+        adapter.write_text(adapter.read_text().replace('"root"', '"elsewhere"'), encoding="utf-8")
+        report = live.check(inst, rounds=1)
+        self.assertEqual((report["rounds"], report["passed"], report["input_problem"]["state"]), ([], False, "unknown"))
+        self.assertNotIn("authorization", report)
+
+    def test_direct_check_pure_legacy_window(self):
+        inst, _ = self.legacy_only_fixture()
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        self.assertEqual(live._direct_history_route(inst, events), "legacy")
+        result = self.evaluate(inst)
+        direct = live.check(inst, rounds=1)
+        self.assertEqual(direct, result["report"])
+        self.assertEqual(direct["authorization"]["state"], "unavailable")
+        self.assertIn("install_history:unknown", direct["authorization"]["why"])
+        # When strict capture is impossible the legacy report stays available,
+        # with the uncollected history made explicit.
+        cfg = json.loads(self.env.transport.read_bytes())
+        adapter = Path(cfg["log"])
+        adapter.write_text(adapter.read_text().replace('"root"', '"elsewhere"'), encoding="utf-8")
+        report = live.check(inst, rounds=1)
+        self.assertTrue(report["rounds"])
+        self.assertEqual((report["authorization"]["state"], report["authorization"]["why"],
+                          report["authorization"]["input_problem"]["state"]),
+                         ("unavailable", ["install_history_uncollected"], "unknown"))
+        self.assertEqual({k: v for k, v in report.items() if k != "authorization"},
+                         live.check(inst, rounds=1, _route=False))
+
     def test_store_and_record_faults_are_explicit(self):
         import shutil
         from unittest.mock import patch
@@ -770,6 +873,10 @@ class ExeclessWindowTests(_Fixture):
         self.assertEqual(result["install_transactions"]["stores"][1]["state"], "fault")
         with patch.object(live, "_directory_source", side_effect=AssertionError("replay listed disk")):
             self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+        self.assertEqual([(u["store"], u["state"]) for u in result["report"]["authorization"]["unbound_transactions"]],
+                         [("tool", "corrupt")])
+        self.assertEqual(result["report"]["authorization"]["state"], "unavailable")
         tool_store.unlink()
         # Project store is not a directory.
         store = inst.evidence / "install"

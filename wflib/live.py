@@ -155,22 +155,23 @@ def _body_substitutions(text):
     return out
 
 
-def _shell_parse(cmd):
+def _shell_tokens(cmd):
     """Minimal quote-aware POSIX shell lexer for classification only.
 
-    Returns ``(segments, substitutions)``. Quoted text never becomes an
-    operator; comments, redirection targets, file-descriptor prefixes and
-    here-document bodies are not commands; ``$(...)`` and backquote bodies
-    (also inside double quotes and unquoted here-documents) are returned for a
-    recursive check. Raises ValueError for unterminated constructs.
+    Returns ``("word", text, substitutions)``, ``("op", separator)`` and
+    ``("subs", bodies)`` tokens. Quoted text never becomes an operator;
+    comments, redirection targets, file-descriptor prefixes and here-document
+    bodies are not words; ``$(...)`` and backquote bodies (also inside double
+    quotes and unquoted here-documents) stay attached to the word or command
+    that would run them. Raises ValueError for unterminated constructs.
     """
-    segments, current, subs, heredocs = [], [], [], []
-    word, in_word, quoted = [], False, False
+    tokens, heredocs = [], []
+    word, in_word, quoted, subs = [], False, False, []
     redirect_target, delimiter = False, None
     i, n = 0, len(cmd)
 
     def end_word():
-        nonlocal word, in_word, quoted, redirect_target, delimiter
+        nonlocal word, in_word, quoted, subs, redirect_target, delimiter
         if not in_word:
             return
         text = "".join(word)
@@ -179,15 +180,11 @@ def _shell_parse(cmd):
             delimiter = None
         elif redirect_target:
             redirect_target = False
+            if subs:
+                tokens.append(("subs", subs))
         else:
-            current.append(text)
-        word, in_word, quoted = [], False, False
-
-    def end_segment():
-        nonlocal current
-        end_word()
-        segments.append(current)
-        current = []
+            tokens.append(("word", text, subs))
+        word, in_word, quoted, subs = [], False, False, []
 
     while i < n:
         c = cmd[i]
@@ -195,8 +192,10 @@ def _shell_parse(cmd):
             end_word()
             i += 1
         elif c == "\n":
-            end_segment()
+            end_word()
+            tokens.append(("op", "\n"))
             i += 1
+            bodies = []
             for delim, strip_tabs, was_quoted in heredocs:
                 body = []
                 while i < n:
@@ -206,8 +205,10 @@ def _shell_parse(cmd):
                         break
                     body.append(line)
                 if not was_quoted:
-                    subs.extend(_body_substitutions("\n".join(body)))
+                    bodies.extend(_body_substitutions("\n".join(body)))
             heredocs.clear()
+            if bodies:
+                tokens.insert(len(tokens) - 1, ("subs", bodies))
         elif c == "#" and not in_word:
             j = cmd.find("\n", i)
             i = n if j < 0 else j
@@ -264,7 +265,7 @@ def _shell_parse(cmd):
             op = next(o for o in _SHELL_OPERATORS if cmd.startswith(o, i))
             i += len(op)
             if op in _SHELL_REDIRECTS:
-                if in_word and not quoted and "".join(word).isdigit():
+                if in_word and not quoted and not subs and "".join(word).isdigit():
                     word, in_word = [], False   # file-descriptor prefix such as 2>
                 else:
                     end_word()
@@ -273,41 +274,94 @@ def _shell_parse(cmd):
                 else:
                     redirect_target = True
             else:
-                end_segment()
+                end_word()
+                tokens.append(("op", op))
         else:
             word.append(c)
             in_word = True
             i += 1
-    end_segment()
-    return segments, subs
+    end_word()
+    return tokens
 
 
-def _legacy_install(cmd, _depth=0):
-    """Classify a shell command as a direct legacy ``wf apply``/``wf self-update``.
+def _function_body(tokens, j):
+    """Tokens of a ``{ ...; }`` or ``( ... )`` function body starting at j."""
+    if j < len(tokens) and tokens[j][0] == "word" and tokens[j][1] == "{":
+        depth, k = 1, j + 1
+        while k < len(tokens):
+            token = tokens[k]
+            at_command = k == j + 1 or tokens[k - 1][0] == "op"
+            if token[0] == "word" and at_command and token[1] in ("{", "}"):
+                depth += 1 if token[1] == "{" else -1
+                if depth == 0:
+                    return tokens[j + 1:k], k + 1
+            k += 1
+        raise ValueError("unterminated function body")
+    if j < len(tokens) and tokens[j] == ("op", "("):
+        depth, k = 1, j + 1
+        while k < len(tokens):
+            if tokens[k] in (("op", "("), ("op", ")")):
+                depth += 1 if tokens[k][1] == "(" else -1
+                if depth == 0:
+                    return tokens[j + 1:k], k + 1
+            k += 1
+        raise ValueError("unterminated function body")
+    raise ValueError("unsupported function body")
 
-    Returns ``None`` for ordinary commands, else ``{schema, entry, kind, parsed,
-    argument}``. ``argument`` is only the first positional package operand used
-    by the legacy report path; it is never an installation reference and never
-    authorizes anything. Commands that mention a wf entry point but cannot be
-    tokenized are returned with ``parsed=False`` and ``kind=None`` (explicitly
-    unknown). Indirection through scripts, aliases, functions or variables is
-    outside this reporting classifier.
+
+def _shell_items(tokens):
+    """Ordered ``("seg", argv, substitutions)`` and ``("def", name, items)``.
+
+    A function definition (``name() {...}``, ``name() (...)``,
+    ``function name {...}``) is recorded, not executed: its body runs only
+    where the function is later invoked.
     """
     import re
-    if not isinstance(cmd, str) or not cmd.strip() or _depth > 3:
-        return None
-    try:
-        segments, substitutions = _shell_parse(cmd)
-    except ValueError:
-        mentions = re.search(r"(?:^|[\s/'\"`;&|(])wf(?:\.py)?(?=['\"\s`]|$)", cmd) \
-            and re.search(r"(?<![\w-])(?:apply|self-update|drill)(?![\w-])", cmd)
-        return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False,
-                "argument": None} if mentions else None
-    hits = [_legacy_simple(argv, _depth) for argv in segments] \
-        + [_legacy_install(body, _depth + 1) for body in substitutions]
-    hits = [hit for hit in hits if hit is not None]
+    items, argv, subs = [], [], []
+    i, n = 0, len(tokens)
+
+    def flush():
+        nonlocal argv, subs
+        if argv or subs:
+            items.append(("seg", argv, subs))
+        argv, subs = [], []
+
+    while i < n:
+        token = tokens[i]
+        if token[0] == "op":
+            flush()
+            i += 1
+            continue
+        if token[0] == "subs":
+            subs = subs + list(token[1])
+            i += 1
+            continue
+        if not argv and not subs:
+            name, j = None, None
+            if i + 2 < n and tokens[i + 1] == ("op", "(") and tokens[i + 2] == ("op", ")") \
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", token[1]) and token[1] not in _SHELL_RESERVED:
+                name, j = token[1], i + 3
+            elif token[1] == "function" and i + 1 < n and tokens[i + 1][0] == "word":
+                name, j = tokens[i + 1][1], i + 2
+                if j + 1 < n and tokens[j] == ("op", "(") and tokens[j + 1] == ("op", ")"):
+                    j += 2
+            if name is not None:
+                while j < n and tokens[j] == ("op", "\n"):
+                    j += 1
+                body, i = _function_body(tokens, j)
+                items.append(("def", name, _shell_items(body)))
+                continue
+        argv.append(token[1])
+        subs = subs + list(token[2])
+        i += 1
+    flush()
+    return items
+
+
+def _pick_legacy(hits):
     # Precedence: an inner review anywhere wins (its child references must never
     # reach the provider), then the first parsed install entry, then unknown.
+    hits = [hit for hit in hits if hit is not None]
     for wanted in (lambda h: h["kind"] == "inner_review", lambda h: h["kind"] is not None, lambda h: True):
         found = next((hit for hit in hits if wanted(hit)), None)
         if found is not None:
@@ -315,12 +369,53 @@ def _legacy_install(cmd, _depth=0):
     return None
 
 
-def _legacy_simple(argv, depth):
+def _classify_items(items, depth, functions):
+    """Hits of the commands that actually run, in order; definitions do not run."""
+    functions, hits = dict(functions), []
+    for item in items:
+        if item[0] == "def":
+            functions[item[1]] = item[2]
+            continue
+        _, argv, subs = item
+        hits.append(_legacy_simple(argv, depth, functions))
+        hits.extend(_legacy_install(body, depth + 1, functions) for body in subs)
+    return hits
+
+
+def _legacy_install(cmd, _depth=0, _functions=None):
+    """Classify a shell command as a direct legacy ``wf apply``/``wf self-update``.
+
+    Returns ``None`` for ordinary commands, else ``{schema, entry, kind, parsed,
+    argument}``. ``argument`` is only the first positional package operand used
+    by the legacy report path; it is never an installation reference and never
+    authorizes anything. Commands that mention a wf entry point but cannot be
+    tokenized are returned with ``parsed=False`` and ``kind=None`` (explicitly
+    unknown). Function bodies count only where the function is invoked.
+    Indirection through scripts, aliases or variables is outside this
+    reporting classifier.
+    """
+    import re
+    if not isinstance(cmd, str) or not cmd.strip() or _depth > 3:
+        return None
+    try:
+        items = _shell_items(_shell_tokens(cmd))
+    except ValueError:
+        mentions = re.search(r"(?:^|[\s/'\"`;&|(])wf(?:\.py)?(?=['\"\s`]|$)", cmd) \
+            and re.search(r"(?<![\w-])(?:apply|self-update|drill)(?![\w-])", cmd)
+        return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False,
+                "argument": None} if mentions else None
+    return _pick_legacy(_classify_items(items, _depth, _functions or {}))
+
+
+def _legacy_simple(argv, depth, functions=None):
     import re
     i, n = 0, len(argv)
     assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
     while i < n and (assignment.fullmatch(argv[i]) or argv[i] in _SHELL_RESERVED):
         i += 1
+    if i < n and functions and argv[i] in functions:
+        # A shell function shadows any command of the same name (including wf).
+        return _pick_legacy(_classify_items(functions[argv[i]], depth + 1, functions)) if depth < 3 else None
     while i < n and argv[i].rsplit("/", 1)[-1] in _WRAPPERS:
         wrapper = argv[i].rsplit("/", 1)[-1]
         i += 1
@@ -338,7 +433,7 @@ def _legacy_simple(argv, depth):
             j += 1
         return _legacy_install(argv[j], depth + 1) if inline and j < n else None
     if name == "eval":
-        return _legacy_install(" ".join(argv[i + 1:]), depth + 1)
+        return _legacy_install(" ".join(argv[i + 1:]), depth + 1, functions)
     rest = None
     if name in ("wf", "wf.py"):
         rest = argv[i + 1:]
@@ -735,7 +830,35 @@ def _install_try(event, histories, history_entries):
     return False
 
 
-def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
+REPORT_AUTHORIZATION_SCHEMA = "live-report-authorization/1"
+
+
+def _direct_history_route(inst, events):
+    """Route a direct ``live.check`` to the same frozen collection goals use.
+
+    ``strict``: structured receipts, or a transaction store that holds a
+    transaction or cannot be listed (a capture problem is then reported, never
+    replaced by a report that omits the transaction). ``legacy``: only
+    classified legacy/inner exec commands; if strict capture is impossible the
+    legacy report is returned with an explicit uncollected authorization.
+    ``None``: an ordinary window, reported as before. The store listing here
+    only routes; the evaluated facts are the frozen ones.
+    """
+    from .core import WF_HOME
+    if any(event.get("type") == "exec" and event.get("install_exec") is not None for event in events):
+        return "strict"
+    for kind, parts in _STORE_PARTS:
+        path = Path(str(inst.root if kind == "project" else WF_HOME)).joinpath(*parts)
+        try:
+            listing = _directory_source(path)
+        except _InputProblem:
+            return "strict"
+        if any(member[0].startswith(("tx-", "restore-")) for member in listing["members"]):
+            return "strict"
+    return "legacy" if _history_required(events) else None
+
+
+def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None, _route=True) -> dict:
     # 1.9.3：按执行端第 123 轮的复核再修——不跳过失败的轮次（按轮号连续计）；日志条目必须带项目字段；回复要核父子 uuid；
     # 审查核版本包哈希与先后；待办按事件核关闭时刻；发现延迟不得为负；同步要带当时的 HEAD；
     # 连续达标的轮次里必须至少各有一次工具安装与项目落地；人工判定看事件身份（actor），驱动器进程里的 wf 内部转换不算人工
@@ -748,14 +871,21 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
     head_at = _inputs.head_at if _inputs else _head_at
     state = _inputs.state if _inputs else inst.state
     ev = read_log(inst.events_path)
-    if _inputs is None and any(e.get("type") == "exec" and e.get("install_exec") is not None for e in ev):
+    route = _direct_history_route(inst, ev) if _inputs is None and _route else None
+    if route is not None:
         try:
             return _evaluate_snapshot(_capture_inputs(inst, rounds=rounds, budget_s=budget_s))["report"]
         except _InputProblem as exc:
-            missing = [f"实景输入 {exc.state}：{exc.source}：{exc.detail}"]
-            return {"rounds": [], "streak": 0, "need": rounds, "missing": missing, "passed": False,
-                    "summary": _summary(inst, [], [], rounds, 0, missing, False),
-                    "input_problem": {"state": exc.state, "source": exc.source, "detail": exc.detail}}
+            problem = {"state": exc.state, "source": exc.source, "detail": exc.detail}
+            if route == "strict":
+                missing = [f"实景输入 {exc.state}：{exc.source}：{exc.detail}"]
+                return {"rounds": [], "streak": 0, "need": rounds, "missing": missing, "passed": False,
+                        "summary": _summary(inst, [], [], rounds, 0, missing, False),
+                        "input_problem": problem}
+            report = check(inst, rounds, budget_s, _route=False)
+            report["authorization"] = {"schema": REPORT_AUTHORIZATION_SCHEMA, "state": "unavailable",
+                                       "why": ["install_history_uncollected"], "input_problem": problem}
+            return report
     histories = _inputs.install_histories(inst, ev) if _inputs else None
     history_entries = (histories or {}).get("entries", [])
     turns = read_log(inst.turns_path)
@@ -1627,6 +1757,10 @@ def _evaluate_snapshot(snapshot):
         reasons = _authorization_reasons(result)
         result.update(authorization="unavailable" if reasons else "available",
                       reason="；".join(reasons) if reasons else None)
+        # The report carries the decision too, so a direct live.check routed
+        # here shows the same refusal and unbound transactions.
+        report["authorization"] = {"schema": REPORT_AUTHORIZATION_SCHEMA, "state": result["authorization"],
+                                   "why": reasons, "unbound_transactions": result["install_transactions"]["unbound"]}
     return result
 
 
