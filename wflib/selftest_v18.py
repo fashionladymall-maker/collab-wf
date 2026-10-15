@@ -782,14 +782,14 @@ def _t_arbiter(_ok):
 
 
 def _t_review_gate(_ok):
-    from . import core, review, release
+    from . import anomaly, core, review, release
     from .core import Instance, WfError
     from .selftest_review import Env
     from unittest.mock import patch
     res = []
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        with patch.object(core, "LOCAL", root / "local"):
+        with patch.object(core, "LOCAL", root / "local"), patch.object(anomaly, "LOCAL", root / "local"):
             env = Env(root)
             with patch.object(review, "_tool_home", lambda: env.tool):
                 target = env.project("gate")
