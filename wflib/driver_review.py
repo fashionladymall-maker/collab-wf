@@ -12,7 +12,7 @@ import os
 import stat
 from pathlib import Path
 
-from . import anomaly, core, release, review
+from . import anomaly, core, ops, release, review
 from .core import Instance, WfError
 
 
@@ -92,7 +92,7 @@ class Attempt:
                 if req and req.get("intent_sha256") != prior["body_sha256"]:
                     raise WfError("驱动器审查请求未绑定意图（driver_review_corrupt）")
                 self.request_id = req.get("request_id") if req else None
-                raise WfError(self.recovery("本轮已有安装审查意图，不自动重审或重装"))
+                raise WfError(self.recovery("本轮已有安装审查意图，不自动重审或重装" + self._close_orphans()))
             if any(n.startswith(self.prefix + "-") for n in os.listdir(self.fd)):
                 raise WfError("驱动器审查阶段记录缺少意图（driver_review_corrupt）")
             return self
@@ -197,8 +197,24 @@ class Attempt:
         if author_for(self.inst) != author:
             raise WfError("审查期间作者绑定改变（author_identity_changed）")
         self.verify()
-        self.write("installing", request_id=self.request_id, content_id=req["content_id"])
+        self.content_id = req["content_id"]
         return self.request_id
+
+    def installing(self, install_exec):
+        """持久调用身份分配之后、交给受保护安装器之前登记；身份写进本次尝试的只增记录。"""
+        decision = self.records.get("decision")
+        if (self.request_id is None or decision is None or decision.get("request_id") != self.request_id
+                or not (decision.get("decision") or {}).get("allowed")):
+            raise WfError("尚未取得本次安装审查许可（driver_review_incomplete）")
+        self.write("installing", request_id=self.request_id, content_id=self.content_id, install_exec=install_exec)
+
+    def _close_orphans(self):
+        """持本目标审查锁时，把被杀的驱动器进程内安装调用补记为中断：只记一次，绝不重跑。"""
+        try:
+            closed = ops.close_orphan_installs(self.inst)
+        except Exception as e:
+            return f"；遗留安装调用补记失败（install_exec_unrecorded）：{type(e).__name__}: {e}"
+        return ("；安装调用 " + "、".join(closed) + " 已补记为中断（install_exec_interrupted）") if closed else ""
 
     def recovery(self, text):
         return (f"{text}（driver_review_incomplete，request_id={self.request_id or '尚未登记'}）。"
@@ -207,8 +223,10 @@ class Attempt:
                 "再 wf review run <新ID>，最后 wf apply <zip> --review-id <新ID>；或让作者重新交付到新轮次。")
 
     def complete(self, result):
+        installing = self.records.get("installing") or {}
         self.write("closed", request_id=self.request_id, install_tx=result.get("install_tx"),
-                   version=result.get("version"))
+                   version=result.get("version"), install_ref=result.get("install_ref"),
+                   install_exec=installing.get("install_exec"))
 
     def __exit__(self, typ, error, tb):
         try:

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1926,7 +1927,13 @@ def h_apply(ctx):
             _save_dirty(ctx)   # Finish baseline writes before freezing review.
             configured_timeout = int(anomaly.transport_cfg().get("review_timeout_s") or 900)
             rid = attempt.reviewed_request(timeout_s=max(1, min(configured_timeout, int(ctx.time_left()))))
-            r = release.apply_zip(inst, Path(path), by="driver", review_id=rid)
+            # C5-D1：审查放行后、安装前分配持久 exec 身份，作为显式参数交给受保护安装器（不经进程环境）。
+            r = ops.run_install(
+                inst, f"wf apply {shlex.quote(str(path))} --review-id {rid}",
+                lambda invocation: release.apply_zip(
+                    inst, Path(path), by="driver", review_id=rid,
+                    exec_receipt=release.ExecReceipt(invocation.context, invocation.receipt_fd)),
+                label="apply", by="driver", before=attempt.installing)
             attempt.complete(r)
         _auto_approve_neutral(ctx, before, r.get("version"))
     except (WfError, OSError, ValueError, TypeError) as e:
