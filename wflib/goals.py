@@ -208,7 +208,7 @@ def mark_na(inst: Instance, gid: str, condition: str, scope: str, reason: str, b
         r = (read_json(inst.wf / "goals_state.json", {}) or {}).get(gid) or {}
         if _failed_record(r):
             raise WfError(f"{gid} 最近一次检查未通过（退出码 {r.get('exit')}）：检查失败或超时不能记为不适用")
-        if r.get("ok") and r.get("goals_sha") == st["current"]:
+        if r.get("ok") and _mech_valid(inst, g, x, r, st, {})[0]:   # B2-C2b：与 progress 同一个机械有效性判定
             raise WfError(f"{gid} 已按当前目标通过检查，不需要记为不适用")
     a = policy.approvals(inst)
     rec = {k: v.strip()[:500] for k, v in fields.items()}
@@ -318,6 +318,858 @@ def _live_attest(inst: Instance, x: dict, st: dict, d: Path, stamp: str) -> dict
     return {"granted": not why, "why": why, "ts": now_iso(), "binding": binding}
 
 
+# ———————— B2-C2b：逐目标机械绑定 v2（mech-binding/2） ————————
+# 新的可执行目标记录绑定：本目标定义（不含 title）与递归依赖目标的定义 hash、依赖闭包的内容摘要、证据文件 sha256。
+# 闭包按检查命令推导；项目 python 脚本另由运行时审计（sys.addaudithook 记下的打开、列目录、换目录、子进程、网络）证明
+# 实际读取的输入。无关目标变化可复用；相关变化、绑定不成立（unbound）、坏的或无法识别的绑定一律失败关闭、不复用。
+# 只有明确的旧格式（没有 binding，或 binding 只有 goals_sha/evidence_sha256）按全局 goals_sha 兼容；
+# 带 live 映射的目标写显式的 goals-sha/1（verified 仍按 B1 的全局绑定）。
+MECH_SCHEMA = "mech-binding/2"
+GLOBAL_SCHEMA = "goals-sha/1"
+CLOSURE_RULE = "closure/5"
+_LEGACY_KEYS = {"goals_sha", "evidence_sha256"}
+_WF_TOOL_ONLY = ("wf self-check", "wf self-check --probes", "wf version")   # 只读工具自身
+_WF_TOOL_PROJECT = ("wf ledger",)   # 只读工具与项目文件（PROJECT.md）
+_PROJECT_EXCLUDE = (".git/", ".venv/", "workflow/state.json", "workflow/*.jsonl", "workflow/usage.json", "workflow/evidence/",
+                    "workflow/outbox/", "workflow/approvals.json", "workflow/goals_state.json", "workflow/goals.json")
+_BUDGET_FILES, _BUDGET_BYTES, _AUDIT_MAX = 20000, 256 * 1024 * 1024, 50000
+_DEV_OK = ("/dev/null", "/dev/urandom", "/dev/random")
+# 静态出现即无法绑定（读环境变量、标准输入、起子进程、网络）；或不允许收窄到 affects（动态导入与执行）
+_STATIC_UNBOUND = ("subprocess", "os.system", "os.popen", "os.exec", "os.spawn", "os.posix_spawn", "os.fork", "os.environ",
+                   "os.getenv", "os.putenv", "os.environb", "socket", "urllib", "http", "multiprocessing", "pty", "ctypes", "input")
+_STATIC_NO_NARROW = ("__import__", "exec", "eval", "compile", "globals", "locals", "vars", "__builtins__", "builtins",
+                     "importlib", "runpy", "sys.modules", "sys.path", "getattr", "setattr", "os.chdir")
+_STAT_CALLS = ("exists", "isfile", "isdir", "islink", "lexists", "stat", "lstat", "access", "is_file", "is_dir", "is_symlink",
+               "iterdir", "glob", "rglob", "iglob", "listdir", "scandir", "walk", "getsize", "getmtime", "samefile")
+
+
+class _Unknown(Exception):
+    """无法核对（读失败、超出预算、范围外的引用、坏输入）：一律不复用。"""
+
+
+def _canon(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _goal_def_sha(x: dict) -> str:
+    """目标定义 hash：除 title 以外的全部字段（check、pass、means、on_fail、live、affects、depends_on 等）。"""
+    return hashlib.sha256(_canon({k: v for k, v in x.items() if k != "title"}).encode("utf-8")).hexdigest()
+
+
+def _dep_defs(g: dict, x: dict) -> dict:
+    """递归依赖目标的定义 hash。按整张可达子图做深度优先三色标记：任何分支上的回边（含兄弟分支汇合后的环）都判为成环；
+    依赖不存在或格式不对同样抛 _Unknown。"""
+    by_id = {y.get("id"): y for y in g.get("goals") or [] if isinstance(y, dict)}
+    color, out = {}, {}
+
+    def visit(node):
+        nid = node.get("id")
+        color[nid] = "gray"
+        dep = node.get("depends_on")
+        if dep is not None:
+            if not (dep == "all_exec" or isinstance(dep, list)):
+                raise _Unknown(f"{nid} 的 depends_on 格式不对")
+            for d in _deps(g, node):
+                if d not in by_id:
+                    raise _Unknown(f"依赖的目标 {d} 不存在")
+                c = color.get(d)
+                if c == "gray":
+                    raise _Unknown(f"目标依赖成环：{nid} → {d}")
+                if c is None:
+                    visit(by_id[d])
+                out[d] = _goal_def_sha(by_id[d])
+        color[nid] = "black"
+    visit(x)
+    out.pop(x.get("id"), None)
+    return dict(sorted(out.items()))
+
+
+def _hash_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _covered(rel: str, aff) -> bool:
+    return any(rel == a or rel.startswith(a + "/") for a in aff)
+
+
+def _tree_rows(root: Path, rels, skip, inside, budget: list) -> list:
+    """逐项（不跟随符号链接）记下类型、权限与内容 hash。符号链接的去处也必须在绑定范围内（由 inside 判定）——
+    指向范围外、或指向被排除的区域时无法绑定（执行时会跟随链接读到范围外的内容）。"""
+    import stat as _st
+    from .core import matches_protect
+    rows, rroot = [], os.path.realpath(root)
+
+    def add(rel):
+        p = Path(root) / rel
+        try:
+            s = os.lstat(p)
+        except FileNotFoundError:
+            rows.append(f"M\t{rel}")
+            return
+        except OSError as e:
+            raise _Unknown(f"读取 {rel} 失败：{type(e).__name__}")
+        mode = _st.S_IMODE(s.st_mode)
+        if _st.S_ISLNK(s.st_mode):
+            try:
+                target = os.readlink(p)
+            except OSError as e:
+                raise _Unknown(f"读取链接 {rel} 失败：{type(e).__name__}")
+            real = os.path.realpath(p)
+            if not os.path.exists(real):
+                rows.append(f"L\t{rel}\t{mode:o}\t{target}\tdangling")
+                return
+            rt = os.path.relpath(real, rroot).replace(os.sep, "/") if (real + os.sep).startswith(rroot + os.sep) else None
+            if rt is None or not inside(rt):
+                raise _Unknown(f"符号链接 {rel} 指向绑定范围外")
+            rows.append(f"L\t{rel}\t{mode:o}\t{target}\tin")
+        elif _st.S_ISREG(s.st_mode):
+            budget[0] += 1
+            budget[1] += s.st_size
+            if budget[0] > _BUDGET_FILES or budget[1] > _BUDGET_BYTES:
+                raise _Unknown("相关文件超出核对预算")
+            try:
+                rows.append(f"F\t{rel}\t{mode:o}\t{_hash_file(p)}")
+            except OSError as e:
+                raise _Unknown(f"读取 {rel} 失败：{type(e).__name__}")
+        elif _st.S_ISDIR(s.st_mode):
+            rows.append(f"D\t{rel}\t{mode:o}")
+            try:
+                names = sorted(os.listdir(p))
+            except OSError as e:
+                raise _Unknown(f"读取目录 {rel} 失败：{type(e).__name__}")
+            for n in names:
+                sub = f"{rel}/{n}" if rel != "." else n
+                if n == "__pycache__" or n.endswith(".pyc") or matches_protect(sub, skip) or matches_protect(sub + "/", skip):
+                    continue
+                add(sub)
+        else:
+            rows.append(f"O\t{rel}\t{mode:o}")
+    for rel in rels:
+        add(rel)
+    return rows
+
+
+def _digest(root: Path, rels, skip, inside) -> dict:
+    rows = _tree_rows(Path(root), rels, skip, inside, [0, 0])
+    return {"digest": hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest(), "entries": len(rows)}
+
+
+def _not_skipped(skip):
+    from .core import matches_protect
+    return lambda rel: rel != "." and not (matches_protect(rel, skip) or matches_protect(rel + "/", skip)
+                                           or "/__pycache__/" in f"/{rel}/")
+
+
+def _cached(cache: dict, key: str, fn):
+    if key not in cache:
+        try:
+            cache[key] = fn()
+        except _Unknown as e:
+            cache[key] = e
+    if isinstance(cache[key], _Unknown):
+        raise cache[key]
+    return cache[key]
+
+
+def _tool_digest(cache: dict) -> dict:
+    """整棵工具的实际内容（含 selftest、dashboard、docs 与 MANIFEST.json；只排除 .git、local/ 与字节码）。"""
+    skip = [".git/", "local/"]
+    return _cached(cache, "mech_tool", lambda: _digest(Path(_TOOL_ROOT), ["."], skip, _not_skipped(skip)))
+
+
+def _project_digest(inst: Instance, cache: dict) -> dict:
+    """整个项目的实际内容（含未跟踪文件）；排除 .git、.venv（解释器环境）与工具写的运行数据（目标定义另由定义 hash 绑定）。"""
+    skip = list(_PROJECT_EXCLUDE)
+    return _cached(cache, "mech_project", lambda: _digest(inst.root, ["."], skip, _not_skipped(skip)))
+
+
+def _norm_affects(root: Path, affects) -> tuple:
+    """affects 的规范化与越界检查：相对路径、已规范化、不含 ..、不指向排除区域、逐级不经过符号链接、留在项目内且存在。"""
+    from .core import matches_protect
+    if not isinstance(affects, list) or not affects or len(affects) > 200:
+        return None, "affects 需要 1–200 项的路径列表"
+    out = []
+    rr = os.path.realpath(root)
+    for a in affects:
+        if not isinstance(a, str) or not a or "\x00" in a or "\\" in a or a.startswith(("/", "~")):
+            return None, f"affects 项不是项目内的相对路径：{str(a)[:60]}"
+        n = os.path.normpath(a)
+        if n != a.rstrip("/") or n in (".", "") or any(part == ".." for part in n.split("/")):
+            return None, f"affects 项没有规范化或越界：{a}"
+        if matches_protect(n, _PROJECT_EXCLUDE) or matches_protect(n + "/", _PROJECT_EXCLUDE):
+            return None, f"affects 项指向排除区域：{a}"
+        cur = Path(root)
+        for part in n.split("/"):
+            cur = cur / part
+            if os.path.islink(cur):
+                return None, f"affects 项经过符号链接：{a}"
+        if not os.path.lexists(cur) or not (os.path.realpath(cur) + os.sep).startswith(rr + os.sep):
+            return None, f"affects 项不存在或越出项目：{a}"
+        out.append(n)
+    return sorted(set(out)), ""
+
+
+def _script_static(root: Path, script: str, args: list, aff) -> tuple:
+    """项目脚本的静态核对：返回 (结论, 原因)。结论 unbound：出现读环境变量、标准输入、子进程、网络等无法绑定的写法；
+    no_narrow：动态导入或执行、对非字面量路径做存在性检查等，不能只凭静态证据收窄；narrow_fail：本地模块、命令参数或
+    路径字面量不在 affects 内；ok：可收窄（仍需运行时审计确认）。"""
+    import ast
+    rr = os.path.realpath(root)
+
+    def rel_of(p):
+        rp = os.path.realpath(p)
+        if not (rp + os.sep).startswith(rr + os.sep) and rp != rr:
+            return None
+        return os.path.relpath(rp, rr).replace(os.sep, "/")
+
+    def check_path(s, base, where) -> str:
+        if not s or "\x00" in s or len(s) > 4096 or s.startswith(("http://", "https://")) or s == "/":
+            return ""
+        for cand in ([s] if os.path.isabs(s) else [os.path.join(rr, s), os.path.join(base, s)]):
+            if os.path.lexists(cand):
+                rel = rel_of(cand)
+                if rel is None or os.path.islink(cand):
+                    return f"{where} 引用了项目外或经符号链接的路径：{s[:60]}"
+                if rel == ".":
+                    return f"{where} 引用了整个项目目录"
+                if aff is None or not _covered(rel, aff):
+                    return f"{where} 引用的 {rel} 不在 affects 内"
+        return ""
+    narrow, no_narrow = "", ""
+    for a in args:
+        v = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
+        narrow = narrow or check_path(v, rr, "命令参数")
+    sdir = os.path.dirname(os.path.join(rr, script))
+    queue, seen = [script], set()
+    while queue:
+        rel = queue.pop()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        if len(seen) > 200:
+            return "unbound", "本地模块过多，无法核对"
+        p = os.path.join(rr, rel)
+        if os.path.islink(p) or not os.path.isfile(p):
+            return "unbound", f"脚本或模块 {rel} 不是普通文件"
+        if aff is None or not _covered(rel, aff):
+            narrow = narrow or f"脚本或模块 {rel} 不在 affects 内"
+        try:
+            tree = ast.parse(Path(p).read_bytes(), filename=rel)
+        except (OSError, SyntaxError, ValueError) as e:
+            return "unbound", f"{rel} 无法解析：{type(e).__name__}"
+        mdir = os.path.dirname(p)
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Name):
+                names = [node.id]
+            elif isinstance(node, ast.Attribute):
+                parts, cur = [node.attr], node.value
+                while isinstance(cur, ast.Attribute):
+                    parts.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name):
+                    parts.append(cur.id)
+                names = [".".join(reversed(parts))]
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                mod = (node.module or "") if isinstance(node, ast.ImportFrom) else ""
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    base = mdir
+                    for _ in range(node.level - 1):
+                        base = os.path.dirname(base)
+                    mods = [(base, (mod.split(".") if mod else []) + [a.name]) for a in node.names]
+                    names = []
+                else:
+                    full = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                        [mod] + [f"{mod}.{a.name}" for a in node.names]
+                    names = full
+                    mods = [(sdir, m.split(".")) for m in full]
+                for base, parts in mods:
+                    for i in range(1, len(parts) + 1):
+                        for c in (os.path.join(base, *parts[:i]) + ".py", os.path.join(base, *parts[:i], "__init__.py")):
+                            if os.path.lexists(c):
+                                r2 = rel_of(c)
+                                if r2 is None:
+                                    return "unbound", f"{rel} 导入了项目外的模块"
+                                queue.append(r2)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                narrow = narrow or check_path(node.value, mdir, rel)
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                nm = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
+                if nm in _STAT_CALLS:
+                    lit = node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+                    if not lit:   # 存在性检查与列目录不一定留下打开记录：参数不是字面量时不能只凭证据收窄
+                        no_narrow = no_narrow or f"{rel} 对非字面量路径调用 {nm}"
+            for nm in names:
+                if any(nm == b or nm.startswith(b + ".") or (b in ("os.exec", "os.spawn") and nm.startswith(b))
+                       for b in _STATIC_UNBOUND):
+                    return "unbound", f"{rel} 使用了无法绑定的 {nm}（环境变量、标准输入、子进程或网络）"
+                if any(nm == b or nm.startswith(b + ".") for b in _STATIC_NO_NARROW):
+                    no_narrow = no_narrow or f"{rel} 使用了动态写法 {nm}"
+    if no_narrow:
+        return "no_narrow", no_narrow
+    return ("narrow_fail", narrow) if narrow else ("ok", "")
+
+
+def _closure_spec(inst: Instance, x: dict) -> dict:
+    """由检查命令推导静态闭包：tool / tool+project / python（再由运行时审计定为 affects、project 或 unbound）/
+    project（只读程序且参数都在项目内）/ unbound（无法绑定：其余 wf 子命令、git、范围外或变量参数、其他命令）。"""
+    import shlex
+    cmd = str(x.get("check") or "").strip()
+    norm = " ".join(cmd.split())
+    if norm in _WF_TOOL_ONLY:
+        return {"kind": "tool", "why": "只读工具自身的 wf 命令"}
+    if norm in _WF_TOOL_PROJECT:
+        return {"kind": "tool+project", "why": "只读工具与项目文件的 wf 命令"}
+    if re.match(r"^wf(\s|$)", norm):
+        return {"kind": "unbound", "why": "该 wf 子命令会读取运行状态（local/、运行数据），无法绑定"}
+    if policy.META.search(cmd.replace("2>&1", "")):
+        return {"kind": "unbound", "why": "检查命令含命令链、重定向或替换，无法推导"}
+    try:
+        toks = shlex.split(cmd.replace("|", " "))
+    except ValueError:
+        return {"kind": "unbound", "why": "检查命令无法解析"}
+    if policy.PROJECT_SCRIPT.match(cmd) and "|" not in cmd:
+        if "/" in toks[0]:
+            return {"kind": "unbound", "why": "路径形式的解释器无法核对"}
+        script, args = os.path.normpath(toks[1]), toks[2:]
+        aff, why = (None, "没有声明 affects") if x.get("affects") is None else _norm_affects(inst.root, x.get("affects"))
+        res, swhy = _script_static(inst.root, script, args, aff)
+        if res == "unbound":
+            return {"kind": "unbound", "why": swhy}
+        try:
+            entry = _python_entry(inst, toks[0])
+        except _Unknown as e:
+            return {"kind": "unbound", "why": str(e)}
+        if aff is not None and res == "ok":
+            return {"kind": "python", "narrow": True, "affects": aff, "entry": entry,
+                    "why": "affects 静态核对通过，待运行时审计确认"}
+        return {"kind": "python", "narrow": False, "entry": entry, "why": why or swhy}
+    if toks and toks[0] == "git":
+        return {"kind": "unbound", "why": "git 会读取项目外的配置与 .git 内部数据，无法绑定"}
+    if policy.READONLY_PROGRAMS.match(cmd):
+        for t in toks[1:]:
+            v = t.split("=", 1)[1] if t.startswith("-") and "=" in t else t
+            if v in _DEV_OK:
+                continue
+            if v.startswith(("/", "~")) or "$" in v or any(part == ".." for part in v.split("/")):
+                return {"kind": "unbound", "why": f"参数 {v[:40]} 指向项目外或含变量，无法绑定"}
+        return {"kind": "project", "why": "只读程序只读取项目内的参数文件"}
+    return {"kind": "unbound", "why": "无法从检查命令推导依赖"}
+
+
+def _closure_state(inst: Instance, kind: str, aff, cache: dict) -> dict:
+    out = {}
+    if kind in ("tool", "tool+project"):
+        out["tool"] = _tool_digest(cache)
+    if kind in ("project", "tool+project"):
+        out["project"] = _project_digest(inst, cache)
+    if kind == "affects":
+        out["affects"] = _digest(inst.root, aff, list(_PROJECT_EXCLUDE), lambda rel: _covered(rel, aff))
+    return out
+
+
+def _runtime_stamp(path, follow=True):
+    """读取时的短期戳只用于检查期间变化；不含会被读取本身改变的 atime。"""
+    try:
+        s = os.stat(path, follow_symlinks=follow)
+        return [s.st_mode, s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        raise _Unknown(f"读取运行输入 {path} 失败：{type(e).__name__}")
+
+
+def _runtime_file(path, expected=None, check_stamp=False) -> dict:
+    """精确文件绑定，包含入口链接的实际去处；不按解释器前缀豁免实际字节。"""
+    import stat
+    path = os.path.abspath(path)
+    stamp = _runtime_stamp(path)
+    if check_stamp and stamp != expected:
+        raise _Unknown(f"检查期间运行输入发生变化：{path}")
+    out = {"path": path, "realpath": os.path.realpath(path)}
+    if stamp is None:
+        return dict(out, absent=True)
+    if not stat.S_ISREG(stamp[0]) or stamp[3] > _BUDGET_BYTES:
+        raise _Unknown(f"运行输入不是普通文件或超出预算：{path}")
+    try:
+        digest = _hash_file(Path(path))
+    except OSError as e:
+        raise _Unknown(f"读取运行输入 {path} 失败：{type(e).__name__}")
+    if _runtime_stamp(path) != stamp:
+        raise _Unknown(f"摘要期间运行输入发生变化：{path}")
+    return dict(out, mode=stat.S_IMODE(stamp[0]), sha256=digest)
+
+
+def _check_env(inst: Instance) -> dict:
+    env = dict(os.environ)
+    env["PATH"] = str(WF_HOME / "bin") + os.pathsep + env.get("PATH", "")
+    venv = inst.root / ".venv"
+    if (venv / "bin").exists():
+        env["VIRTUAL_ENV"] = str(venv)
+        env["PATH"] = str(venv / "bin") + os.pathsep + env["PATH"]
+    return env
+
+
+def _python_entry(inst: Instance, command: str) -> dict:
+    import shutil
+    # bash 在项目 cwd 中解析相对 PATH 项；which 的调用进程 cwd 则不一定是项目。
+    path = os.pathsep.join(os.path.abspath(inst.root / p) if not os.path.isabs(p) else p
+                           for p in _check_env(inst)["PATH"].split(os.pathsep))
+    entry = shutil.which(command, path=path)
+    if not entry:
+        raise _Unknown("找不到检查命令实际使用的解释器")
+    return dict(_runtime_file(entry), environment_sha256=hashlib.sha256(_canon(_check_env(inst)).encode("utf-8")).hexdigest())
+
+
+def _import_names(path, candidates):
+    try:
+        return sorted(set(os.listdir(path)) & set(candidates))
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        raise _Unknown(f"读取模块搜索目录失败：{path}（{type(e).__name__}）")
+
+
+def _site_directory(path):
+    try:
+        names = sorted(n for n in os.listdir(path) if n.endswith(".pth") and not n.startswith("."))
+    except (FileNotFoundError, NotADirectoryError):
+        names = None
+    except OSError as e:
+        raise _Unknown(f"读取 site 启动目录失败：{path}（{type(e).__name__}）")
+    return {"realpath": os.path.realpath(path), "names": names}
+
+
+def _startup_current(startup):
+    return {"directories": {p: _site_directory(p) for p in startup["directories"]},
+            "paths": {p: [os.path.realpath(p), os.path.exists(p)] for p in startup["paths"]}}
+
+
+def _runtime_binding(audit: dict) -> dict:
+    stamps = audit["files"]
+    paths = sorted(set(audit.get("bound_files") or []))
+    if len(paths) > _BUDGET_FILES:
+        raise _Unknown("运行输入超出核对预算")
+    files = [_runtime_file(p, stamps[p], True) for p in paths]
+    stats = audit.get("stats") or []
+    for row in stats:
+        if not isinstance(row, list) or len(row) != 3 or not isinstance(row[0], str):
+            raise _Unknown("运行时 stat 记录损坏")
+        if _runtime_stamp(row[0], row[1]) != row[2]:
+            raise _Unknown(f"检查期间 stat 输入发生变化：{row[0]}")
+    candidates = audit.get("candidates")
+    dirs = audit.get("import_dirs")
+    if not isinstance(candidates, list) or not isinstance(dirs, dict):
+        raise _Unknown("模块搜索输入缺失")
+    searches = []
+    for p, names in sorted(dirs.items()):
+        if names is not None and not isinstance(names, list):
+            raise _Unknown("模块搜索目录不可读")
+        prior = None if names is None else sorted(set(names) & set(candidates))
+        if _import_names(p, candidates) != prior:
+            raise _Unknown(f"检查期间模块搜索输入发生变化：{p}")
+        searches.append({"path": p, "names": prior})
+    startup = audit.get("startup")
+    if not isinstance(startup, dict) or _startup_current(startup) != startup:
+        raise _Unknown("site 启动输入缺失或在检查期间改变")
+    return {"files": files, "stats": stats, "candidates": candidates, "searches": searches, "startup": startup}
+
+
+def _runtime_current(binding: dict) -> dict:
+    if not isinstance(binding, dict) or not all(isinstance(binding.get(k), list)
+                                              for k in ("files", "stats", "candidates", "searches")):
+        raise _Unknown("运行输入绑定缺失或损坏")
+    return {"files": [_runtime_file(r["path"]) for r in binding["files"]],
+            "stats": [[r[0], r[1], _runtime_stamp(r[0], r[1])] for r in binding["stats"]],
+            "candidates": binding["candidates"],
+            "searches": [{"path": r["path"], "names": _import_names(r["path"], binding["candidates"])}
+                         for r in binding["searches"]],
+            "startup": _startup_current(binding["startup"])}
+
+
+# observer 只用已加载的 sys/os、冻结 importlib 与内建 atexit；不导入 sysconfig/json/pathlib。
+# 初始化与 dump 不进入脚本事件。文件打开时先记 stat 戳，父进程在戳仍一致时读取字节摘要。
+# stat/lstat/access 的 Python 入口补足 CPython audit 没有覆盖的存在性读取；不改变返回值或异常。
+_AUDIT_SITE = r'''
+import sys, os, atexit
+_wf_log = os.environ.get("WF_GOAL_AUDIT")
+_wf_ev, _wf_over, _wf_files, _wf_stats = [], [False], {}, []
+_wf_dirs, _wf_sources, _wf_imports = {}, {}, set()
+_wf_busy = [True]
+_wf_stat, _wf_lstat, _wf_access = os.stat, os.lstat, os.access
+_wf_external = sys.modules["_frozen_importlib_external"]
+_wf_bootstrap = sys.modules["_frozen_importlib"]
+_wf_here = os.path.dirname(os.path.abspath(__file__))
+_wf_stdlib = os.path.dirname(os.__file__)
+_wf_observer = sys.modules[__name__]
+_wf_owned = {os.path.realpath(__file__)}
+_wf_cache = getattr(_wf_observer, "__cached__", None)
+if isinstance(_wf_cache, str):
+    _wf_owned.add(os.path.realpath(_wf_cache))
+    try:
+        _wf_owned.add(os.path.realpath(_wf_external.source_from_cache(_wf_cache)))
+    except (ValueError, NotImplementedError):
+        pass
+_wf_startup = {"directories": {}, "paths": {}}
+_wf_startup_files, _wf_startup_errors = [], []
+def _wf_stamp(p, follow=True):
+    try:
+        s = _wf_stat(p, follow_symlinks=follow)
+        return [s.st_mode, s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns]
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+def _wf_remember(p):
+    p = os.path.abspath(p)
+    if os.path.realpath(p) in _wf_owned:
+        return
+    if p not in _wf_files:
+        _wf_files[p] = _wf_stamp(p)
+    if p.endswith(".pyc"):
+        try:
+            source = _wf_external.source_from_cache(p)
+            _wf_sources[p] = source
+            if os.path.realpath(source) not in _wf_owned and source not in _wf_files:
+                _wf_files[source] = _wf_stamp(source)
+        except (ValueError, NotImplementedError):
+            pass
+def _wf_modules():
+    out = []
+    for m in list(sys.modules.values()):
+        if m is _wf_observer:
+            continue
+        p = getattr(m, "__file__", None)
+        if isinstance(p, str):
+            out.append(os.path.abspath(p))
+            cached = getattr(m, "__cached__", None)
+            if isinstance(cached, str):
+                out.append(os.path.abspath(cached))
+    return sorted(set(out))
+def _wf_dir(p):
+    p = os.path.abspath(p)
+    if p not in _wf_dirs:
+        try:
+            _wf_dirs[p] = os.listdir(p)
+        except (FileNotFoundError, NotADirectoryError):
+            _wf_dirs[p] = None
+        except OSError:
+            _wf_dirs[p] = "unknown"
+def _wf_standard_module(module, name):
+    spec = getattr(module, "__spec__", None)
+    filename = os.path.join(_wf_stdlib, name + ".py")
+    if (module is not sys.modules.get(name) or getattr(spec, "name", None) != name
+            or os.path.realpath(getattr(module, "__file__", "")) != os.path.realpath(filename)):
+        return False
+    loader = spec.loader
+    return ((loader is _wf_bootstrap.FrozenImporter and spec.origin == "frozen")
+            or (type(loader) is _wf_external.SourceFileLoader
+                and os.path.realpath(spec.origin) == os.path.realpath(filename)
+                and os.path.realpath(loader.path) == os.path.realpath(filename)))
+def _wf_standard_startup(site):
+    # 只确认正常 CPython/site/os 的可观察前提；不支持替换启动实现或预启动任意执行代码。
+    if (sys.implementation.name != "cpython" or sys.flags.no_site
+            or not _wf_standard_module(site, "site") or not _wf_standard_module(os, "os")
+            or getattr(site, "os", None) is not os or getattr(site, "sys", None) is not sys
+            or type(os.environ) is not os._Environ):
+        return False
+    mapping = getattr(sys.modules.get("_collections_abc"), "Mapping", None)
+    if getattr(os.environ.get, "__func__", None) is not getattr(mapping, "get", None):
+        return False
+    for name in ("main", "addpackage", "addsitedir", "getsitepackages", "execsitecustomize"):
+        fn = getattr(site, name, None)
+        code = getattr(fn, "__code__", None)
+        if (getattr(fn, "__globals__", None) is not site.__dict__ or code is None
+                or not (code.co_filename == "<frozen site>"
+                        or os.path.realpath(code.co_filename) == os.path.realpath(site.__file__))):
+            return False
+    return True
+def _wf_pth_problem(line):
+    # 完整行精确匹配；仅忽略明确的 ASCII 行尾空白，不允许后缀代码／注释或宽 AST 求值。
+    for default in ("stdlib", "local"):
+        template = ("import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, '"
+                    + default + "') == 'local'; enabled and __import__('_distutils_hack').add_shim();")
+        if line.rstrip(" \t\r\n") == template:
+            if os.environ.get("SETUPTOOLS_USE_DISTUTILS", default) != "local":
+                return None  # 已加载 os，赋值与字符串比较后 and 右支不执行；未主动导入 shim。
+            return "启动 .pth 的 distutils 执行分支未禁用，观察前输入无法证明"
+    return "启动 .pth 含未知执行代码，观察前输入无法证明"
+def _wf_site_inputs():
+    site = sys.modules["site"]
+    if not _wf_standard_startup(site):
+        _wf_startup_errors.append("无法确认标准 CPython/site/os 启动前提，启动输入无法证明")
+        return
+    dirs = list(site.getsitepackages())
+    if site.ENABLE_USER_SITE:
+        user = site.getusersitepackages()
+        dirs.extend([user] if isinstance(user, str) else user)
+    executable = os.environ.get("__PYVENV_LAUNCHER__", sys.executable)
+    exe_dir = os.path.dirname(os.path.abspath(executable))
+    for parent in (exe_dir, os.path.dirname(exe_dir)):
+        p = os.path.join(parent, "pyvenv.cfg")
+        _wf_startup_files.append(p)
+        _wf_remember(p)
+    for directory in sorted(set(dirs)):
+        directory = os.path.abspath(directory)
+        try:
+            names = sorted(n for n in os.listdir(directory) if n.endswith(".pth") and not n.startswith("."))
+        except (FileNotFoundError, NotADirectoryError):
+            names = None
+        _wf_startup["directories"][directory] = {"realpath": os.path.realpath(directory), "names": names}
+        for name in names or []:
+            p = os.path.join(directory, name)
+            _wf_startup_files.append(p)
+            _wf_remember(p)
+            with open(p) as f:
+                for line in f:
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    if line.startswith(("import ", "import\t")):
+                        problem = _wf_pth_problem(line)
+                        if problem:
+                            _wf_startup_errors.append(problem + "：" + p)
+                        continue
+                    target = os.path.abspath(os.path.join(directory, line.rstrip()))
+                    _wf_startup["paths"][target] = [os.path.realpath(target), os.path.exists(target)]
+try:
+    _wf_site_inputs()
+except Exception as _wf_error:
+    _wf_startup_errors.append("无法核对 site 启动输入：" + type(_wf_error).__name__)
+_wf_initial = _wf_modules()
+for _wf_p in _wf_initial + [sys.executable]:
+    _wf_remember(_wf_p)
+sys.path[:] = [p for p in sys.path if os.path.abspath(p or ".") != _wf_here]
+# 查找本来的 sitecustomize 是 observer 自身的引导，不能污染脚本输入。
+for _wf_p in sys.path:
+    if isinstance(_wf_p, str):
+        _wf_dir(_wf_p or ".")
+_wf_site = _wf_external.PathFinder.find_spec("sitecustomize", sys.path)
+def _wf_hook(ev, args):
+    if _wf_busy[0]:
+        return
+    _wf_busy[0] = True
+    try:
+        if ev == "import" and args and isinstance(args[0], str):
+            _wf_imports.add(args[0])
+            for search in sys.path:
+                if isinstance(search, str):
+                    _wf_dir(search or ".")
+        if ev in ("open", "os.listdir", "os.scandir", "os.chdir", "builtins.input") or ev.startswith(
+                ("subprocess.", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.popen", "socket.", "ctypes.")):
+            if len(_wf_ev) >= %d:
+                _wf_over[0] = True
+                return
+            a0 = args[0] if args else None
+            if isinstance(a0, int) or a0 is None:
+                p = None if isinstance(a0, int) else "."
+            else:
+                p = os.fsdecode(a0) if isinstance(a0, (str, bytes)) else os.fsdecode(os.fspath(a0))
+            if ev == "open" and p is not None:
+                _wf_remember(p)
+            if ev in ("os.listdir", "os.scandir"):
+                caller = sys._getframe(1).f_code.co_filename
+                if caller.startswith("<frozen importlib.") or caller.endswith("/importlib/_bootstrap_external.py"):
+                    _wf_dir(p or ".")
+                    ev = "import-dir"
+            _wf_ev.append([ev, p])
+    except Exception:
+        _wf_ev.append(["hook-error", None])
+    finally:
+        _wf_busy[0] = False
+def _wf_observe_stat(fn, p, args, kw, follow):
+    if _wf_busy[0]:
+        return fn(p, *args, **kw)
+    _wf_busy[0] = True
+    try:
+        try:
+            if isinstance(p, int) or kw.get("dir_fd") is not None:
+                _wf_ev.append(["hook-error", None])
+            else:
+                path = os.path.abspath(os.fsdecode(os.fspath(p)))
+                if len(_wf_ev) + len(_wf_stats) >= %d:
+                    _wf_over[0] = True
+                else:
+                    _wf_stats.append([path, follow, _wf_stamp(path, follow)])
+        except Exception:
+            _wf_ev.append(["hook-error", None])
+        return fn(p, *args, **kw)
+    finally:
+        _wf_busy[0] = False
+def _wf_stat_call(p, *args, **kw):
+    return _wf_observe_stat(_wf_stat, p, args, kw, kw.get("follow_symlinks", True))
+def _wf_lstat_call(p, *args, **kw):
+    return _wf_observe_stat(_wf_lstat, p, args, kw, False)
+def _wf_access_call(p, *args, **kw):
+    return _wf_observe_stat(_wf_access, p, args, kw, kw.get("follow_symlinks", True))
+os.stat, os.lstat, os.access = _wf_stat_call, _wf_lstat_call, _wf_access_call
+sys.addaudithook(_wf_hook)
+def _wf_dump():
+    _wf_busy[0] = True
+    candidates = {"sitecustomize.py", "sitecustomize.pyc", "sitecustomize"}
+    suffixes = [".py", ".pyc"] + sys.modules["_imp"].extension_suffixes()
+    for name in set(sys.modules) | _wf_imports:
+        last = name.rsplit(".", 1)[-1]
+        candidates.add(last)
+        candidates.update(last + suffix for suffix in suffixes)
+    tmp = _wf_log + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(repr({"events": _wf_ev, "overflow": _wf_over[0], "files": _wf_files, "stats": _wf_stats,
+                      "modules": _wf_modules(), "initial": _wf_initial, "stdlib": _wf_stdlib,
+                      "startup": _wf_startup, "startup_files": _wf_startup_files, "startup_errors": _wf_startup_errors,
+                      "import_dirs": _wf_dirs, "candidates": sorted(candidates), "cache_sources": _wf_sources,
+                      "executable": sys.executable, "cwd": os.getcwd(), "version": sys.version}))
+    os.replace(tmp, _wf_log)
+atexit.register(_wf_dump)
+_wf_busy[0] = False
+if _wf_site is not None:
+    _wf_original = _wf_bootstrap.module_from_spec(_wf_site)
+    sys.modules["sitecustomize"] = _wf_original
+    _wf_site.loader.exec_module(_wf_original)
+''' % (_AUDIT_MAX, _AUDIT_MAX)
+
+
+def _audit_kind(inst: Instance, spec: dict, audit, audit_dir: str) -> tuple:
+    """按运行时审计确定最终闭包：返回 (kind, 原因)。读到范围外或排除区域、网络、标准输入、换目录、起子进程、
+    审计记录缺失或损坏都是 unbound；narrow 且所有项目内输入都在 affects 内为 affects，否则 project。"""
+    from .core import matches_protect
+    if not isinstance(audit, dict) or not isinstance(audit.get("events"), list) or not isinstance(audit.get("files"), dict):
+        return "unbound", "运行时审计记录缺失或损坏（脚本可能用 os._exit 退出）"
+    if audit.get("overflow"):
+        return "unbound", "运行时审计事件超出上限"
+    if audit.get("startup_errors"):
+        return "unbound", "；".join(audit["startup_errors"])
+    rr = os.path.realpath(inst.root)
+    stdlib = os.path.realpath(str(audit.get("stdlib") or ""))
+    modules = set(audit.get("modules") or []) | set(audit.get("initial") or [])
+    bound = set(audit.get("startup_files") or [])
+    ad = os.path.realpath(audit_dir)
+    narrow_bad = ""
+    # 实际加载的模块文件／其缓存（含系统 sitecustomize 的依赖）逐文件绑定，绝不豁免所在目录。
+    def runtime(p):
+        return p in modules
+    for p in audit["files"]:
+        if p == audit.get("executable") or runtime(p):
+            bound.add(p)
+    for item in audit["events"]:
+        if not isinstance(item, list) or len(item) != 2:
+            return "unbound", "运行时审计记录损坏"
+        ev, p = item
+        if ev == "hook-error":
+            return "unbound", "运行时审计钩子出错"
+        if ev == "os.chdir":
+            return "unbound", "脚本切换了工作目录，相对路径无法核对"
+        if ev == "builtins.input":
+            return "unbound", "脚本读取了标准输入"
+        if ev.startswith("socket."):
+            return "unbound", "脚本使用了网络"
+        if ev.startswith(("subprocess.", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.popen", "ctypes.")):
+            return "unbound", f"脚本启动了子进程或外部代码（{ev}），子进程的输入无法审计"
+        if p is None:
+            continue
+        if ev == "import-dir":
+            continue   # 模块实际文件另行核对，不把 importlib 的查找当成脚本列目录
+        rp = os.path.realpath(os.path.join(rr, p))
+        if rp in _DEV_OK or (rp + os.sep).startswith(ad + os.sep) or rp == ad:
+            continue
+        absolute = os.path.abspath(os.path.join(rr, p))
+        if ev == "open" and (runtime(absolute) or absolute == audit.get("executable")):
+            bound.add(absolute)
+            continue
+        if ev in ("os.listdir", "os.scandir") and (rp + os.sep).startswith(stdlib + os.sep):
+            # import 搜索目录不是文件内容；实际导入文件仍逐项绑定。脚本显式列目录不允许靠此前缀豁免。
+            return "unbound", f"脚本或导入读取了外部目录：{p[:80]}"
+        if not ((rp + os.sep).startswith(rr + os.sep) or rp == rr):
+            return "unbound", f"脚本读取了项目外的路径：{p[:80]}"
+        rel = os.path.relpath(rp, rr).replace(os.sep, "/")
+        if ev == "open" and rel.startswith(".venv/"):
+            bound.add(absolute)
+            narrow_bad = narrow_bad or "实际读取了 affects 之外的解释器环境文件"
+            continue
+        if "/__pycache__/" in f"/{rel}" and ".pyc" in rel:
+            continue   # 字节码缓存，源文件另有记录
+        if rel != "." and (matches_protect(rel, _PROJECT_EXCLUDE) or matches_protect(rel + "/", _PROJECT_EXCLUDE)):
+            return "unbound", f"脚本读取了不在绑定范围内的 {rel}"
+        if spec.get("narrow") and (rel == "." or not _covered(rel, spec["affects"])):
+            narrow_bad = narrow_bad or f"运行时读取了 affects 之外的 {rel}"
+    # .pyc 的对应源码在打开缓存前已取戳，防止执行后才把新源码误记成实际输入。
+    for p in list(bound):
+        source = (audit.get("cache_sources") or {}).get(p)
+        if source in audit["files"]:
+            bound.add(source)
+    audit["bound_files"] = sorted(bound)
+    if spec.get("narrow") and not narrow_bad:
+        return "affects", "affects 经静态核对与运行时审计确认"
+    return "project", narrow_bad or spec.get("why") or "按整个项目绑定"
+
+
+def _binding_core(inst: Instance, g: dict, x: dict) -> dict:
+    return {"schema": MECH_SCHEMA, "closure_rule": CLOSURE_RULE, "goal_id": x["id"], "goal_sha": _goal_def_sha(x),
+            "deps": _dep_defs(g, x), "static": _closure_spec(inst, x)}
+
+
+def _legacy_binding(r: dict) -> bool:
+    """明确的旧格式：没有 binding 键（B1 之前），或 binding 是只含 goals_sha/evidence_sha256 的 dict（B1）。"""
+    if "binding" not in r:
+        return True
+    b = r["binding"]
+    return isinstance(b, dict) and "schema" not in b and set(b) <= _LEGACY_KEYS
+
+
+def _mech_valid(inst: Instance, g: dict, x: dict, r: dict, st: dict, cache: dict) -> tuple:
+    """B2-C2b：机械记录当前是否仍然有效——progress、_layer、mark_na 都用它，避免 ok 与 layer 矛盾。"""
+    if not r:
+        return False, ["尚未检查"]
+    if _legacy_binding(r):
+        return (True, []) if r.get("goals_sha") == st["current"] else (False, ["目标文件已改动（旧记录按全局绑定）"])
+    b = r.get("binding")
+    if not isinstance(b, dict):
+        return False, ["绑定格式无法识别"]
+    if b.get("schema") == GLOBAL_SCHEMA:
+        if not isinstance(x.get("live"), dict):
+            return False, ["只有带 live 映射的目标使用全局绑定"]
+        return (True, []) if r.get("goals_sha") == st["current"] and b.get("goals_sha") == st["current"] else \
+            (False, ["目标文件已改动（全局绑定）"])
+    if b.get("schema") != MECH_SCHEMA:
+        return False, ["绑定格式无法识别"]
+    key = ("mech_valid", x.get("id"))
+    if key in cache:
+        return cache[key]
+    why = []
+    try:
+        if b.get("unbound"):
+            why.append(f"依赖绑定不成立：{b.get('unbound')}")
+        else:
+            if b.get("closure_rule") != CLOSURE_RULE or b.get("goal_id") != x.get("id"):
+                why.append("绑定的规则或目标编号不一致")
+            if isinstance(x.get("live"), dict):
+                why.append("带 live 映射的目标不使用逐目标绑定")
+            if b.get("goal_sha") != _goal_def_sha(x):
+                why.append("本目标的定义已改动")
+            if b.get("deps") != _dep_defs(g, x):
+                why.append("依赖目标的定义已改动")
+            if b.get("static") != _closure_spec(inst, x):
+                why.append("依赖闭包的静态推导已改变")
+            if (b.get("static") or {}).get("kind") == "python" and b.get("runtime") != _runtime_current(b.get("runtime")):
+                why.append("解释器、实际运行库／环境文件或 stat 输入已改变")
+            kind, aff = b.get("kind"), b.get("affects")
+            if kind not in ("tool", "tool+project", "project", "affects") or (kind == "affects") != isinstance(aff, list):
+                why.append("绑定的闭包类型无效")
+            elif b.get("state") != _closure_state(inst, kind, aff, cache):
+                why.append("依赖闭包内的文件已改变（新增、删除、权限、内容或链接去处）")
+        es = b.get("evidence_sha256")
+        if not es or _sha256_file(inst.root / str(r.get("evidence") or "")) != es:
+            why.append("机械检查的证据文件缺失或被改动")
+    except _Unknown as e:
+        why.append(f"无法核对：{e}")
+    except Exception as e:   # noqa: BLE001 —— 坏输入一律不复用
+        why.append(f"无法核对：{type(e).__name__}")
+    cache[key] = (not why, why)
+    return cache[key]
+
+
 def run_checks(inst: Instance, timeout=900, by="driver") -> dict:
     """运行全部 exec 类目标的检查命令，结果写入 workflow/goals_state.json 并留存证据。"""
     g = load(inst)
@@ -327,33 +1179,109 @@ def run_checks(inst: Instance, timeout=900, by="driver") -> dict:
     d = inst.evidence / "goals"
     d.mkdir(parents=True, exist_ok=True)
     gs = read_json(inst.wf / "goals_state.json", {}) or {}
-    env = dict(os.environ)
-    env["PATH"] = str(WF_HOME / "bin") + os.pathsep + env.get("PATH", "")
-    venv = inst.root / ".venv"
-    if (venv / "bin").exists():
-        env["VIRTUAL_ENV"] = str(venv)
-        env["PATH"] = str(venv / "bin") + os.pathsep + env["PATH"]
+    env = _check_env(inst)
+    import shutil
+    import tempfile
+    cores, pre, pre_cache = {}, {}, {}
+    for x in g["goals"]:   # B2-C2b：检查前先算各目标的静态绑定与候选闭包的内容摘要，检查后再算一次
+        if x["kind"] != "exec" or isinstance(x.get("live"), dict):
+            continue
+        try:
+            cores[x["id"]] = core = _binding_core(inst, g, x)
+        except _Unknown as e:
+            cores[x["id"]] = e
+            continue
+        k = core["static"]["kind"]
+        for kind in (("project", "affects") if k == "python" else (k,)):
+            if kind == "affects" and not core["static"].get("narrow") or kind == "unbound":
+                continue
+            try:
+                pre[(x["id"], kind)] = _closure_state(inst, kind, core["static"].get("affects"), pre_cache)
+            except _Unknown as e:
+                pre[(x["id"], kind)] = e
+    ran, audits = [], {}
     for x in g["goals"]:
         if x["kind"] != "exec":
             continue
         stamp = time.strftime("%Y%m%d-%H%M%S")
         t0 = time.time()
+        core = cores.get(x["id"])
+        audit_dir, run_env = None, env
+        if isinstance(core, dict) and core["static"]["kind"] == "python":   # B2-C2b：项目脚本在运行时审计下执行
+            audit_dir = tempfile.mkdtemp(prefix="wf-goal-audit-")
+            Path(audit_dir, "sitecustomize.py").write_text(_AUDIT_SITE, encoding="utf-8")
+            run_env = dict(env, WF_GOAL_AUDIT=str(Path(audit_dir, "audit.json")), PYTHONDONTWRITEBYTECODE="1",
+                           PYTHONPATH=audit_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""))
         try:
             r = subprocess.run(["bash", "-c", x["check"]], cwd=str(inst.root), capture_output=True, text=True,
-                               timeout=timeout, env=env)
+                               timeout=timeout, env=run_env)
             code, out = r.returncode, r.stdout + r.stderr
         except subprocess.TimeoutExpired as e:
             code, out = 124, (e.stdout or "") if isinstance(e.stdout, str) else ""
+        if audit_dir:
+            import ast
+            try:
+                audit = ast.literal_eval(Path(audit_dir, "audit.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError, SyntaxError):
+                audit = None
+            audits[x["id"]] = (audit, audit_dir)
+            shutil.rmtree(audit_dir, ignore_errors=True)
         ok, why = judge(x["pass"], code, out)
         ev = d / f"{stamp}-{x['id']}.txt"
         ev.write_text(f"$ {x['check']}\nexit={code}\n{out}", encoding="utf-8")
+        live = isinstance(x.get("live"), dict)
         gs[x["id"]] = {"ok": ok, "why": why, "ts": now_iso(), "exit": code, "evidence": str(ev.relative_to(inst.root)),
                        "duration_s": round(time.time() - t0, 1), "goals_sha": st["current"],
                        "layer": "mechanical_pass" if ok else "failed",   # B1-C：记录层面只到机械层
-                       "binding": {"goals_sha": st["current"], "evidence_sha256": _sha256_file(ev)}}
-        if isinstance(x.get("live"), dict):   # B1-C：声明了实景映射的目标，另由 live.check 实测决定能否授予 verified
+                       "binding": {"schema": GLOBAL_SCHEMA if live else MECH_SCHEMA, "goals_sha": st["current"],
+                                   "evidence_sha256": _sha256_file(ev)}}
+        if live:   # B1-C：声明了实景映射的目标，另由 live.check 实测决定能否授予 verified
             gs[x["id"]]["verified"] = _live_attest(inst, x, st, d, stamp)
+        ran.append(x)
         inst.event("goal_check", goal=x["id"], ok=ok, why="；".join(why) or None, by=by)
+    post_cache = {}
+    for x in ran:   # B2-C2b：写 v2 绑定；推导不了、运行时审计不通过、检查期间有变化时写 unbound（失败关闭，不复用）
+        if isinstance(x.get("live"), dict):
+            continue
+        rec, core, unb = gs[x["id"]], cores.get(x["id"]), ""
+        base = {"schema": MECH_SCHEMA, "closure_rule": CLOSURE_RULE, "goal_id": x["id"], "goal_sha": _goal_def_sha(x),
+                "goals_sha": st["current"], "evidence_sha256": rec["binding"]["evidence_sha256"]}
+        kind = aff = state = runtime = None
+        if isinstance(core, _Unknown):
+            unb = str(core)
+        elif core["static"]["kind"] == "unbound":
+            unb = core["static"]["why"]
+        else:
+            kind = core["static"]["kind"]
+            if kind == "python":
+                audit, adir = audits.get(x["id"], (None, ""))
+                kind, kwhy = _audit_kind(inst, core["static"], audit, adir)
+                if kind == "unbound":
+                    unb = kwhy
+                else:
+                    try:
+                        runtime = _runtime_binding(audit)
+                        if core["static"] != _closure_spec(inst, x):
+                            unb = "检查期间解释器入口或静态输入发生变化"
+                    except (KeyError, TypeError, _Unknown) as e:
+                        unb = f"运行输入无法绑定：{e}"
+            if not unb:
+                aff = core["static"].get("affects") if kind == "affects" else None
+                s0 = pre.get((x["id"], kind))
+                try:
+                    state = _closure_state(inst, kind, aff, post_cache)
+                except _Unknown as e:
+                    unb = str(e)
+                if not unb and isinstance(s0, _Unknown):
+                    unb = str(s0)
+                elif not unb and s0 != state:
+                    unb = "检查期间依赖闭包内的文件发生变化"
+        if unb:
+            rec["binding"] = dict(base, unbound=unb)
+        else:
+            rec["binding"] = dict(base, deps=core["deps"], static=core["static"], kind=kind, affects=aff, state=state)
+            if runtime is not None:
+                rec["binding"]["runtime"] = runtime
     write_json(inst.wf / "goals_state.json", gs)
     return progress(inst)
 
@@ -366,12 +1294,14 @@ def progress(inst: Instance) -> dict:
     gs = read_json(inst.wf / "goals_state.json", {}) or {}
     conf = _confirmations(inst)
     items = []
+    cache = {}
     for x in g["goals"]:
         if x["kind"] == "exec":
             r = gs.get(x["id"]) or {}
-            valid = r.get("goals_sha") == st["current"]
+            valid, vwhy = _mech_valid(inst, g, x, r, st, cache)   # B2-C2b：v2 记录按逐目标绑定，旧记录按全局 goals_sha
             ok = bool(r.get("ok")) and valid
-            detail = ("通过" if ok else ("；".join(r.get("why", [])) or "未通过")) if valid and r else "尚未检查"
+            detail = ("通过" if ok else ("；".join(r.get("why", [])) or "未通过")) if valid and r else (
+                "尚未检查" if not r or _legacy_binding(r) else "尚未检查：" + "；".join(vwhy))
         else:
             c = conf.get(x["id"]) or {}
             ok = c.get("goals_sha") == st["current"] and st["approved"]
@@ -394,7 +1324,6 @@ def progress(inst: Instance) -> dict:
             i["ok"] = False
             i["detail"] = "前置未满足：" + "；".join(why) + "（未到确认的时候，不通知）"
     na_all = policy.approvals(inst).get("not_applicable") or {}
-    cache = {}
     for x, i in zip(g["goals"], items):   # B1-C：分层只新增键，不改 ok
         _layer(inst, g, x, i, gs.get(x["id"]) or {}, na_all.get(x["id"]), st, cache)
     done = sum(1 for i in items if i["ok"])
@@ -481,9 +1410,11 @@ def _layer(inst, g, x, i, r, na, st, cache) -> None:
     i["binding"] = None
     i["na"] = None
     if x["kind"] == "exec":
-        valid = bool(r) and r.get("goals_sha") == st["current"]
+        valid = _mech_valid(inst, g, x, r, st, cache)[0]   # B2-C2b：与 progress 的 ok 用同一个判定
         if r:
-            b = dict(r.get("binding") or {"goals_sha": r.get("goals_sha")})
+            rb = r.get("binding")   # B2-C2b：绑定可能是坏格式（列表、null 等）；展示时不崩溃，判定已由 _mech_valid 拒绝
+            b = dict(rb) if isinstance(rb, dict) else {"goals_sha": r.get("goals_sha")} if "binding" not in r else \
+                {"unrecognized": True}
             es = b.get("evidence_sha256")
             b["evidence_intact"] = (_sha256_file(inst.root / str(r.get("evidence") or "")) == es) if es else None
             i["binding"] = b
