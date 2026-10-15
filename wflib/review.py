@@ -298,13 +298,18 @@ def read_package(zip_path, *, kind=None, protect=None) -> dict:
     raw = _read_bytes(Path(zip_path))
     if raw is None:
         raise WfError(f"读不了版本包：{zip_path}")
+    return _package_bytes(raw, kind=kind, protect=protect)
+
+
+def _package_bytes(raw: bytes, *, kind=None, protect=None) -> dict:
+    """同一包解析器的冻结字节入口；历史采集不重新打开磁盘路径。"""
     if len(raw) > MAX_PACKAGE_BYTES:
         raise WfError("版本包超过大小上限")
     import io
     try:
         zf = zipfile.ZipFile(io.BytesIO(raw))
     except zipfile.BadZipFile:
-        raise WfError(f"不是有效的 zip 文件：{zip_path}")
+        raise WfError("不是有效的 zip 文件")
     infos = zf.infolist()
     seen, folded, tops, entries, ignored, data = set(), {}, set(), [], [], {}
     total = 0
@@ -1183,10 +1188,16 @@ def _verifier_now() -> dict:
     return {"path": prog[0], "sha256": prog[1], "pinned": pinned, "synthetic": bool(cfg.get("synthetic")), "why": ""}
 
 
-def _evaluate(req, a: dict, now: datetime, cur_req: dict, trust: dict) -> dict:
+def _evaluate(req, a: dict, now: datetime, cur_req: dict, trust: dict, *, reader=None,
+              attempt_dir=None, lanes=None) -> dict:
     """单个尝试：从原文件重算结论与来源。req 是该尝试所属的请求（可能为 None：读不了），cur_req 是正在判定的请求，
     trust 是宿主此刻的核验器。返回 {verdict, eligible, reasons, provenance, expires_at}。"""
-    d = _attempt_dir(a["attempt_id"])
+    d = attempt_dir if attempt_dir is not None else _attempt_dir(a["attempt_id"])
+    read = reader if reader is not None else _read_bytes
+
+    def file_ok(directory, name, rec):
+        b = read(directory / name)
+        return isinstance(rec, dict) and b is not None and _sha(b) == rec.get("sha256")
     reasons, prov = [], {"level": "unavailable", "synthetic": False, "model_claimed": a.get("model_claimed"),
                          "model_verified": None, "reviewer_identity": None, "verifier_sha256": None}
     files = a.get("files") or {}
@@ -1196,16 +1207,16 @@ def _evaluate(req, a: dict, now: datetime, cur_req: dict, trust: dict) -> dict:
         req = {"request_id": a.get("request_id"), "content_id": a.get("content_id"), "author": None,
                "diff": {"sha256": None}}
     sent = a.get("sent") or {}
-    if not (_file_ok(d, "request.json", sent.get("request")) and _file_ok(d, "diff.patch", sent.get("diff"))
+    if not (file_ok(d, "request.json", sent.get("request")) and file_ok(d, "diff.patch", sent.get("diff"))
             and sent.get("diff", {}).get("sha256") == req["diff"]["sha256"]
             and sent.get("request", {}).get("sha256") == _sha(_canon(req))):
         reasons.append("sent_material_mismatch")
     code = (a.get("runner") or {}).get("exit")
     if code != 0:
         reasons.append(f"runner_exit_{code}")
-    if not all(_file_ok(d, f"{k}.bin" if k != "result" else "result.json", files.get(k)) for k in ("stdout", "stderr", "result")):
+    if not all(file_ok(d, f"{k}.bin" if k != "result" else "result.json", files.get(k)) for k in ("stdout", "stderr", "result")):
         reasons.append("raw_hash_mismatch")
-    res, _ = _last_json(_read_bytes(d / "result.json") or b"")
+    res, _ = _last_json(read(d / "result.json") or b"")
     if not isinstance(res, dict):
         reasons.append("result_invalid")
     else:
@@ -1230,9 +1241,9 @@ def _evaluate(req, a: dict, now: datetime, cur_req: dict, trust: dict) -> dict:
     else:
         prov["verifier_sha256"] = v.get("sha256")
         prov["synthetic"] = bool(v.get("synthetic"))
-        if not _file_ok(d, "verify_stdout.bin", v.get("stdout")):
+        if not file_ok(d, "verify_stdout.bin", v.get("stdout")):
             reasons.append("verify_output_hash_mismatch")
-        out, _ = _last_json(_read_bytes(d / "verify_stdout.bin") or b"")
+        out, _ = _last_json(read(d / "verify_stdout.bin") or b"")
         if not isinstance(out, dict) or v.get("exit") != 0:
             reasons.append("verify_output_invalid")
         else:
@@ -1257,7 +1268,7 @@ def _evaluate(req, a: dict, now: datetime, cur_req: dict, trust: dict) -> dict:
     else:
         ident = prov["reviewer_identity"] or {}
         sess = ident.get("session")
-        lanes = _lanes()
+        lanes = _lanes() if lanes is None else lanes
 
         def sessions_of(author):
             lane = lanes.get(author) if isinstance(author, str) and author.strip() else None
@@ -1505,3 +1516,9 @@ def consume(request_id: str, *, target, extracted_dir, now=None, install_context
             finally:
                 os.close(fd)
     return d
+
+
+def collect_install_history(context, install_ref, reader) -> dict:
+    """只读历史安装重验；所有实际读取通过调用方冻结 reader，不重新消费安装许可。"""
+    from .install_history import collect_install_history as collect
+    return collect(context, install_ref, reader)

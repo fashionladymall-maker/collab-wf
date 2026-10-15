@@ -442,6 +442,29 @@ def _new_baseline(lock, path, tx_id, req):
         config = data.decode("utf-8")
         config_state = state
     touched = req["base"]["touched"]
+    control = review._control(target)
+    control_blobs = []
+    for row in control:
+        state, data = review._source_state(lock.root, row["path"])
+        if data is not None:
+            blob = path / "blobs" / review._sha(data)
+            if not blob.exists():
+                review._write_new(blob, data, 0o400)
+            if review._sha(blob.read_bytes()) != state["sha256"]:
+                raise WfError("控制文件基线字节不一致（baseline_changed）")
+            fd = os.open(str(blob), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        control_blobs.append(state)
+    fd = os.open(str(path / "blobs"), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    if review._control(target) != control:
+        raise WfError("控制文件基线采集期间发生变化（baseline_changed）")
     runtime = None
     if lock.kind == "tool":
         from . import server
@@ -456,7 +479,7 @@ def _new_baseline(lock, path, tx_id, req):
         "protect_sha256": _digest(target["protect"]), "config_sha256": target["config_sha256"],
         "config": config, "config_state": config_state, "paths": rows, "inventory_sha256": _digest(rows),
         "protected_paths": protected, "protected_paths_sha256": _digest(protected),
-        "control": review._control(target), "touched": touched, "runtime": runtime,
+        "control": control, "control_blobs": control_blobs, "touched": touched, "runtime": runtime,
         "delete_closure_sha256": _digest([s for s in touched if s["role"] == "delete"]),
         "verified_at": review._iso(review._now()), "source": "preinstall-verified", "status": "verified"})
 
@@ -737,6 +760,7 @@ def _recover_tx(lock, path):
 
 class _InstallTx:
     def __init__(self, lock, req, src, plan, decision):
+        exec_context = _exec_context()
         lock.activate().verify()
         self.lock, self.req, self.plan = lock, req, plan
         self.tx_id = "tx-" + secrets.token_hex(16)
@@ -754,7 +778,14 @@ class _InstallTx:
             "protect_sha256": _digest(req["base"]["protect"]), "extracted_root": str(src),
             "delete_closure_sha256": _digest([s for s in req["base"]["touched"] if s["role"] == "delete"]),
             "lock": {"path": str(lock.path), "token": lock.token, "acquired_at": lock.acquired_at},
-            "times": decision["times"], "decision_sha256": _digest(decision), "request": req, "plan": plan})
+            "times": decision["times"], "decision_sha256": _digest(decision), "request": req, "plan": plan,
+            "exec": exec_context})
+        self.install_ref = {"schema": "install-ref/1", "tx_id": self.tx_id,
+                            "request_id": req["request_id"], "content_id": req["content_id"],
+                            "package_sha256": req["package"]["sha256"],
+                            "target": {"kind": req["kind"], "root": str(lock.root)},
+                            "prepared_sha256": self.prepared["body_sha256"]}
+        _emit_install_ref(self.prepared["exec"], self.install_ref)
 
     def consume(self, target, src):
         self.lock.verify()
@@ -798,6 +829,37 @@ class _InstallTx:
             "prepared_sha256": self.prepared["body_sha256"], "failed_at": review._iso(review._now()),
             "error": {"type": type(exc).__name__, "message": str(exc)[:2000]},
             "recovery": recovery})
+
+
+def _exec_context():
+    """只关联调用者，不授予安装权限。receipt FD 仅由当前 exec 子进程继承。"""
+    raw = os.environ.get("WF_INSTALL_EXEC_CONTEXT")
+    if raw is None:
+        return None
+    context = json.loads(raw)
+    if (not isinstance(context, dict) or context.get("schema") != "install-exec/1"
+            or not isinstance(context.get("subject"), dict)
+            or not isinstance(context["subject"].get("project"), str)
+            or not Path(context["subject"].get("root", "")).is_absolute()
+            or type(context.get("turn")) is not int or context["turn"] < 1
+            or not isinstance(context.get("exec"), dict)
+            or not isinstance(context["exec"].get("id"), str)
+            or not isinstance(context["exec"].get("nonce"), str)
+            or len(context["exec"]["nonce"]) != 32):
+        raise WfError("exec 安装关联身份无效（install_exec_invalid）")
+    return context
+
+
+def _emit_install_ref(context, ref):
+    if context is None:
+        return
+    fd = int(os.environ["WF_INSTALL_RECEIPT_FD"])
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise WfError("安装关联收据不是普通文件（install_exec_invalid）")
+    data = review._canon({"schema": "install-exec-receipt/1", "exec": context, "install_ref": ref}) + b"\n"
+    if os.write(fd, data) != len(data):
+        raise WfError("安装关联收据未完整写入（install_exec_invalid）")
+    os.fsync(fd)
 
 
 def _review_source(review_id, *, target, kind, dest, zip_path=None) -> Path:
@@ -1029,9 +1091,10 @@ def apply_zip(inst: Instance, zip_path=None, by="executor", *, review_id=None) -
                 head, changed = _commit(root, f"release {p['version']}", tag=p["version"])
                 res = {"version": p["version"], "commit": head, "changed": changed, "deleted": deleted,
                        "config": cfg_keys, "hints": _restart_hints(inst, changed), "notes": manifest.get("notes"),
-                       "install_tx": tx.tx_id}
+                       "install_tx": tx.tx_id, "install_ref": tx.install_ref}
                 actual = _verify_install(root, "project", protect, plan)
-                inst.event("apply", version=p["version"], commit=head, changed=len(changed), deleted=deleted or None, by=by)
+                inst.event("apply", version=p["version"], commit=head, changed=len(changed), deleted=deleted or None,
+                           by=by, install_ref=tx.install_ref, install_exec=tx.prepared["exec"])
                 tx.complete(actual)
             except BaseException as e:
                 note = "安装已消费，结果未登记成功。" if tx.started else "尚未写目标内容。"
@@ -1452,7 +1515,8 @@ def self_update(zip_path=None, skip_test=False, allow_same=False, auto=False, *,
                   + (f"看板已加载 {new}" if board_was_running else "看板未在运行")
                   + ("；" + "；".join(receipt["notes"]) if receipt["notes"] else ""), file=sys.stderr, flush=True)
             return {"from": cur, "to": new, "commit": head, "changed": changed, "tested": not skip_test,
-                    "board_restarted": restarted, "receipt": receipt, "install_tx": tx.tx_id}
+                    "board_restarted": restarted, "receipt": receipt, "install_tx": tx.tx_id,
+                    "install_ref": tx.install_ref}
 
 
 def _restart_board() -> bool:
