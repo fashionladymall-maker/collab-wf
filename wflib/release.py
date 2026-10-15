@@ -932,7 +932,25 @@ def _delete(root: Path, rels, protect, done=None) -> list:
 def _commit(root: Path, message: str, tag=None):
     if not (root / ".git").exists():
         git(["init", "-q"], root)
-    git(["add", "-A", "--", ".", ":(exclude)workflow/evidence/install", ":(exclude)local/install"], root)
+    def transaction_path(path):
+        return any(path == p or path.startswith(p + "/")
+                   for p in ("workflow/evidence/install", "local/install"))
+
+    # An excluded pathspec beneath an ignored parent makes git add fail after
+    # partially staging the tree. Enumerate tracked (including deleted) and
+    # nonignored new files instead; NUL-delimited literal paths preserve names.
+    staged = git(["diff", "--cached", "--name-only", "-z"], root).stdout.split("\0")
+    if any(transaction_path(p) for p in staged):
+        raise WfError("安装事务记录已经暂存，拒绝将其提交（install_metadata_staged）")
+    paths = git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], root).stdout.split("\0")
+    paths = sorted({p for p in paths if p and not transaction_path(p)})
+    if paths:
+        added = subprocess.run(["git", "--literal-pathspecs", "add", "-A",
+                                "--pathspec-from-file=-", "--pathspec-file-nul"],
+                               cwd=str(root), input="".join(p + "\0" for p in paths),
+                               capture_output=True, text=True)
+        if added.returncode:
+            raise WfError("git add 失败：" + (added.stderr or added.stdout).strip())
     status = [l.split("\t") for l in git(["diff", "--cached", "--name-status"], root).stdout.splitlines() if l]
     changed = [f"{x[0][0]} {x[-1]}" for x in status]
     if not changed:
