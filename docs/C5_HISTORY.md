@@ -364,24 +364,35 @@ including those inside double quotes and unquoted here-documents. Function
 definitions (`name() {...}`, `name() (...)`, `function name {...}`) do not run:
 their bodies and the substitutions of redirections written after the body
 count only where the function is invoked later in the same command (also
-through `$(name)`, `eval` or another function). Function scope follows the
-shell: an invoked function runs in the caller's shell, so definitions and
-redefinitions it makes persist; `( ... )` groups, pipeline members, background
-jobs and command substitutions work on a copy, so their definitions do not
-leak. A function shadows a command of the same name, including `wf`. The
-unqualified `time` keyword (with `-p`) times the following command, which may
-be a function; a path such as `/usr/bin/time` is an external wrapper. `command`,
-`env`, `exec` and the other wrappers bypass functions, and `command -v`/`-V`
-(also combined, e.g. `-pv`) only query and do not execute. Nesting beyond six
-levels (deep recursion) is explicitly unknown. The selftests compare these
-cases with real Bash, using a stand-in `wf` that only records its arguments. A command
+through `$(name)`, `eval` or another function). A function shadows a command
+of the same name, including `wf`. Compound commands (`{ }`, `if`, `case`,
+`for`/`while`/`until`/`select`) are parsed as one item, so the scope of a
+pipeline member or background job covers everything inside it.
+
+| syntax | can a definition or redefinition affect the parent shell |
+|---|---|
+| top level, invoked `{ ... }` function body, `{ ...; }` brace group, `eval` | yes |
+| `( ... )` group, invoked `name() ( ... )` body, command substitution | no |
+| any pipeline member or background job, including a brace group or function call there | no (default Bash, `lastpipe` off) |
+| `time f` (unqualified keyword, optional `-p`) | as the scope of `f`'s body |
+| external `time` path, `command`, `env`, `exec` and other wrappers | they bypass shell functions; `command f`/`env f` never call the function |
+| right side of `&&`/`\|\|`, inside `if`/`case`/loops | possibly: the condition is not evaluated, so a later call is the union of every possible definition and the external command (may over-report, never hides) |
+| uncalled body, definition-trailing redirection | not run; evaluated on each invocation |
+
+`command -v`/`-V` (also combined, e.g. `-pv`) only query and do not execute.
+Nesting beyond six levels (deep recursion) is explicitly unknown. The
+selftests compare these rows, each with definition and shadow/redefinition
+contrasts, and the earlier 31-case matrix with real Bash, using a stand-in
+`wf` that only records its arguments; only the conditional row may
+over-report (four recorded cases). A command
 that mentions a wf entry but cannot be tokenized is `parsed=false`, kind
 unknown. Rows carry `legacy_command` `{schema, entry, kind, parsed}` as a
 diagnostic only; no installation reference is derived from a basename or
 command string. Conditions are not evaluated: commands in `if`/`case`/loop
-branches are counted as if they run (conservative). Scripts, aliases,
-variables, functions defined outside the command (for example in a sourced
-file) and other indirection are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
+branches and after `&&`/`||` are counted as if they run, and definitions there
+are only possible (conservative). Scripts, aliases, variables, `lastpipe`,
+functions defined outside the command (for example in a sourced file) and
+other indirection are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
 report path reads the parsed first package operand and reports
 `旧版安装命令无法解析（unknown）` when none exists. A missing legacy package or
 review result is frozen as an absent source and reported (`没有记录` /

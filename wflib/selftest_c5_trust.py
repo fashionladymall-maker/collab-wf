@@ -52,6 +52,99 @@ BASH_ORACLE = [
 ]
 
 
+# Scope of function definitions per supported syntax, compared with real Bash.
+# Rows marked CONSERVATIVE: conditions are not evaluated, so a definition
+# reached only conditionally must never hide a command Bash runs; reporting a
+# command Bash skipped there is an accepted over-report.
+SCOPE_TABLE = {
+ "parent: top-level / { } function / brace group / eval": [
+  "wf() { :; }; wf self-update x.zip",
+  "setup() { wf() { :; }; }; setup; wf self-update x.zip",
+  "{ wf() { :; }; }; wf self-update x.zip",
+  "eval 'wf() { :; }'; wf self-update x.zip",
+  "f() { :; }; setup() { f() { wf self-update used.zip; }; }; setup; f",
+  "{ f() { wf self-update used.zip; }; }; f",
+  "f() { :; }; eval 'f() { wf apply ev.zip; }'; f",
+ ],
+ "no leak: ( ) group / name() ( ) body / command substitution": [
+  "(wf() { :; }); wf self-update leak.zip",
+  "setup() ( wf() { :; }; ); setup; wf self-update used.zip",
+  "setup() ( f() { wf self-update unused.zip; }; ); setup; f",
+  'echo "$(wf() { :; })"; wf self-update leak.zip',
+  "f() { wf apply keep.zip; }; (f() { :; }); f",
+  "f() { wf apply keep.zip; }; setup() ( f() { :; }; ); setup; f",
+  'f() { wf apply keep.zip; }; echo "$(f() { :; })"; f',
+  "(wf() { :; }; wf self-update inner.zip)",
+  "setup() ( wf() { :; }; wf self-update inner.zip ); setup",
+ ],
+ "no leak: pipeline member / background job (incl. brace group, call)": [
+  "setup() { wf() { :; }; }; setup | cat; wf self-update leak.zip",
+  "setup() { wf() { :; }; }; { setup; } | cat; wf self-update used.zip",
+  "setup() { wf() { :; }; }; { setup; } & wait; wf self-update used.zip",
+  "setup() { wf() { :; }; }; setup & wait; wf self-update leak.zip",
+  "{ wf() { :; }; } | cat; wf self-update leak.zip",
+  "true | { wf() { :; }; }; wf self-update leak.zip",
+  "f() { wf apply keep.zip; }; { f() { :; }; } | cat; f",
+  "{ wf() { :; }; wf self-update inner.zip; } | cat",
+  "if true; then wf() { :; }; fi | cat; wf self-update leak.zip",
+  "setup() { wf() { :; }; }; setup && wf self-update shadowed.zip",
+ ],
+ "time keyword follows the timed function's scope": [
+  "f() { wf self-update used.zip; }; time f",
+  "setup() { wf() { :; }; }; time setup; wf self-update x.zip",
+  "setup() ( wf() { :; }; ); time setup; wf self-update used.zip",
+  "time { wf() { :; }; }; wf self-update x.zip",
+ ],
+ "external time/command/env/exec bypass shell functions": [
+  "f() { wf apply x.zip; }; command f", "f() { wf apply x.zip; }; env f", "f() { wf apply x.zip; }; EXT_TIME f",
+  "EXT_TIME wf self-update ext.zip", "wf() { :; }; command wf self-update real.zip",
+  "wf() { :; }; env wf self-update real.zip", "wf() { :; }; exec wf self-update real.zip",
+  "setup() { wf() { :; }; }; env setup; wf self-update x.zip", "command -v wf self-update",
+ ],
+ "CONSERVATIVE conditional (&&, ||, if/case/loops not evaluated): never hide": [
+  "if true; then wf() { :; }; fi; wf self-update x.zip",
+  "if false; then wf() { :; }; fi; wf self-update x.zip",
+  "true && wf() { :; }; wf self-update x.zip",
+  "false && wf() { :; }; wf self-update x.zip",
+  "true || wf() { :; }; wf self-update x.zip",
+  "false || setup() { g() { wf apply x.zip; }; }; setup; g",
+  "while false; do wf() { :; }; done; wf self-update x.zip",
+  "for i in 1; do f() { wf apply loop.zip; }; done; f",
+  "case a in a) wf() { :; };; esac; wf self-update x.zip",
+  "if true; then f() { wf apply x.zip; }; fi; f",
+  "f() { wf apply keep.zip; }; if true; then f() { :; }; fi; f",
+ ],
+ "uncalled body / definition redirection: not run; run on call": [
+  "helper() { wf self-update unused.zip; }; printf ordinary", "helper() { wf self-update used.zip; }; helper",
+  'f() { :; } >"$(wf self-update unused.zip)"', 'f() { :; } >"$(wf self-update used.zip)"; f',
+  'f() ( : ) >"$(wf self-update unused.zip)"', 'f() ( : ) >"$(wf self-update used.zip)"; f',
+  '{ :; } >"$(wf self-update used.zip)"',
+ ],
+}
+
+
+def bash_trace_kind(command):
+    """Run ``command`` in real Bash with a stand-in wf that only records argv."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        folder = Path(folder)
+        (folder / "bin").mkdir()
+        trace = folder / "trace"
+        (folder / "bin" / "wf").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$WF_TRACE"\n')
+        (folder / "bin" / "time").write_text('#!/bin/sh\nexec "$@"\n')   # stand-in external time
+        for name in ("wf", "time"):
+            (folder / "bin" / name).chmod(0o755)
+        command = command.replace("EXT_TIME", str(folder / "bin" / "time"))
+        subprocess.run(["bash", "-c", command], cwd=folder, capture_output=True, timeout=20,
+                       env={"PATH": f"{folder / 'bin'}:/usr/bin:/bin", "WF_TRACE": str(trace), "HOME": str(folder)})
+        calls = trace.read_text().splitlines() if trace.exists() else []
+        classified = (live._legacy_install(command) or {}).get("kind")
+    kinds = {"self-update": "tool", "apply": "project"}
+    executed = next((kinds[c.split()[0]] for c in calls if c.split() and c.split()[0] in kinds), None)
+    return executed, classified, calls
+
+
 class _Fixture(unittest.TestCase):
     """Two real protected installs (project + tool) through ops.run_exec."""
     # "unmarked": output and transport omit synthetic (reviewed counterexample);
@@ -670,7 +763,8 @@ class LegacyEntryTests(_Fixture):
         before = stores()
         for command in ("helper() { wf self-update unused.zip; }; printf '%s\\n' ordinary",
                         "setup() { wf() { :; }; }; setup; wf self-update unused.zip",
-                        'f() { :; } >"$(wf self-update unused.zip)"'):
+                        'f() { :; } >"$(wf self-update unused.zip)"',
+                        "setup() ( f() { wf self-update unused.zip; }; ); setup; f; :"):
             self.assertEqual(ops.run_exec(inst, command, by="driver"), 0, command)
             seq = live._strict_log(inst.events_path.read_bytes(), inst.events_path)[-1]["seq"]
             self.assertEqual(stores(), before, command)
@@ -685,27 +779,32 @@ class LegacyEntryTests(_Fixture):
     def test_classifier_agrees_with_real_bash_argv_trace(self):
         """Stand-in argv trace: a wf on PATH that only records its arguments."""
         import shutil
-        import subprocess
-        import tempfile
         if shutil.which("bash") is None:
             self.skipTest("bash unavailable")
         for command in BASH_ORACLE:
-            with tempfile.TemporaryDirectory() as folder:
-                folder = Path(folder)
-                (folder / "bin").mkdir()
-                trace = folder / "trace"
-                (folder / "bin" / "wf").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$WF_TRACE"\n')
-                (folder / "bin" / "time").write_text('#!/bin/sh\nexec "$@"\n')   # stand-in external time
-                for name in ("wf", "time"):
-                    (folder / "bin" / name).chmod(0o755)
-                command = command.replace("EXT_TIME", str(folder / "bin" / "time"))
-                subprocess.run(["bash", "-c", command], cwd=folder, capture_output=True, timeout=20,
-                               env={"PATH": f"{folder / 'bin'}:/usr/bin:/bin", "WF_TRACE": str(trace),
-                                    "HOME": str(folder)})
-                calls = trace.read_text().splitlines() if trace.exists() else []
-                kinds = {"self-update": "tool", "apply": "project"}
-                executed = next((kinds[c.split()[0]] for c in calls if c.split() and c.split()[0] in kinds), None)
-                self.assertEqual((live._legacy_install(command) or {}).get("kind"), executed, (command, calls))
+            executed, classified, calls = bash_trace_kind(command)
+            self.assertEqual(classified, executed, (command, calls))
+
+    def test_scope_table_agrees_with_real_bash_argv_trace(self):
+        """Definition scope per supported syntax, each row with shadow/redefinition contrasts."""
+        import shutil
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        over, executed_rows = [], 0
+        for row, commands in SCOPE_TABLE.items():
+            for command in commands:
+                executed, classified, calls = bash_trace_kind(command)
+                if row.startswith("CONSERVATIVE") and executed is None:
+                    if classified is not None:
+                        over.append(command)
+                    continue
+                executed_rows += executed is not None
+                self.assertEqual(classified, executed, (row, command, calls))
+        self.assertEqual(sorted(over), sorted([
+            "if true; then wf() { :; }; fi; wf self-update x.zip", "true && wf() { :; }; wf self-update x.zip",
+            "case a in a) wf() { :; };; esac; wf self-update x.zip",
+            "f() { wf apply keep.zip; }; if true; then f() { :; }; fi; f"]))
+        self.assertGreater(executed_rows, 20)
 
     def test_pre_receipt_events_and_classifier(self):
         reader = SimpleNamespace(bytes=lambda path: None,

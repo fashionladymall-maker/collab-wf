@@ -294,7 +294,7 @@ def _function_body(tokens, j):
             if token[0] == "word" and at_command and token[1] in ("{", "}"):
                 depth += 1 if token[1] == "{" else -1
                 if depth == 0:
-                    return tokens[j + 1:k], k + 1
+                    return tokens[j + 1:k], k + 1, False
             k += 1
         raise ValueError("unterminated function body")
     if j < len(tokens) and tokens[j] == ("op", "("):
@@ -303,20 +303,64 @@ def _function_body(tokens, j):
             if tokens[k] in (("op", "("), ("op", ")")):
                 depth += 1 if tokens[k][1] == "(" else -1
                 if depth == 0:
-                    return tokens[j + 1:k], k + 1
+                    return tokens[j + 1:k], k + 1, True   # name() ( ... ) runs in a subshell
             k += 1
         raise ValueError("unterminated function body")
     raise ValueError("unsupported function body")
+
+
+_COMPOUND_CLOSERS = {"{": "}", "if": "fi", "case": "esac", "for": "done", "while": "done", "until": "done",
+                     "select": "done"}
+_COMMAND_PREFIXES = {"!", "then", "do", "else", "elif", "time"}
+
+
+def _at_command(argv, subs):
+    """True when the next word starts a command (only prefix keywords so far)."""
+    if subs:
+        return False
+    k = 0
+    while k < len(argv):
+        if argv[k] == "time":
+            k += 1
+            while k < len(argv) and argv[k].startswith("-"):
+                k += 1
+        elif argv[k] in _COMMAND_PREFIXES:
+            k += 1
+        else:
+            return False
+    return True
+
+
+def _compound_end(tokens, i):
+    """Index of the closer matching the compound opener at i (nesting aware)."""
+    stack, k = [_COMPOUND_CLOSERS[tokens[i][1]]], i + 1
+    while k < len(tokens):
+        token = tokens[k]
+        previous = tokens[k - 1]
+        at_command = k == i + 1 or previous[0] == "op" \
+            or (previous[0] == "word" and previous[1] in _COMMAND_PREFIXES)
+        if token[0] == "word" and at_command:
+            if token[1] == stack[-1]:
+                stack.pop()
+                if not stack:
+                    return k
+            elif token[1] in _COMPOUND_CLOSERS:
+                stack.append(_COMPOUND_CLOSERS[token[1]])
+        k += 1
+    raise ValueError("unterminated compound command")
 
 
 _LEGACY_MAX_DEPTH = 6
 
 
 def _parse_items(tokens, i=0, nested=False):
-    """Items of one shell list: ``("seg", argv, subs, isolated)``,
-    ``("def", name, body_items, redirect_subs, isolated)`` and
-    ``("sub", items)`` for ``( ... )``. ``isolated`` marks pipeline members
-    and background jobs, which run in a subshell.
+    """Items of one shell list: ``("seg", argv, subs, isolated, conditional)``,
+    ``("def", name, body_items, redirect_subs, subshell_body, isolated,
+    conditional)``, ``("group", items, redirect_subs, isolated, conditional)``
+    for compound commands (``{ }``, ``if``, ``case``, loops) and
+    ``("sub", items)`` for ``( ... )``. ``isolated`` marks pipeline members and
+    background jobs, which run in a subshell with everything inside them;
+    ``conditional`` marks items after ``&&``/``||`` and keyword compounds.
     """
     import re
     items, seps, argv, subs = [], [], [], []
@@ -332,9 +376,25 @@ def _parse_items(tokens, i=0, nested=False):
     def finish():
         out = []
         for k, item in enumerate(items):
+            # Every pipeline member and background job runs in a subshell; the
+            # flag applies to the whole item (segment, group or definition).
             isolated = seps[k] in ("|", "|&", "&") or (k > 0 and seps[k - 1] in ("|", "|&"))
-            out.append(("sub", item[1]) if item[0] == "sub" else tuple(item) + (isolated,))
+            conditional = (k > 0 and seps[k - 1] in ("&&", "||")) \
+                or (item[0] == "group" and item[3] != "{")
+            if item[0] == "sub":
+                out.append(("sub", item[1]))
+            elif item[0] == "group":
+                out.append(("group", item[1], item[2], isolated, conditional))
+            else:
+                out.append(tuple(item) + (isolated, conditional))
         return out
+
+    def trailing_subs(j):
+        found = []
+        while j < n and tokens[j][0] == "subs":
+            found.extend(tokens[j][1])
+            j += 1
+        return found, j
 
     while i < n:
         token = tokens[i]
@@ -356,7 +416,17 @@ def _parse_items(tokens, i=0, nested=False):
             subs = subs + list(token[1])
             i += 1
             continue
-        if not argv and not subs:
+        if token[1] in _COMPOUND_CLOSERS and _at_command(argv, subs):
+            # A compound command is one item: its own separators decide whether
+            # it runs in the current shell or in a subshell.
+            flush()
+            opener = i
+            end = _compound_end(tokens, opener)
+            redirect, i = trailing_subs(end + 1)
+            items.append(["group", _parse_items(tokens[opener + 1:end])[0], redirect, tokens[opener][1]])
+            seps.append(None)
+            continue
+        if _at_command(argv, subs):
             name, j = None, None
             if i + 2 < n and tokens[i + 1] == ("op", "(") and tokens[i + 2] == ("op", ")") \
                     and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]*", token[1]) and token[1] not in _SHELL_RESERVED:
@@ -366,16 +436,14 @@ def _parse_items(tokens, i=0, nested=False):
                 if j + 1 < n and tokens[j] == ("op", "(") and tokens[j + 1] == ("op", ")"):
                     j += 2
             if name is not None:
+                flush()   # prefix keywords such as ``then`` are not part of it
                 while j < n and tokens[j] == ("op", "\n"):
                     j += 1
-                body, i = _function_body(tokens, j)
+                body, i, subshell = _function_body(tokens, j)
                 # Redirections after the body (and their substitutions) belong
                 # to the definition and run only when the function is invoked.
-                redirect = []
-                while i < n and tokens[i][0] == "subs":
-                    redirect.extend(tokens[i][1])
-                    i += 1
-                items.append(["def", name, _parse_items(body)[0], redirect])
+                redirect, i = trailing_subs(i)
+                items.append(["def", name, _parse_items(body)[0], redirect, subshell])
                 seps.append(None)
                 continue
         argv.append(token[1])
@@ -404,28 +472,60 @@ def _pick_legacy(hits):
     return None
 
 
-def _classify_items(items, depth, env):
-    """Hits of the commands that actually run, in order.
+def _env_copy(env):
+    return dict(env)
 
-    ``env`` is the function table of the current shell and is updated in
-    place: a definition (also one made inside an invoked function or eval)
-    persists for later commands. Subshells (``( ... )``, pipeline members,
-    background jobs, command substitutions) work on a copy.
+
+def _run_maybe(env, run):
+    """Run on a trial copy; merge every changed name back as a possibility."""
+    trial = _env_copy(env)
+    hits = run(trial)
+    for name, entry in trial.items():
+        if env.get(name) != entry:
+            before = env.get(name) or {"defs": [], "external": True}
+            env[name] = {"defs": before["defs"] + [d for d in entry["defs"] if d not in before["defs"]],
+                         "external": before["external"] or entry["external"]}
+    return hits
+
+
+def _classify_items(items, depth, env):
+    """Hits of the commands that actually (or possibly) run, in order.
+
+    ``env`` maps a function name to ``{"defs": [...], "external": bool}`` for
+    the current shell and is updated in place: a definition (also one made in
+    an invoked ``{ }`` function, a brace group or eval) persists. Subshells
+    (``( ... )``, ``name() ( ... )`` bodies, pipeline members, background
+    jobs, command substitutions) work on a copy. Conditions are not evaluated:
+    items after ``&&``/``||`` and inside ``if``/``case``/loop compounds run on a
+    trial copy whose definitions are merged back as possibilities, so a
+    conditional definition can over-report but never hide a later command.
     """
     hits = []
     for item in items:
-        if item[0] == "def":
-            _, name, body, redirect, isolated = item
-            if not isolated:
-                env[name] = (body, redirect)
-            continue
         if item[0] == "sub":
-            hits.extend(_classify_items(item[1], depth, dict(env)))
+            hits.extend(_classify_items(item[1], depth, _env_copy(env)))
             continue
-        _, argv, subs, isolated = item
-        scope = dict(env) if isolated else env
-        hits.extend(_legacy_install(body, depth + 1, dict(scope)) for body in subs)
-        hits.append(_legacy_simple(argv, depth, scope))
+        isolated, conditional = item[-2], item[-1]
+
+        def run(scope, item=item):
+            if item[0] == "def":
+                _, name, body, redirect, subshell = item[:5]
+                scope[name] = {"defs": [(body, redirect, subshell)], "external": False}
+                return []
+            if item[0] == "group":
+                _, inner, redirect = item[:3]
+                found = [_legacy_install(text, depth + 1, _env_copy(scope)) for text in redirect]
+                return found + _classify_items(inner, depth, scope)
+            _, argv, subs = item[:3]
+            found = [_legacy_install(text, depth + 1, _env_copy(scope)) for text in subs]
+            return found + [_legacy_simple(argv, depth, scope)]
+
+        if isolated:
+            hits.extend(run(_env_copy(env)))
+        elif conditional:
+            hits.extend(_run_maybe(env, run))
+        else:
+            hits.extend(run(env))
     return hits
 
 
@@ -472,15 +572,39 @@ def _legacy_simple(argv, depth, functions=None):
                 i += 1
         else:
             break
-    if i < n and functions is not None and argv[i] in functions:
-        # A shell function shadows any command of the same name (including wf)
-        # and runs in the current shell: definitions it makes persist.
-        if depth >= _LEGACY_MAX_DEPTH:
-            return _unknown_legacy()
-        body, redirect = functions[argv[i]]
-        hits = [_legacy_install(text, depth + 1, dict(functions)) for text in redirect]
-        hits.extend(_classify_items(body, depth + 1, functions))
-        return _pick_legacy(hits)
+    entry = functions.get(argv[i]) if i < n and functions is not None else None
+    if entry is None:
+        return _legacy_command(argv, i, depth, functions)
+    # A shell function shadows any command of the same name (including wf).
+    if depth >= _LEGACY_MAX_DEPTH:
+        return _unknown_legacy()
+    hits = []
+    if len(entry["defs"]) == 1 and not entry["external"]:
+        hits.extend(_invoke_definition(entry["defs"][0], depth, functions))
+    else:
+        # Only possibly defined (or one of several definitions): every
+        # possibility counts and their effects persist as possibilities.
+        for definition in entry["defs"]:
+            hits.extend(_run_maybe(functions, lambda trial, d=definition: _invoke_definition(d, depth, trial)))
+        if entry["external"]:
+            hits.append(_legacy_command(argv, i, depth, functions))
+    return _pick_legacy(hits)
+
+
+def _invoke_definition(definition, depth, env):
+    """Hits of one function invocation: redirection substitutions, then body."""
+    body, redirect, subshell = definition
+    hits = [_legacy_install(text, depth + 1, _env_copy(env)) for text in redirect]
+    # A { ... } body runs in the caller's shell; a ( ... ) body in a subshell.
+    hits.extend(_classify_items(body, depth + 1, _env_copy(env) if subshell else env))
+    return hits
+
+
+def _legacy_command(argv, i, depth, functions=None):
+    """Resolve argv[i:] as a command that is not a shell function."""
+    import re
+    n = len(argv)
+    assignment = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
     while i < n and argv[i].rsplit("/", 1)[-1] in _WRAPPERS:
         wrapper = argv[i].rsplit("/", 1)[-1]
         i += 1
