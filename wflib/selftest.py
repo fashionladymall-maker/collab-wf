@@ -121,6 +121,11 @@ def _run_checks() -> int:
     run_v15(_ok)
     from .selftest_v18 import run_v18   # 1.8.2 新增检查，计入总数
     run_v18(_ok)
+    # IC-2（批次 1）：只接入已合入 integ/batch1 的车道检查，计入总数；与上面一样运行在本子进程的隔离环境里
+    # （WF_NOTIFY=0、临时 WF_LOCAL_DIR）。尚未合入的车道不在这里导入。
+    print("  —— B1-C 车道检查（证据分层与不适用）——", flush=True)
+    from .selftest_lane_c import run_lane_c
+    run_lane_c(_ok)
     tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-"))
     env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local"), "WF_NOTIFY": "0"}   # 子进程里本来就是 0，这里照旧写明
     env.pop("VIRTUAL_ENV", None)
