@@ -3,6 +3,8 @@
 其中几条用真实发生过的情形做回归样例（见各条名称）。"""
 from __future__ import annotations
 
+from .selftest_send_fixtures import send_context, send_host, register as register_send_fixture
+
 import json
 import os
 import tempfile
@@ -843,6 +845,7 @@ def _t_v161_neutral(_ok):
         and any(e.get("type") == "approve" and e.get("by") == "driver" for e in evs), f"{f1} {f2} {s1} {s2}")
 
 
+@send_host()
 def _t_v161_unattended(_ok):
     import subprocess
     from datetime import timedelta
@@ -877,7 +880,8 @@ def _t_v161_unattended(_ok):
         inst.state.update(state="COMPOSE", outgoing={"turn": 1, "file": str(out), "kind": "task", "effort": "high"},
                           budget={"date": now().strftime("%Y-%m-%d"), "rounds": 5})
         inst.save()
-        r = driver.h_compose(driver.Ctx(inst, {"max_rounds_per_day": 5}, time.time() + 60))
+        register_send_fixture(inst)
+        r = driver.h_compose(send_context(inst, {"max_rounds_per_day": 5}, time.time() + 60))
         tomorrow = (now() + timedelta(days=1)).strftime("%Y-%m-%d")
         st = inst.state
         _ok("1.6.1 每日轮次上限：上限不变，但不再停下等人，等到第二天自动继续",
@@ -1413,6 +1417,7 @@ def _t_v175_pause(_ok):
         str([o0[-120:], o1[-80:], it1.get("command"), o2[-120:], un[-1:] if un else None, o4[-160:], o5[-160:]])[:900])
 
 
+@send_host("_v169_inst")
 def _t_v176_compose(_ok):
     import time as _t
     from . import driver, machine
@@ -1427,13 +1432,13 @@ def _t_v176_compose(_ok):
         (a.turn_dir(4) / "intake.json").write_text(json.dumps({"effort": "high", "blocks_missing": ["本轮结论"]}), encoding="utf-8")
         a.state.update(compose_reason="continue", continue_streak=1, pending_tell=[{"ts": "2026-10-12T15:00:00", "text": "测试：块规格补充"}])
         a.save()
-        driver.h_compose(driver.Ctx(a, {}, _t.time() + 60))
+        driver.h_compose(send_context(a, {}, _t.time() + 60))
         body = (a.outbox / "turn-005.md").read_text(encoding="utf-8") if (a.outbox / "turn-005.md").exists() else ""
         after = dict(a.state)
         b = _v169_inst(td, "v176-b")
         b.state.update(state="INTAKE", turn=9, continue_streak=3, turn_flags={})
         b.save()
-        r = driver._anomaly(driver.Ctx(b, {}, _t.time() + 60), {"source": "intake", "kind": "missing_blocks"}, "测试")
+        r = driver._anomaly(send_context(b, {}, _t.time() + 60), {"source": "intake", "kind": "missing_blocks"}, "测试")
         bst = read_json(b.root / "workflow" / "state.json", {}) or {}
     _ok("1.7.6 续接：进入新一轮时清掉续接标记；续接消息带块规格与没识别到的块、用过即清；wf tell 的说明附在消息末尾；"
         "连续 3 轮续接后停下",
