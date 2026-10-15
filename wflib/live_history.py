@@ -35,9 +35,11 @@ def _query_key(root, argv):
                    and re.fullmatch(oid, argv[2])))
     if not allowed:
         raise _problem("unsupported", root, "historical Git query is outside the read-only protocol")
-    root = Path(root).absolute()
-    if str(root) != str(root.resolve()):
-        raise _problem("unsupported", root, "historical Git root is not canonical")
+    # Frozen replay validates names only. Current path identity belongs to
+    # capture and must not change replies already held in a snapshot.
+    root = Path(root)
+    if not root.is_absolute() or ".." in root.parts:
+        raise _problem("unsupported", root, "historical Git root must be lexically absolute")
     return _canonical([str(root), argv])
 
 
@@ -146,9 +148,11 @@ class CaptureReader:
         return record
 
     def git(self, root, argv):
+        root = Path(root).absolute()
         key = _query_key(root, argv)
+        if str(root) != str(root.resolve()):
+            raise _problem("unsupported", root, "historical Git root is not canonical")
         if key not in self._queries:
-            root = Path(root).absolute()
             repository = self._repository(root)
             reply = _run(repository["executable"], root, argv, repository["environment"])
             self._reply_bytes += len(reply["stdout"]) + len(reply["stderr"])

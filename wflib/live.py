@@ -641,7 +641,8 @@ class _FrozenInputs:
         return self.json(Path(self.root) / "workflow" / "state.json")
 
     def head_at(self, root, ts):
-        if str(Path(root).resolve()) != self.root:
+        path = Path(root)
+        if not path.is_absolute() or ".." in path.parts or str(path) != self.root:
             raise _InputProblem("corrupt", root, "Git root mismatch")
         return dict(self.descriptor["git"]["heads"]).get(ts, "")
 

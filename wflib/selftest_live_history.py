@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 
 def run_reader_tests(ok):
@@ -129,3 +130,25 @@ def run_reader_tests(ok):
         git("config", "include.path", str(root / "external-config"))
         ok("C5 reader: config includes are rejected before provider object reads",
            state(lambda: reader()[0].git(repo, ["cat-file", "blob", blob])) == "unsupported")
+        try:
+            with patch.object(Path, "resolve", side_effect=AssertionError("frozen replay resolved current filesystem")):
+                replay = FrozenReader(snapshot, first)
+                pure_replay = replay.git(repo, ["cat-file", "blob", blob]) == got
+                heads = live._FrozenInputs(repo, "fixture", {}, {"git": {"heads": [["original", oid]]}})
+                pure_replay = pure_replay and heads.head_at(repo, "original") == oid
+                pure_replay = pure_replay and all(
+                    state(lambda path=path: replay.git(path, ["cat-file", "blob", blob])) == "unsupported"
+                    for path in (Path("relative"), repo / ".." / "repo"))
+        except AssertionError:
+            pure_replay = False
+        ok("C5 reader: frozen construction, queries and historical HEAD use no filesystem resolution", pure_replay)
+        moved = root / "moved"
+        repo.rename(moved)
+        repo.symlink_to(moved, target_is_directory=True)
+        try:
+            stable = frozen.git(repo, ["cat-file", "blob", blob]) == got and heads.head_at(repo, "original") == oid
+        except live._InputProblem:
+            stable = False
+        ok("C5 reader: frozen reply survives current root becoming a symlink while fresh capture rejects it",
+           stable and all(state(lambda current=current: current.git(repo, ["cat-file", "blob", blob])) == "unsupported"
+                          for current in (capture, reader()[0])))

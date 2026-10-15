@@ -86,7 +86,8 @@ class C5IntegrationTests(unittest.TestCase):
         # Frozen replay cannot read disk through mutable review helpers.
         with patch.object(review, "_read_bytes", side_effect=AssertionError("global read")), \
              patch.object(review, "_target", side_effect=AssertionError("current target")), \
-             patch.object(review, "consume", side_effect=AssertionError("install write")):
+             patch.object(review, "consume", side_effect=AssertionError("install write")), \
+             patch.object(Path, "resolve", side_effect=AssertionError("frozen replay filesystem resolution")):
             self.assertEqual(live._evaluate_snapshot(snap), result)
         # Direct reporting takes the same structured route for commands whose
         # long Python invocation has no parseable final ZIP token.
