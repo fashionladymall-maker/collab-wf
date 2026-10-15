@@ -958,6 +958,105 @@ def h_compose(ctx):
     return "progress", f"消息已就绪（{out['kind']}，档位 {out['effort']}）"
 
 
+def _verify_pending(ctx, out, turn, intent):
+    """结果不明的核对（原 h_send 分支，B3 抽出供 accepted 恢复复用）：只轮询确认，不 acquire、不借用、不重发。"""
+    inst, st = ctx.inst, ctx.st
+    tdir = inst.turn_dir()
+    _slot_missing_check(ctx, "发送结果不明的核对")   # B1-A r2：缺 token 也留痕；只核对，不 acquire、不借用、不重发
+    intent = json.loads(json.dumps(intent))
+    pargs = ["--project", inst.name, "--turn", turn, "--ref", intent.get("ref") or "", "--out", tdir / "delivered"]
+    pargs += anomaly.conv_args(inst)   # 1.7.0（ISOLATION.md S1）：本项目的对话
+    if not intent.get("ref"):
+        try:
+            old_out = _check_attempt(ctx, intent)
+        except _PermissionError as e:
+            return _outgoing_stop(ctx, e)
+    if not intent.get("ref") and anomaly.transport_cfg().get("poll_since"):
+        # 1.5.1：没有 ref 时，让适配器按“发送时刻之后、内容与本轮消息相同的那条消息”定位（transport.json 的 poll_since）
+        pargs += ["--since", intent.get("ts") or "", "--message", old_out["file"],
+                  "--prev-ref", st.get("send_ref") or ""]   # 上一轮的 ref 原样交回，适配器可据此找到会话
+    r = anomaly.call("poll", pargs, env_extra=page.poll_env(inst))   # 1.5.3：顺带写 Claude 页面快照
+    inst.save()
+    if st.get("send_intent") != intent or st.get("turn") != turn:
+        return "user", "核对期间发送意图已改变，未把旧轮询结果记到新意图"
+    _adapter_warning(inst, "poll", r)
+    page.after_poll(inst, "poll", r["data"].get("status"))
+    status = r["data"].get("status")
+    _read_error_track(st, status == "read_error")   # 1.9.7
+    if r["code"] == 0 and status in ("generating", "done"):
+        st["send_intent"].update(status="accepted", ref=r["data"].get("ref") or intent.get("ref"))
+        _send_meta(inst, r["data"], confirmed_by="poll")   # 1.9.4：结果不明后经轮询确认的发送，也记下消息 uuid
+        return _finalize_send(ctx, out, "发送曾被中断，经轮询确认消息已被接受", immediate=(status == "done"))
+    if status == "read_error":   # 1.9.6：适配器读不了通道，不等于“没有回复”：单独处置，不消耗“结果不明”的等待窗口
+        return _anomaly(ctx, {"source": "driver", "kind": "poll_read_error"},
+                        f"发送意图 {intent.get('ts')} 待确认，但轮询读不了通道（read_error）：{(r['data'].get('error') or r['raw'])[:160]}")
+    # 1.5.1：policy 的 send_unknown_wait 为真时先自动等待并反复确认（长回复可达半小时以上），绝不自动重发
+    return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
+                    f"发送意图 {intent.get('ts')} 结果不明；轮询返回 {status or r['raw'][:120]}")
+
+
+def _accepted_unfinished(ctx, intent):
+    """B3（S02a）：SEND 状态下留着本轮 accepted 意图，说明通道已接受、登记没走完（_finalize_send 与 mark_sent 之间中断）。
+    绝不当作未发送：先核对正文绑定（项目根、轮次、副本），再降为待核对（保留 ref，记 accepted 来源），只轮询确认；
+    不发送、不取新租约。返回 None 表示已降级、可以核对；否则是停下的结果。"""
+    try:
+        _check_attempt(ctx, intent)
+    except _PermissionError as e:
+        return _outgoing_stop(ctx, e)
+    it = ctx.st["send_intent"]
+    it["status"] = "pending"
+    it.setdefault("origin", "accepted_unfinished")
+    ctx.inst.event("auto", rule="SEND_ACCEPTED_UNFINISHED", action="verify",
+                   detail=f"第 {it['turn']} 轮的发送已被接受但登记未完成：只轮询核对，不重发", by="driver")
+    ctx.inst.save()
+    return None
+
+
+def _ref_less_locate(ctx):
+    """B3（S03）：WAIT_REPLY 没有 send_ref。只有本轮确由驱动器外发、留有可核对的持久证据，且通道支持按发送时刻与正文
+    定位（transport.json 的 poll_since）时，才返回定位参数；只轮询，不发送、不取或释放发送槽、不清任何外发标记。
+    证据二选一：本轮的发送意图（pending/accepted，正文绑定核对通过）；或意图已清（双缺字段）时，_finalize_send 记下的
+    last_sent（本轮、本轮证据目录里的正文副本、外发前的意图时刻 sent_ts）。都没有就是真正的 NO_REF，返回 None。"""
+    st = ctx.st
+    turn = st.get("turn")
+    if type(turn) is not int or turn <= 0 or not anomaly.transport_cfg().get("poll_since"):
+        return None
+    intent = st.get("send_intent")
+    if intent is not None:
+        if not (isinstance(intent, dict) and intent.get("turn") == turn and intent.get("status") in ("pending", "accepted")
+                and parse_iso(intent.get("ts")) is not None):
+            return None
+        out = _sent_message(ctx, intent.get("message"), turn)
+        return None if out is None else {"since": intent["ts"], "message": out["file"], "evidence": "send_intent"}
+    ls = st.get("last_sent")
+    if (not isinstance(ls, dict) or ls.get("turn") != turn or parse_iso(ls.get("sent_ts")) is None
+            or not isinstance(ls.get("message"), dict) or ls.get("file") != ls["message"].get("snapshot")
+            or not isinstance(ls.get("snapshot_stat"), list)):
+        return None
+    out = _sent_message(ctx, ls["message"], turn, ls["snapshot_stat"])
+    return None if out is None else {"since": ls["sent_ts"], "message": out["file"], "evidence": "last_sent"}
+
+
+def _sent_message(ctx, message, turn, snapshot_stat=None):
+    """B3（S03）：定位前重新核对已外发正文的完整身份：driver-message/1 的项目根、轮次、attempt、副本路径与正文
+    sha256（_check_attempt），源文件路径与内容仍是当时外发的那份（_outgoing_check），以及外发时记下的副本
+    dev/ino/mode/size。任何一项不符返回 None，由调用方按 NO_REF 停下，不改任何标记。"""
+    if not isinstance(message, dict) or not isinstance(message.get("outgoing"), dict):
+        return None
+    try:
+        out = _check_attempt(ctx, {"turn": turn, "message": message})
+        source, _raw, source_sha = _outgoing_check(ctx, message["outgoing"])
+    except _PermissionError:
+        return None
+    if str(source) != message.get("source_file") or source_sha != message.get("source_sha256"):
+        return None
+    if snapshot_stat is not None:
+        s = os.lstat(out["file"])
+        if [s.st_dev, s.st_ino, stat.S_IMODE(s.st_mode), s.st_size] != snapshot_stat:
+            return None
+    return out
+
+
 def h_send(ctx):
     inst, st = ctx.inst, ctx.st
     w = _wait_retry(ctx)
@@ -966,10 +1065,18 @@ def h_send(ctx):
     out = st.get("outgoing") or {}
     turn = st["turn"]
     intent = st.get("send_intent")
-    if intent and (not isinstance(intent, dict) or (intent.get("status") == "pending"
-                   and (type(intent.get("turn")) is not int or intent["turn"] != turn))):
-        return _outgoing_stop(ctx, _OutgoingError("已有发送意图的轮次身份不符，保留原意图，不自动重发"))
-    tdir = inst.turn_dir()
+    # 字段不存在（None）才是“没有意图”；存在但为空、非 dict、未知状态或轮次不符（{}、[]、0 …）都按已有标记处理
+    if intent is not None and (not isinstance(intent, dict) or intent.get("status") not in ("pending", "accepted")
+                               or type(intent.get("turn")) is not int or intent["turn"] != turn):
+        # B3（S02a）：旧轮次、旧协议或未知状态的意图都可能已经外发：保留原意图停下，不当作未发送重试
+        return _outgoing_stop(ctx, _OutgoingError("已有发送意图的状态或轮次身份不符，保留原意图，不自动重发"))
+    mx = int(ctx.pol.get("shared_max_inflight", 0) or 0)
+    if intent and intent.get("status") == "accepted" and mx <= 0:
+        # B3（S02a）：仲裁关闭时，accepted 残留直接降为待核对，下面就地轮询；绝不进入新发送
+        early = _accepted_unfinished(ctx, intent)
+        if early:
+            return early
+        intent = st["send_intent"]
     gap = int(ctx.pol.get("min_send_gap_s", 0) or 0)   # 1.6.5（W42）：默认 0，不改变原有行为
     ra = st.get("replied_at")
     if gap > 0 and ra and not (intent and intent.get("turn") == turn and intent.get("status") == "pending"):
@@ -980,37 +1087,7 @@ def h_send(ctx):
             return "wait", (f"上一条回复 {int(waited)} 秒前才落地，等满 {gap} 秒再发"
                             "（min_send_gap_s，W42：太早发送会接到上一条残留的生成，被误判为已接受）")
     if intent and intent.get("turn") == turn and intent.get("status") == "pending":
-        _slot_missing_check(ctx, "发送结果不明的核对")   # B1-A r2：缺 token 也留痕；只核对，不 acquire、不借用、不重发
-        intent = json.loads(json.dumps(intent))
-        pargs = ["--project", inst.name, "--turn", turn, "--ref", intent.get("ref") or "", "--out", tdir / "delivered"]
-        pargs += anomaly.conv_args(inst)   # 1.7.0（ISOLATION.md S1）：本项目的对话
-        if not intent.get("ref"):
-            try:
-                old_out = _check_attempt(ctx, intent)
-            except _PermissionError as e:
-                return _outgoing_stop(ctx, e)
-        if not intent.get("ref") and anomaly.transport_cfg().get("poll_since"):
-            # 1.5.1：没有 ref 时，让适配器按“发送时刻之后、内容与本轮消息相同的那条消息”定位（transport.json 的 poll_since）
-            pargs += ["--since", intent.get("ts") or "", "--message", old_out["file"],
-                      "--prev-ref", st.get("send_ref") or ""]   # 上一轮的 ref 原样交回，适配器可据此找到会话
-        r = anomaly.call("poll", pargs, env_extra=page.poll_env(inst))   # 1.5.3：顺带写 Claude 页面快照
-        inst.save()
-        if st.get("send_intent") != intent or st.get("turn") != turn:
-            return "user", "核对期间发送意图已改变，未把旧轮询结果记到新意图"
-        _adapter_warning(inst, "poll", r)
-        page.after_poll(inst, "poll", r["data"].get("status"))
-        status = r["data"].get("status")
-        _read_error_track(st, status == "read_error")   # 1.9.7
-        if r["code"] == 0 and status in ("generating", "done"):
-            st["send_intent"].update(status="accepted", ref=r["data"].get("ref") or intent.get("ref"))
-            _send_meta(inst, r["data"], confirmed_by="poll")   # 1.9.4：结果不明后经轮询确认的发送，也记下消息 uuid
-            return _finalize_send(ctx, out, "发送曾被中断，经轮询确认消息已被接受", immediate=(status == "done"))
-        if status == "read_error":   # 1.9.6：适配器读不了通道，不等于“没有回复”：单独处置，不消耗“结果不明”的等待窗口
-            return _anomaly(ctx, {"source": "driver", "kind": "poll_read_error"},
-                            f"发送意图 {intent.get('ts')} 待确认，但轮询读不了通道（read_error）：{(r['data'].get('error') or r['raw'])[:160]}")
-        # 1.5.1：policy 的 send_unknown_wait 为真时先自动等待并反复确认（长回复可达半小时以上），绝不自动重发
-        return _anomaly(ctx, {"source": "driver", "kind": fidelity.send_unknown_kind(ctx.pol)},
-                        f"发送意图 {intent.get('ts')} 结果不明；轮询返回 {status or r['raw'][:120]}")
+        return _verify_pending(ctx, out, turn, intent)
     if not out.get("file"):   # 1.8.5（W81）：状态在“发送”却没有待发消息（第 109 轮），不调用适配器，安全停下并说明
         return _anomaly(ctx, {"source": "driver", "kind": "outgoing_missing"},
                         "状态在“发送”，但没有待发消息（outgoing 为空），没有调用适配器。处置：wf unblock --to COMPOSE 重新组织本轮消息")
@@ -1028,7 +1105,6 @@ def h_send(ctx):
             inst.save()
             decide(inst, "rate", f"推迟发送到 {st['retry_at']}", f"{win} 秒内已发送 {len(recent)} 条（上限 {rate['max_sends']}）")
             return "wait", f"全局限速：{win} 秒内已发送 {len(recent)} 条，推迟到 {st['retry_at']}"
-    mx = int(ctx.pol.get("shared_max_inflight", 0) or 0)
     fresh = None
     if mx <= 0 and st.get("send_slot"):
         _slot_release(ctx, "arbitration_disabled")   # B1-A：仲裁已关闭就不再持有发送槽：按 token 退回上一次尝试留下的槽
@@ -1047,9 +1123,21 @@ def h_send(ctx):
             st["retry_at"] = (now() + timedelta(seconds=30)).isoformat(timespec="seconds")
             inst.save()
             return "wait", f"共享发送槽被占用（{g['holder']}），本项目排第 {g['position']} 位，30 秒后再看"
+        slot_prev = json.loads(json.dumps(st.get("send_slot")))
         fresh, early = _slot_bind(ctx, g, out)
         if early:
             return early
+        if (st.get("send_intent") or {}).get("status") == "accepted":
+            # B3（S02a）：仲裁开启时重入核对仍走 _slot_bind（token 缺失或不符照旧降为结果不明）；这里拦住
+            # “本地 token 一致”与“原租约已不在、刚得到新授予”两种情况：新 token 不用于任何外发，立即按 token 退回
+            if fresh:
+                arbiter.release(inst, "accepted_intent_no_resend", lease_id=fresh["lease_id"], turn=fresh["turn"])
+                if slot_prev is None:
+                    st.pop("send_slot", None)
+                else:
+                    st["send_slot"] = slot_prev
+            early = _accepted_unfinished(ctx, st["send_intent"])
+            return early or _verify_pending(ctx, out, turn, st["send_intent"])
     slot_for_attempt = dict(st.get("send_slot") or {})
     try:
         message = _prepare_send(ctx, out)
@@ -1153,6 +1241,11 @@ def _finalize_send(ctx, out, note, immediate=False):
         sent_out = {"file": None}
         ops.add_note(inst, "deviation", "已确认旧发送被接受，但缺少可验证的旧正文；未用当前新草稿补作发送证据", by="driver")
     message = intent.get("message") or {}
+    sent_identity = {}
+    if sent_out.get("file"):   # B3（S03）：外发正文的完整身份与副本元数据，供无 ref 时重新核对后才定位
+        s = os.lstat(sent_out["file"])
+        sent_identity = {"message": json.loads(json.dumps(message)),
+                         "snapshot_stat": [s.st_dev, s.st_ino, stat.S_IMODE(s.st_mode), s.st_size]}
     clear_outgoing = False
     if isinstance(message, dict) and out == message.get("outgoing"):
         try:
@@ -1161,16 +1254,21 @@ def _finalize_send(ctx, out, note, immediate=False):
         except _PermissionError:
             pass
     model = sent_out.get("model") or anomaly.transport_cfg().get("model")
-    append_jsonl(LOCAL / "send_log.jsonl", {"ts": now_iso(), "project": inst.name, "turn": st["turn"]})
+    first = not intent.get("logged")   # B3（S02a）：中断后补完登记时，发送日志与当日轮数不重复计
+    if first:
+        append_jsonl(LOCAL / "send_log.jsonl", {"ts": now_iso(), "project": inst.name, "turn": st["turn"]})
     st["send_ref"] = st["send_intent"].get("ref")
     recovery.close(inst, evidence="send_accepted")   # B2-A2a：通道确认接受（不是只有心跳），或结果不明后经轮询确认
-    b = st.setdefault("budget", {"date": now().strftime("%Y-%m-%d"), "rounds": 0})
-    b["rounds"] = b.get("rounds", 0) + 1
+    if first:
+        b = st.setdefault("budget", {"date": now().strftime("%Y-%m-%d"), "rounds": 0})
+        b["rounds"] = b.get("rounds", 0) + 1
+        st["send_intent"]["logged"] = True
     inst.save()
     ops.mark_sent(inst, sent_out.get("file"), sent_out.get("kind"), sent_out.get("effort"), model, by="driver",
                   role=sent_out.get("role"), reasons=sent_out.get("reasons"))
     st = inst.state
-    st["last_sent"] = {"turn": st["turn"], "file": sent_out.get("file"), "kind": sent_out.get("kind"), "effort": sent_out.get("effort")}
+    st["last_sent"] = {"turn": st["turn"], "file": sent_out.get("file"), "kind": sent_out.get("kind"), "effort": sent_out.get("effort"),
+                       "sent_ts": intent.get("ts"), **sent_identity}   # B3（S03）：外发前的意图时刻与正文身份
     st["send_intent"] = None
     if clear_outgoing and st.get("outgoing") == out:
         st["outgoing"] = None
@@ -1385,7 +1483,10 @@ def h_wait_reply(ctx):
     w = _wait_retry(ctx)
     if w:
         return w
+    locate = None
     if not st.get("send_ref"):
+        locate = _ref_less_locate(ctx)   # B3（S03）：驱动器自己发出、只缺 ref 时按时刻与正文定位，只轮询
+    if not st.get("send_ref") and locate is None:
         # 本轮是在驱动器之外手动发出的，没有登记 ref，无法自动接续（缺口 7）
         return _anomaly(ctx, {"source": "driver", "kind": "no_ref"},
                         "本轮消息是手动发出的、没有登记 ref，驱动器无法轮询接续。批准解决不了这个问题（1.8.2 起 wf approve 会拒绝）："
@@ -1396,13 +1497,19 @@ def h_wait_reply(ctx):
     if pa and (secs_since(pa) or 0) < 0:
         return "wait", "Claude 正在处理（稍后检查）"
     tdir = inst.turn_dir()
-    r = anomaly.call("poll", ["--project", inst.name, "--turn", st["turn"], "--ref", st.get("send_ref") or "",
-                              "--out", tdir / "delivered"] + anomaly.conv_args(inst),   # 1.7.0：本项目的对话
+    pargs = ["--project", inst.name, "--turn", st["turn"], "--ref", st.get("send_ref") or "", "--out", tdir / "delivered"]
+    if locate:   # B3（S03）：与结果不明核对同一协议（transport.json 的 poll_since）
+        pargs += ["--since", locate["since"], "--message", locate["message"], "--prev-ref", ""]
+    r = anomaly.call("poll", pargs + anomaly.conv_args(inst),   # 1.7.0：本项目的对话
                      env_extra=page.poll_env(inst))   # 1.5.3：顺带写页面快照
     _adapter_warning(inst, "poll", r)
     page.after_poll(inst, "poll", r["data"].get("status"))
     status = r["data"].get("status")
     _read_error_track(st, status == "read_error")   # 1.9.7
+    if locate and status == "no_ref":   # B3（S03）：按时刻与正文也定位不了，仍是 NO_REF（同一轮第二次转为阻塞，不循环）
+        inst.save()
+        return _anomaly(ctx, {"source": "driver", "kind": "no_ref"},
+                        f"本轮由驱动器发出（{locate['evidence']}），适配器没有返回 ref，按发送时刻与正文也定位不了")
     interval = int(ctx.pol.get("poll_interval_s", 120))
     # 独立落地核对（缺口 11/§3）：send 返回 0 只是适配器的说法。这里由 wf 查会话确认消息真的出现了。
     # landed 字段（适配器可给出）或 generating/done 都算“确实落地”；若连续 none，说明消息没落地，按 POLL_NONE 退避/阻塞。
