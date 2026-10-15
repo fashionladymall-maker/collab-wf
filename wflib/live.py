@@ -399,6 +399,89 @@ def _directory_source(path):
         raise _InputProblem("unreadable", p, type(e).__name__) from e
 
 
+def collect_install_materials(inst, *, tool_root=None):
+    """Freeze B2b's ordinary history files without making an authorization.
+
+    This preparatory reader collects bytes, parsed JSON objects and directory
+    selectors.  It does not establish a historical review decision or link an
+    exec event to a transaction.  Neither live.check nor goals consumes it to
+    grant verification.  Missing stores are explicit inputs.
+    """
+    from .core import WF_HOME
+    tool = Path(tool_root if tool_root is not None else WF_HOME).absolute()
+    project = Path(inst.root).absolute()
+    roots = {"tool_install": tool / "local/install",
+             "project_install": project / "workflow/evidence/install",
+             "reviews": Path(LOCAL).absolute() / "reviews",
+             "releases": Path(LOCAL).absolute() / "releases"}
+    fixed = (Path(LOCAL).absolute() / "transport.json",
+             Path(LOCAL).absolute() / "lanes.json", tool / "docs/REVIEW.md")
+    files, documents, directories = {}, {}, {}
+    total_bytes = 0
+
+    def read(path):
+        nonlocal total_bytes
+        key = str(path)
+        if key in files:
+            return
+        source, raw = _file_source(path)
+        files[key] = source
+        if raw is not None:
+            total_bytes += len(raw)
+            if len(files) > 20000 or total_bytes > 256 * 1024 * 1024:
+                raise _InputProblem("unsupported", path, "install material budget exceeded")
+            if path.suffix == ".json":
+                documents[key] = _strict_json(raw, path)
+
+    def visit(path):
+        if len(directories) >= 20000:
+            raise _InputProblem("unsupported", path, "install material directory budget exceeded")
+        desc = _directory_source(path)
+        directories[str(path)] = desc
+        if desc["state"] == "absent":
+            return
+        for name, kind, _mode in desc["members"]:
+            child = path / name
+            if kind == "dir":
+                visit(child)
+            elif kind == "file":
+                read(child)
+            else:
+                raise _InputProblem("unsupported", child, "install material member type")
+
+    for path in roots.values():
+        # _directory_source rejects aliased paths and symlinks before descent.
+        visit(path)
+    for path in fixed:
+        read(path)
+    transport = documents.get(str(fixed[0]), {})
+    verifier = transport.get("review_verifier")
+    if isinstance(verifier, dict) and isinstance(verifier.get("path"), str):
+        path = Path(verifier["path"]).expanduser()
+        if not path.is_absolute():
+            raise _InputProblem("unsupported", fixed[0], "absolute review verifier path required")
+        read(path)
+    # Re-read the same files and selectors.  The comparison is optimistic
+    # stability, not an OS transaction or protection against malicious ABA.
+    for key, source in files.items():
+        if _file_source(key)[0] != source:
+            raise _InputProblem("changed", key, "install material changed during collection")
+    for key, source in directories.items():
+        if _directory_source(key) != source:
+            raise _InputProblem("changed", key, "install material selector changed during collection")
+    descriptor = {"schema": "install-materials/1", "complete": False,
+                  "subject": {"project": inst.name, "root": str(project), "tool_root": str(tool),
+                              "local": str(Path(LOCAL).absolute())},
+                  "stores": {k: str(v) for k, v in roots.items()},
+                  "sources": sorted(files.values(), key=lambda s: s["path"]),
+                  "directories": sorted(directories.values(), key=lambda s: s["path"])}
+    return {"state": "collected", "authorization": "unavailable", "descriptor": descriptor,
+            "materials_sha256": hashlib.sha256(_canonical(descriptor).encode()).hexdigest(),
+            "documents": documents,
+            "pending": ["historical_review_provenance", "exec_transaction_association",
+                        "installation_chain_validation"]}
+
+
 def _git_inputs(root, timestamps):
     """Controlled ordinary local Git only.  Every query is replayed on validation."""
     import os
