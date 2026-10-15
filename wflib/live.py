@@ -97,6 +97,16 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
     head_at = _inputs.head_at if _inputs else _head_at
     state = _inputs.state if _inputs else inst.state
     ev = read_log(inst.events_path)
+    if _inputs is None and any(e.get("type") == "exec" and e.get("install_exec") is not None for e in ev):
+        try:
+            return _evaluate_snapshot(_capture_inputs(inst, rounds=rounds, budget_s=budget_s))["report"]
+        except _InputProblem as exc:
+            missing = [f"实景输入 {exc.state}：{exc.source}：{exc.detail}"]
+            return {"rounds": [], "streak": 0, "need": rounds, "missing": missing, "passed": False,
+                    "summary": _summary(inst, [], [], rounds, 0, missing, False),
+                    "input_problem": {"state": exc.state, "source": exc.source, "detail": exc.detail}}
+    histories = _inputs.install_histories(inst, ev) if _inputs else None
+    history_entries = (histories or {}).get("entries", [])
     turns = read_log(inst.turns_path)
     sent, done = {}, {}
     for r in turns:
@@ -132,6 +142,18 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
             results.append({"turn": t, "ok": False, "criteria": crit, "installs": False, "applies": False})
             continue
         tev = [e for e in ev if e.get("turn") == t]
+
+        def bound_auto_apply(event):
+            if event.get("type") != "apply" or histories is None:
+                return False
+            from .live_history import entry_problem
+            return any(not entry_problem(row) and row["reference"]["target"]["kind"] == "project"
+                       and event.get("install_ref") == row["reference"]
+                       and event.get("install_exec") == row["invocation"]
+                       and any(parent.get("seq") == row["seq"] and parent.get("type") == "exec"
+                               and parent.get("actor") == "driver" and parent.get("by") == "driver" for parent in tev)
+                       for row in history_entries if row.get("turn") == t)
+
         t0 = str(sent[t][0].get("ts_sent") or "")
         t1 = str(((sent.get(t + 1) or [{}])[0]).get("ts_sent") or "")
         if alog is None:
@@ -156,7 +178,11 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
         bad3 = [e.get("rule") for e in tev if e.get("type") == "auto" and e.get("rule") in ("RELEASE_MISSING", "FP_MISMATCH")]
         add(3, last.get("deliveries") in ("ok", "none") and not bad3,
             "交付核对：" + (last.get("deliveries") or "没有记录") + (("；" + "、".join(bad3)) if bad3 else ""))
-        tries = [e for e in tev if e.get("type") == "exec" and "wf self-update" in str(e.get("cmd") or "")]
+        tries = [e for e in tev if e.get("type") == "exec"
+                 and ("wf self-update" in str(e.get("cmd") or "")
+                      or any(row.get("seq") == e.get("seq")
+                             and (row.get("reference") or {}).get("target", {}).get("kind") == "tool"
+                             for row in history_entries))]
         ups = [e for e in tries if e.get("exit_code") == 0]
         # B1-C r2（F1）：任何失败、超时或结果未知的安装尝试都留在结构化状态里，不被同轮的成功安装遮掉
         att = {"total": len(tries), "ok": len(ups),
@@ -174,6 +200,14 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
         else:
             vs = []
             for e in ups:
+                if e.get("install_exec") is not None and histories is not None:
+                    from .live_history import entry_problem
+                    entries = [row for row in history_entries if row.get("seq") == e.get("seq")
+                               and (row.get("reference") or {}).get("target", {}).get("kind") == "tool"]
+                    problems = [entry_problem(row) for row in entries]
+                    vs.append("pass" if entries and not any(problems)
+                              else "历史安装无法核对（" + "、".join([p for p in problems if p] or ["missing_receipt"]) + "）")
+                    continue
                 zp = inst.root / str(e.get("cmd")).split()[-1]
                 rr = read_doc(LOCAL / "reviews" / f"{zp.stem}.result.json", {}) or {}
                 v = rr.get("verdict") or "没有记录"
@@ -187,7 +221,8 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
             add(4, ok4, "安装前审查：" + "、".join(vs), status="attempt_failed" if (ok4 and bad_try) else None)
         if tries:
             crit[-1]["attempts"] = att
-        man = [f"{e.get('type')}（{e.get('by')}/{e.get('actor') or '?'}）" for e in tev if _manual(e)]
+        man = [f"{e.get('type')}（{e.get('by')}/{e.get('actor') or '?'}）"
+               for e in tev if _manual(e) and not bound_auto_apply(e)]
         add(5, not man, "人工改动：" + ("、".join(man[:5]) if man else "无"))
         cmds = (read_doc(tdir / "intake.json", {}) or {}).get("commands") or []
         ran = [e for e in tev if e.get("type") == "exec" and e.get("by") == "driver"]
@@ -238,7 +273,7 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None) -> dict:
                 f"（{head_at(inst.root, hs[-1].get('ts'))[:12] or '查不到'}）不一致")
         else:
             add(10, False, "本轮时间窗里没有带提交号与 HEAD 的同步")
-        applies = any(e.get("type") == "apply" and not _manual(e) for e in tev)
+        applies = any(e.get("type") == "apply" and (not _manual(e) or bound_auto_apply(e)) for e in tev)
         results.append({"turn": t, "ok": all(c["ok"] for c in crit), "criteria": crit, "installs": bool(ups), "applies": applies})
     results = results[-rounds:] if rounds else results
     streak = 0
@@ -276,8 +311,8 @@ def _summary(inst, results: list, win: list, rounds: int, streak: int, missing: 
             "rounds_sha256": hashlib.sha256(canon.encode("utf-8")).hexdigest()}
 
 
-# C2c-1 is a collection protocol, not a production authorization protocol.  In
-# particular it does not claim the complete tool/project closure or C5 history.
+# A window captures report inputs. Goals additionally require the complete
+# tool/project closure and the C5 history protocol before authorization.
 WINDOW_SCHEMA = "window-inputs/1"
 WINDOW_RULE = "live-read-set/1"
 CLOSURE_SCHEMA = "live-closure/1"
@@ -482,7 +517,7 @@ def collect_install_materials(inst, *, tool_root=None):
                         "installation_chain_validation"]}
 
 
-def _git_inputs(root, timestamps):
+def _git_inputs(root, timestamps, *, include_status=False):
     """Controlled ordinary local Git only.  Every query is replayed on validation."""
     import os
     import re
@@ -499,17 +534,21 @@ def _git_inputs(root, timestamps):
         raise _InputProblem("unsupported", gd, "Git replace refs")
     config_source, _ = _file_source(gd / "config")
     head_source, _ = _file_source(gd / "HEAD")
+    status_sources = [_file_source(gd / rel)[0] for rel in ("index", "info/exclude", "info/attributes")] \
+        if include_status else []
     executable = shutil.which("git", path=os.defpath)
     if not executable:
         raise _InputProblem("unknown", gd, "Git executable unavailable")
     executable = str(Path(executable).resolve())
     binary, _ = _file_source(executable)
     env = {"PATH": os.defpath, "HOME": "/nonexistent", "LC_ALL": "C",
-           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_OPTIONAL_LOCKS": "0"}
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull,
+           "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"}
     records = []
 
     def query(args):
-        argv = [executable, "--no-replace-objects", "-c", "core.hooksPath=/dev/null", *args]
+        argv = [executable, "--no-replace-objects", "-c", "core.hooksPath=/dev/null",
+                "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args]
         try:
             r = subprocess.run(argv, cwd=str(root), env=env, capture_output=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -523,10 +562,13 @@ def _git_inputs(root, timestamps):
             raise _InputProblem("unknown", gd, f"Git read failed: {args[0]} rc={r.returncode} {err[:200]}")
         return out.strip()
 
-    config = query(["config", "--local", "--list"])
+    config = query(["config", "--local", "--no-includes", "--list"])
     if any(line.lower().startswith(("include.", "includeif.", "extensions.", "core.worktree="))
            for line in config.splitlines()):
         raise _InputProblem("unsupported", gd, "Git config indirection/extensions")
+    if include_status and any(line.lower().startswith(("filter.", "submodule.", "core.attributesfile=", "core.excludesfile="))
+                              for line in config.splitlines()):
+        raise _InputProblem("unsupported", gd, "Git status external filters/attributes/excludes/submodules")
     if query(["for-each-ref", "--format=%(refname)", "refs/replace"]):
         raise _InputProblem("unsupported", gd, "Git replace refs")
     fmt = query(["rev-parse", "--show-object-format"])
@@ -543,12 +585,16 @@ def _git_inputs(root, timestamps):
     if not re.fullmatch(r"[0-9a-f]{" + str(width) + "}", head):
         raise _InputProblem("unknown", gd, "no full HEAD OID")
     spine = query(["log", "--first-parent", "--format=%H%x00%P%x00%cI", "HEAD"])
+    status = query(["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]).splitlines() \
+        if include_status else None
     if _file_source(gd / "config")[0] != config_source or _file_source(gd / "HEAD")[0] != head_source \
-            or _file_source(executable)[0] != binary:
+            or _file_source(executable)[0] != binary \
+            or any(_file_source(row["path"])[0] != row for row in status_sources):
         raise _InputProblem("changed", gd, "Git config/HEAD/executable changed during query")
     return {"root": str(root.resolve()), "gitdir": str(gd.resolve()), "head": head, "format": fmt,
             "executable": binary, "environment": env, "queries": records, "heads": heads,
-            "first_parent_history": spine, "config_source": config_source, "head_source": head_source}
+            "first_parent_history": spine, "config_source": config_source, "head_source": head_source,
+            "status": status, "status_sources": status_sources}
 
 
 class _FrozenInputs:
@@ -595,13 +641,25 @@ class _FrozenInputs:
         return self.json(Path(self.root) / "workflow" / "state.json")
 
     def head_at(self, root, ts):
-        if str(Path(root).resolve()) != self.root:
+        path = Path(root)
+        if not path.is_absolute() or ".." in path.parts or str(path) != self.root:
             raise _InputProblem("corrupt", root, "Git root mismatch")
         return dict(self.descriptor["git"]["heads"]).get(ts, "")
 
+    def install_histories(self, inst, events):
+        from .live_history import FrozenReader, collect_bound_histories
+        inputs = self.descriptor["review_inputs"]
+        if inputs.get("schema") != "live-install-history/1":
+            return None
+        replay = collect_bound_histories(inst, events, FrozenReader(self, inputs["reader"]),
+                                        local=inputs["host"]["local"], tool_root=inputs["host"]["tool_root"])
+        if replay != {"schema": inputs["schema"], "entries": inputs["entries"]}:
+            raise _InputProblem("corrupt", "install_history", "stored history differs from frozen replay")
+        return replay
+
 
 def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
-    """Strict fresh-disk read set for C2c-1.  No new verified capability."""
+    """Freeze strict report inputs, including modern C5 execution histories."""
     from datetime import datetime, timezone
     import re
     from .core import Instance
@@ -633,11 +691,13 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
         key = str(path)
         if key in raw:
             return raw[key]
+        if len(raw) >= 20000:
+            raise _InputProblem("unsupported", path, "snapshot source budget exceeded")
         desc, data = _file_source(path)
         desc["format"] = kind
         if data is not None:
             captured_bytes += len(data)
-            if len(raw) >= 20000 or captured_bytes > 256 * 1024 * 1024:
+            if captured_bytes > 256 * 1024 * 1024:
                 raise _InputProblem("unsupported", path, "snapshot source budget exceeded")
             if kind == "jsonl":
                 desc["coverage"] = _log_coverage(data)
@@ -744,10 +804,12 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
             if not isinstance(meta.get("parent"), str) or not isinstance(smeta.get("message_uuid"), str):
                 raise _InputProblem("unknown", td, "message identity unavailable")
             log(td / "notes.jsonl")
-        # C5 is unavailable, but legacy report reads still belong to this read set.
+        # Legacy report reads remain explicit. Structural receipts never fall
+        # back to parsing a command's final token.
         import shlex
         for event in events:
-            if event.get("type") == "exec" and "wf self-update" in str(event.get("cmd") or "") and event.get("exit_code") == 0:
+            if event.get("type") == "exec" and event.get("install_exec") is None \
+                    and "wf self-update" in str(event.get("cmd") or "") and event.get("exit_code") == 0:
                 try:
                     tokens = shlex.split(event["cmd"])
                 except ValueError as e:
@@ -798,7 +860,27 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
                       "excluded": "latest_pending" if t == max(sent) and t not in done else None}
                      for t in sorted(sent)]
         git_inputs = _git_inputs(fresh.root, [h["ts"] for h in hist if h.get("status") in ("pushed", "unchanged")])
-        descriptor = {"schema": WINDOW_SCHEMA, "rule": WINDOW_RULE, "complete": False,
+        history_reader = None
+        review_inputs = {"state": "unavailable", "reason": "install_history_unavailable"}
+        if any(event.get("type") == "exec" and event.get("install_exec") is not None for event in events):
+            from .core import WF_HOME
+            from .live_history import CaptureReader, collect_bound_histories
+
+            def history_directory(path):
+                desc = _directory_source(path)
+                previous = next((row for row in directories if row["path"] == desc["path"]), None)
+                if previous is not None and previous != desc:
+                    raise _InputProblem("changed", path, "history selector changed during collection")
+                if previous is None:
+                    directories.append(desc)
+                return desc
+
+            history_reader = CaptureReader(lambda path: source(path, "bytes", required=False), history_directory)
+            review_inputs = collect_bound_histories(fresh, events, history_reader, local=LOCAL, tool_root=WF_HOME)
+            review_inputs.update(host={"local": str(Path(LOCAL).absolute()), "tool_root": str(Path(WF_HOME).absolute())},
+                                 reader=history_reader.descriptor)
+        descriptor = {"schema": WINDOW_SCHEMA, "rule": WINDOW_RULE,
+                      "complete": review_inputs.get("schema") == "live-install-history/1",
                       "subject": {"root": str(fresh.root), "project": fresh.name, "created": cfg.get("created"),
                                   "local": str(LOCAL.resolve())},
                       "parameters": {"rounds": rounds, "budget_s": budget_s},
@@ -806,9 +888,11 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
                       "directories": sorted(directories, key=lambda s: s["path"]),
                       "adapter": str(adapter.absolute()), "selection": selection, "git": git_inputs,
                       "output_contract": contract, "task_protocol": "A1-uuid/1",
-                      "review_inputs": {"state": "unavailable", "reason": "install_history_unavailable"}}
+                      "review_inputs": review_inputs}
         # Re-read bytes and member boundaries; no after-the-fact hash can be
         # paired with data evaluated earlier. No global ACID/ABA claim is made.
+        if history_reader is not None:
+            history_reader.revalidate()
         for desc in sources:
             current, data = _file_source(desc["path"])
             current["format"] = desc["format"]
@@ -832,9 +916,17 @@ def _evaluate_snapshot(snapshot):
                            events_path=root / "workflow" / "events.jsonl", turns_path=root / "workflow" / "turns.jsonl")
     params = snapshot.descriptor["parameters"]
     report = check(inst, params["rounds"], params["budget_s"], _inputs=snapshot)
-    return {"state": "collected", "window_inputs": snapshot.descriptor,
-            "inputs_sha256": hashlib.sha256(snapshot.descriptor_json.encode()).hexdigest(),
-            "report": report, "authorization": "unavailable", "reason": "install_history_unavailable"}
+    result = {"state": "collected", "window_inputs": snapshot.descriptor,
+              "inputs_sha256": hashlib.sha256(snapshot.descriptor_json.encode()).hexdigest(),
+              "report": report, "authorization": "unavailable", "reason": "install_history_unavailable"}
+    history = snapshot.descriptor["review_inputs"]
+    if history.get("schema") == "live-install-history/1":
+        from .live_history import window_authorization
+        authorization = window_authorization(history, snapshot.jsonl(inst.events_path), report)
+        result.update(history_authorization=authorization,
+                      authorization="available" if authorization["eligible"] else "unavailable",
+                      reason=None if authorization["eligible"] else "；".join(authorization["why"]))
+    return result
 
 
 def _revalidate_inputs(inst, descriptor):
@@ -981,7 +1073,7 @@ def _closure_inputs(inst, snapshot, *, tool_root, records):
 
     tool = tree(tool_root, set())
     project = tree(inst.root, ignored_outputs)
-    git_tool = _git_inputs(tool_root, [])
+    git_tool = _git_inputs(tool_root, [], include_status=True)
     descriptor = {"schema": CLOSURE_SCHEMA, "rule": CLOSURE_RULE, "complete": True,
                   "subject": snapshot.descriptor["subject"], "tool": tool, "project": project,
                   "git_tool": git_tool, "git_project": snapshot.descriptor["git"],
@@ -991,7 +1083,7 @@ def _closure_inputs(inst, snapshot, *, tool_root, records):
     # Re-discover all members and bytes before sealing the closure.
     seen_files, total_bytes = 0, 0
     if tree(tool_root, set()) != tool or tree(inst.root, ignored_outputs) != project \
-            or _git_inputs(tool_root, []) != git_tool:
+            or _git_inputs(tool_root, [], include_status=True) != git_tool:
         raise _InputProblem("changed", inst.root, "closure changed during collection")
     _, state_again = _file_source(state_path)
     again = {} if state_again is None else _strict_json(state_again, state_path)
