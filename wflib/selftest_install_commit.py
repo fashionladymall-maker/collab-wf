@@ -113,6 +113,18 @@ class InstallCommitTests(unittest.TestCase):
         self.assertTrue(head)
         self.assertEqual(changed, ["A first.txt"])
 
+    def test_tool_self_init_ignored_local(self):
+        root = self.base / "new-tool"
+        (root / "local/install/tx-example").mkdir(parents=True)
+        (root / "local/install/tx-example/prepared.json").write_text("transaction")
+        (root / "VERSION").write_text("0.1.0")
+        with patch.object(release, "WF_HOME", root), patch.object(core, "WF_HOME", root):
+            head = release.self_init()
+            self.assertTrue(head)
+            self.assertEqual(release.self_init(), head)
+        self.assertIn("local/", (root / ".gitignore").read_text())
+        self.assertNotIn("local/", _git(root, "ls-files"))
+
 
 if __name__ == "__main__":
     unittest.main()
