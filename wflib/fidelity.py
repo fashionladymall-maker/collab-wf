@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat as _stat
 import time
 from pathlib import Path
 
@@ -494,11 +495,21 @@ def post_install_receipt(new: str, src_files: dict, installed: dict, board_was_r
 
 # ---------------- 无附件续接 ----------------
 
-def tool_manifest_text(wf_home: Path, project_root=None) -> str:
-    """新对话恢复包附带的文件清单：通道不能上传附件时，Claude 据此点名要读的文件。"""
+def tool_manifest_text(wf_home: Path, project_root=None, *, ref=None, files=None) -> str:
+    """新对话恢复包附带的文件清单：通道不能上传附件时，Claude 据此点名要读的文件。
+    B1-B：ref 给出提交时按该提交的内容列（不读工作区）；files 给出冻结的 {路径: (权限, 字节)} 时按冻结内容列。
+    两者都不给时与此前完全相同（读工作区）。口径与 tree_hashes 相同。"""
     lines = ["工具文件（路径、字节数、sha256 前 12 位）："]
-    for rel, h in tree_hashes(wf_home).items():
-        lines.append(f"- {rel}  {(Path(wf_home) / rel).stat().st_size}  {h[:12]}")
+    if ref is not None and files is None:
+        files = commit_files(wf_home, ref)
+    if files is not None:
+        for rel in sorted(files):
+            if _manifest_rel(rel):
+                data = files[rel][1]
+                lines.append(f"- {rel}  {len(data)}  {hashlib.sha256(data).hexdigest()[:12]}")
+    else:
+        for rel, h in tree_hashes(wf_home).items():
+            lines.append(f"- {rel}  {(Path(wf_home) / rel).stat().st_size}  {h[:12]}")
     if project_root is not None:
         try:
             from .ops import fingerprint
@@ -508,3 +519,463 @@ def tool_manifest_text(wf_home: Path, project_root=None) -> str:
         except Exception as e:  # 清单只是辅助信息，失败不影响恢复包
             lines.append(f"（项目文件清单生成失败：{e}）")
     return "\n".join(lines)
+
+
+# ---------------- 交接材料同源（B1-B）----------------
+# 恢复包里的工具 zip 此前取自工具 HEAD，而说明消息里的 WORKFLOW.md、模板、VERSION 与文件清单取自工作区：工具目录有
+# 未提交改动时，同一份恢复包的几部分不同源。这里一次固定来源：有版本库时是一个提交（之后 HEAD 怎么移动都不影响已
+# 固定的内容），没有版本库时是一次冻结的快照（每个文件只读一次，后续全部用这份字节）。工作区相对该提交的改动另行
+# 冻结、逐个记 sha256，并可打成只读的覆盖包；覆盖包不是版本包，不能安装。
+# r2（独立审查 R1–R3）：工具 zip 直接由冻结的字节写出，不再调用 git archive（它会读取当时的 .gitattributes 与
+# .git/info/attributes）；遍历目录出错即整次失败；符号链接一律按链接本身冻结（记目标字符串），从不读取链接目标，
+# 也不经过任何一级被换成链接的父目录。
+
+SOURCE_SKIP_PARTS = {".git", "local", "__pycache__"}   # 与 _tool_zip、tree_hashes 排除的目录相同
+OVERLAY_PREFIX = "wf-dirty-overlay-"                     # 不以 collab-wf- 开头：同步与自动安装都按 collab-wf-<版本> 选包
+LINK_MODE = 0o120777                                     # 冻结源里符号链接的权限位（与 zip、git 的约定相同）；内容是目标字符串
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+_walk = os.walk                                          # 单独成名字：测试可以注入目录遍历错误
+
+
+def is_link_mode(mode) -> bool:
+    return bool(mode) and _stat.S_ISLNK(mode)
+
+
+def _manifest_rel(rel: str) -> bool:
+    """清单口径（与 tree_hashes 相同）：排除 .git、local、__pycache__、*.pyc、MANIFEST.json、RELEASE.json。"""
+    return not (set(rel.split("/")) & SOURCE_SKIP_PARTS) and not rel.endswith(".pyc") \
+        and rel not in ("MANIFEST.json", "RELEASE.json")
+
+
+def _git_bytes(args, cwd, inp=None) -> bytes:
+    """以字节方式运行 git（core.git 是文本方式，读 blob 会损坏二进制内容）。失败抛 WfError。"""
+    import subprocess
+    from .core import WfError
+    try:
+        r = subprocess.run(["git"] + list(args), cwd=str(cwd), input=inp, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise WfError(f"git {' '.join(args[:2])} 无法运行：{e}")
+    if r.returncode != 0:
+        raise WfError(f"git {' '.join(args[:2])} 失败：{r.stderr.decode('utf-8', 'replace').strip()[:300]}")
+    return r.stdout
+
+
+def _fd_capable() -> bool:
+    """r3（独立审查 R7）：以目录描述符为锚的读取需要 openat/fstatat/readlinkat 与 O_NOFOLLOW。macOS、Linux 都有；
+    没有时冻结一律拒绝，不退回按路径读取。单独成函数：测试可以模拟不支持的平台。"""
+    try:
+        return bool(getattr(os, "O_NOFOLLOW", 0)) and os.open in os.supports_dir_fd \
+            and os.stat in os.supports_dir_fd and os.readlink in os.supports_dir_fd
+    except AttributeError:
+        return False
+
+
+class _NotInside(Exception):
+    """路径的某一级上级不是工具目录内的普通目录（被换成链接、文件或已不存在）。"""
+
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_root(home: Path) -> int:
+    """打开工具根目录作为锚（之后所有读取都相对这个描述符，不再按路径解析上级目录）。调用方负责关闭。"""
+    from .core import WfError
+    if not _fd_capable():
+        raise WfError("当前平台不支持以目录描述符为锚的安全读取（openat/fstatat/readlinkat 与 O_NOFOLLOW），"
+                      "拒绝冻结工具目录；没有生成任何交接材料")
+    try:
+        fd = os.open(str(home), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:
+        raise WfError(f"无法打开工具目录 {home}：{e}；没有生成任何交接材料")
+    if not _stat.S_ISDIR(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise WfError(f"{home} 不是目录；没有生成任何交接材料")
+    return fd
+
+
+def _open_parent(root_fd: int, rel: str) -> tuple:
+    """从根目录描述符起逐级以 O_NOFOLLOW|O_DIRECTORY 打开上级目录，返回 (最后一级上级目录的描述符, 文件名)。
+    任何一级是链接、不是目录或不存在时抛 _NotInside。打开后上级目录即被固定：之后路径再被换成链接，读到的仍是
+    这里已打开的目录对象，不会到工具目录之外。调用方负责关闭返回的描述符。"""
+    import errno
+    parts = rel.split("/")
+    fd = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT, getattr(errno, "EMLINK", -1)):
+                    raise _NotInside(part)
+                raise
+            os.close(fd)
+            fd = nfd
+            if not _stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise _NotInside(part)
+        return fd, parts[-1]
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_file(dir_fd: int, name: str) -> tuple:
+    """在已固定的上级目录里读一个普通文件，不跟随链接（O_NOFOLLOW + fstat 复核类型）。返回 (字节, st_mode)。
+    单独成函数：测试可以注入读取失败或在这一刻替换上级目录。"""
+    from .core import WfError
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise WfError(f"{name} 不是普通文件")
+        chunks = []
+        while True:
+            b = os.read(fd, 1 << 20)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks), st.st_mode
+    finally:
+        os.close(fd)
+
+
+def _inside(real_home: str, path: str) -> bool:
+    return path == real_home or path.startswith(real_home.rstrip(os.sep) + os.sep)
+
+
+def _freeze_rel(root_fd: int, rel: str, what: str = "冻结工具目录失败", missing_ok: bool = False):
+    """以根目录描述符为锚冻结一个路径：链接记 (LINK_MODE, 目标字符串)，普通文件记 (权限, 字节)。
+    missing_ok（git 现场改动用）：上级不是目录内普通目录、路径不存在或已是目录时返回 None（与 git 的“已删除”一致）；
+    否则这些情况与其他类型、读不了一样整次失败（WfError）。从不按路径解析上级目录，因而不会读到工具目录之外。"""
+    from .core import WfError
+    try:
+        dfd, name = _open_parent(root_fd, rel)
+    except _NotInside as e:
+        if missing_ok:
+            return None
+        raise WfError(f"{what}（{rel}）：上级 {e} 已不是工具目录内的普通目录（可能被换成链接或已消失）；没有生成任何交接材料")
+    except OSError as e:
+        raise WfError(f"{what}（{rel}）：{e}；没有生成任何交接材料")
+    try:
+        try:
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        if _stat.S_ISLNK(st.st_mode):
+            return LINK_MODE, os.fsencode(os.readlink(name, dir_fd=dfd))
+        if _stat.S_ISDIR(st.st_mode) and missing_ok:
+            return None
+        if not _stat.S_ISREG(st.st_mode):
+            raise WfError(f"{what}（{rel}）：不是普通文件或符号链接；没有生成任何交接材料")
+        data, mode = _read_file(dfd, name)
+        return mode & 0o777, data
+    except FileNotFoundError:
+        raise WfError(f"{what}（{rel}）：文件在冻结过程中消失；没有生成任何交接材料")
+    except WfError:
+        raise
+    except OSError as e:
+        raise WfError(f"{what}（{rel}）：{e}；没有生成任何交接材料")
+    finally:
+        os.close(dfd)
+
+
+def commit_files(wf_home: Path, commit: str) -> dict:
+    """按提交读出全部文件：{路径: (权限, 字节)}。普通文件权限是 0o644/0o755，符号链接是 LINK_MODE（内容为目标）。
+    只读对象库，不读工作区、不看 HEAD。子模块（gitlink）不在其中。"""
+    from .core import WfError
+    raw = _git_bytes(["ls-tree", "-r", "-z", "--full-tree", commit], wf_home)
+    entries = []
+    for rec in raw.split(b"\0"):
+        if not rec:
+            continue
+        meta, _, path = rec.partition(b"\t")
+        mode, typ, oid = meta.decode().split()
+        if typ != "blob":
+            continue
+        m = int(mode, 8)
+        entries.append((path.decode("utf-8", "surrogateescape"), LINK_MODE if _stat.S_ISLNK(m) else (m & 0o777 or 0o644), oid))
+    if not entries:
+        return {}
+    out = _git_bytes(["cat-file", "--batch"], wf_home, inp=("\n".join(e[2] for e in entries) + "\n").encode())
+    files, pos = {}, 0
+    for rel, mode, oid in entries:
+        nl = out.find(b"\n", pos)
+        head = out[pos:nl].decode().split() if nl >= 0 else []
+        if len(head) != 3 or head[0] != oid or head[1] != "blob":
+            raise WfError(f"读取提交 {commit[:12]} 的文件 {rel} 失败：{' '.join(head) or '输出不完整'}")
+        size = int(head[2])
+        data = out[nl + 1:nl + 1 + size]
+        if len(data) != size:
+            raise WfError(f"读取提交 {commit[:12]} 的文件 {rel} 失败：内容不完整")
+        files[rel] = (mode, data)
+        pos = nl + 1 + size + 1
+    return files
+
+
+def _freeze_dir(home: Path) -> dict:
+    """没有版本库时冻结工具目录：每个文件读一次。列目录失败、文件读不了或中途消失都整次失败（不产出残缺的快照）；
+    指向目录的链接与指向文件的链接一样只记链接本身，不进入、不读取目标。r3：内容一律经 _freeze_rel 以工具根目录
+    描述符为锚读取，遍历期间上级目录被换成链接时整次拒绝，不会读到目录外字节。"""
+    from .core import WfError
+    home = Path(home)
+    real_home = os.path.realpath(home)
+
+    def rel_of(path) -> str:
+        try:
+            return str(Path(path).relative_to(home)).replace(os.sep, "/") or "."
+        except ValueError:
+            return str(path)
+
+    def onerror(e):
+        raise WfError(f"冻结工具目录失败（无法列出 {rel_of(getattr(e, 'filename', '') or home)}）：{e}；没有生成任何交接材料")
+    files = {}
+    root_fd = _open_root(home)
+    try:
+        for dp, dns, fns in _walk(home, onerror=onerror, followlinks=False):
+            if not _inside(real_home, os.path.realpath(dp)):
+                raise WfError(f"冻结工具目录失败（{rel_of(dp)} 已不在工具目录内）；没有生成任何交接材料")
+            keep = []
+            for d in sorted(dns):
+                if d in SOURCE_SKIP_PARTS:
+                    continue
+                p = Path(dp) / d
+                try:
+                    st = os.lstat(p)
+                except OSError as e:
+                    raise WfError(f"冻结工具目录失败（{rel_of(p)}）：{e}；没有生成任何交接材料")
+                if _stat.S_ISLNK(st.st_mode):
+                    files[rel_of(p)] = _freeze_rel(root_fd, rel_of(p))
+                else:
+                    keep.append(d)
+            dns[:] = keep
+            for fn in sorted(fns):
+                if fn in SOURCE_SKIP_PARTS:
+                    continue
+                rel = rel_of(Path(dp) / fn)
+                files[rel] = _freeze_rel(root_fd, rel)
+    finally:
+        os.close(root_fd)
+    return files
+
+
+def _wt_mode(st_mode: int) -> int:
+    return 0o755 if st_mode & 0o100 else 0o644   # 与 git 相同：只看属主执行位
+
+
+def _kind_of(x):
+    return None if x is None else ("symlink" if is_link_mode(x[0]) else "file")
+
+
+def _frozen_dirty(home: Path, commit: str, files: dict) -> tuple:
+    """工作区相对 commit（不是当时的 HEAD）的改动，读一次冻结。返回 (条目列表, {路径: (权限, 字节) 或 None})。
+    链接只记目标字符串；父目录被换成链接的路径按已删除记。"""
+    names = set()
+    for args in (["diff", "--name-only", "-z", "--no-renames", commit, "--"],
+                 ["ls-files", "--others", "--exclude-standard", "-z"]):
+        names |= {n.decode("utf-8", "surrogateescape") for n in _git_bytes(args, home).split(b"\0") if n}
+    entries, frozen = [], {}
+    rels = [r for r in sorted(names) if not (set(r.split("/")) & SOURCE_SKIP_PARTS) and not r.endswith(".pyc")]
+    root_fd = _open_root(home) if rels else None   # r3（R7）：以工具根目录描述符为锚读取
+    try:
+        for rel in rels:
+            cur = _freeze_rel(root_fd, rel, "冻结工作区改动失败", missing_ok=True)
+            if cur is not None and not is_link_mode(cur[0]):
+                cur = (_wt_mode(cur[0]), cur[1])
+            _add_dirty(entries, frozen, rel, cur, files.get(rel))
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+    return entries, frozen
+
+
+def _add_dirty(entries: list, frozen: dict, rel: str, cur, base) -> None:
+    if base == cur:
+        return   # 只是时间戳变了
+    status = "D" if cur is None else ("A" if base is None else "M")
+    e = {"path": rel, "status": status, "type": _kind_of(cur), "base_type": _kind_of(base),
+         "sha256": hashlib.sha256(cur[1]).hexdigest() if cur else None,
+         "bytes": len(cur[1]) if cur else None, "mode": oct(cur[0]) if cur else None,
+         "base_sha256": hashlib.sha256(base[1]).hexdigest() if base else None,
+         "base_mode": oct(base[0]) if base else None}
+    if cur and is_link_mode(cur[0]):
+        e["target"] = cur[1].decode("utf-8", "replace")
+    entries.append(e)
+    frozen[rel] = cur
+
+
+def freeze_tool_source(wf_home: Path) -> dict:
+    """一次固定交接用的工具来源。返回：
+    kind（git / snapshot）、commit、tree、version、files（{路径: (权限, 字节)}）、manifest（{路径: sha256}，清单口径）、
+    digest（按 ops.fingerprint 的行格式对 manifest 求 sha256 前 16 位）、commit_verified（材料是否确由该提交读出）、
+    dirty（相对该提交的工作区改动，冻结后的 sha256）、dirty_frozen（{路径: (权限, 字节) 或 None}）。"""
+    from .core import WfError
+    home = Path(wf_home)
+    if (home / ".git").exists():
+        commit = _git_bytes(["rev-parse", "--verify", "HEAD^{commit}"], home).decode().strip()
+        tree = _git_bytes(["rev-parse", "--verify", commit + "^{tree}"], home).decode().strip()
+        short = _git_bytes(["rev-parse", "--short", commit], home).decode().strip()
+        files = commit_files(home, commit)
+        kind = "git"
+    else:
+        commit = tree = short = None
+        files = _freeze_dir(home)
+        kind = "snapshot"
+    if "VERSION" not in files or is_link_mode(files["VERSION"][0]):
+        raise WfError("固定的工具来源里没有 VERSION（或它不是普通文件），无法生成交接材料")
+    manifest = {rel: hashlib.sha256(files[rel][1]).hexdigest() for rel in sorted(files) if _manifest_rel(rel)}
+    digest = hashlib.sha256("".join(f"{h}  {rel}\n" for rel, h in manifest.items()).encode()).hexdigest()[:16]
+    dirty, frozen = _frozen_dirty(home, commit, files) if kind == "git" else ([], {})
+    return {"kind": kind, "home": str(home), "commit": commit, "tree": tree, "short": short,
+            "version": files["VERSION"][1].decode("utf-8", "replace").strip(),
+            "files": files, "manifest": manifest, "digest": digest, "commit_verified": kind == "git",
+            "dirty": dirty, "dirty_frozen": frozen}
+
+
+def source_text(src: dict, rel: str) -> str:
+    """从固定来源取一个文本文件（模板、WORKFLOW.md）。来源里没有或是链接时抛 WfError，不退回读工作区。"""
+    from .core import WfError
+    if rel not in src["files"] or is_link_mode(src["files"][rel][0]):
+        raise WfError(f"固定的工具来源（{src.get('commit') or '冻结快照'}）里没有普通文件 {rel}")
+    return src["files"][rel][1].decode("utf-8")
+
+
+def _zip_attr(mode: int) -> int:
+    return (LINK_MODE if is_link_mode(mode) else (_stat.S_IFREG | ((mode or 0o644) & 0o7777))) << 16
+
+
+def _zip_bytes(members) -> bytes:
+    """确定性 zip：固定时间戳、按给定顺序写入、记录权限（链接按 zip 约定记为链接，内容是目标字符串）。"""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, mode, data in members:
+            info = zipfile.ZipInfo(name, _ZIP_EPOCH)
+            info.external_attr = _zip_attr(mode)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            zf.writestr(info, data)
+    return buf.getvalue()
+
+
+def source_zip_bytes(src: dict, prefix: str = "collab-wf/") -> bytes:
+    """工具 zip：全部内容来自固定来源的冻结字节（有提交时即该提交的全部 blob）。不调用 git archive，
+    因而不受 .gitattributes、.git/info/attributes 的 export-ignore / export-subst 等现场设置影响。"""
+    return _zip_bytes([(prefix + rel, src["files"][rel][0], src["files"][rel][1]) for rel in sorted(src["files"])])
+
+
+snapshot_zip_bytes = source_zip_bytes   # r1 的名字，保留
+
+
+def verify_zip_source(zip_path: Path, src: dict, prefix: str = "collab-wf/") -> list:
+    """核对一个工具 zip 与固定来源逐项一致：路径集合、每个条目的字节与权限（含链接类型）。返回问题列表（空表示一致）。"""
+    import zipfile
+    problems = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            got = {}
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                if not info.filename.startswith(prefix):
+                    problems.append(f"条目不在 {prefix} 下：{info.filename}")
+                    continue
+                got[info.filename[len(prefix):]] = (info.external_attr >> 16, zf.read(info))
+    except (OSError, zipfile.BadZipFile) as e:
+        return [f"工具 zip 无法读取：{e}"]
+    want = src["files"]
+    for rel in sorted(set(want) - set(got)):
+        problems.append(f"zip 缺少 {rel}")
+    for rel in sorted(set(got) - set(want)):
+        problems.append(f"zip 多出 {rel}")
+    for rel in sorted(set(want) & set(got)):
+        if got[rel][1] != want[rel][1]:
+            problems.append(f"{rel} 内容与固定来源不同")
+        elif got[rel][0] != _zip_attr(want[rel][0]) >> 16:
+            problems.append(f"{rel} 权限或类型与固定来源不同（{oct(got[rel][0])} ≠ {oct(_zip_attr(want[rel][0]) >> 16)}）")
+    return problems
+
+
+def dirty_diff_bytes(src: dict) -> bytes:
+    """工作区改动的可读 diff，只用冻结的字节生成（不再读工作区）。仅供阅读，不是可直接应用的补丁
+    （按行比较，不保留行尾差异）；逐文件原字节与 sha256 以覆盖包里的 files/ 与 OVERLAY.json 为准。"""
+    import difflib
+    out = []
+    for e in src["dirty"]:
+        rel = e["path"]
+        base = src["files"].get(rel)
+        cur = src["dirty_frozen"].get(rel)
+        if (base and is_link_mode(base[0])) or (cur and is_link_mode(cur[0])):
+            def show(x):
+                return "（无）" if x is None else (("链接 -> " + x[1].decode("utf-8", "replace")) if is_link_mode(x[0])
+                                                 else f"普通文件 sha256 {hashlib.sha256(x[1]).hexdigest()}")
+            out.append(f"symlink {rel}: {show(base)} => {show(cur)}")
+            continue
+        old_b = base[1] if base else b""
+        new_b = cur[1] if cur else b""
+        if e["mode"] != e["base_mode"] and e["mode"] and e["base_mode"]:
+            out.append(f"mode {rel}: {e['base_mode']} -> {e['mode']}")
+        try:
+            old_t, new_t = old_b.decode("utf-8").splitlines(), new_b.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            out.append(f"Binary files a/{rel} and b/{rel} differ ({e['base_sha256']} -> {e['sha256']})")
+            continue
+        out += list(difflib.unified_diff(old_t, new_t, f"a/{rel}" if base else "/dev/null",
+                                         f"b/{rel}" if e["status"] != "D" else "/dev/null", lineterm=""))
+    return ("\n".join(out) + "\n").encode("utf-8") if out else b""
+
+
+def overlay_bytes(src: dict) -> tuple:
+    """只读覆盖包：冻结的现场改动 + 清单 + diff。返回 (zip 字节, 清单 dict)。
+    包内有多个顶层条目、没有 VERSION 与 wf.py：release._extract 按“只能有一个顶层目录”拒绝，不能被当作版本包安装。
+    链接只在 OVERLAY.json 里记目标字符串，不作为 zip 条目、更不读取目标内容；files/ 下只有冻结的普通文件字节。"""
+    diff = dirty_diff_bytes(src)
+    meta = {"kind": "collab-wf-dirty-overlay", "installable": False, "base_kind": src["kind"],
+            "base_commit": src["commit"], "base_tree": src["tree"], "base_version": src["version"],
+            "entries": src["dirty"], "diff_sha256": hashlib.sha256(diff).hexdigest(),
+            "diff_note": "DIRTY.diff 仅供阅读，不是可直接应用的补丁；以 files/ 的原字节与 entries 的 sha256 为准",
+            "note": "运行现场相对 base_commit 的未提交改动，冻结一次后打包；作者、授权与审查来源未知，不是版本包，不可安装。"}
+    members = [("NOT-INSTALLABLE.txt", 0o444, ("这是现场未提交改动的只读留证包，不是 collab-wf 版本包，不可安装。\n"
+                                                f"基线提交 {src['commit']}，tree {src['tree']}。\n").encode("utf-8")),
+               ("OVERLAY.json", 0o444, json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")),
+               ("DIRTY.diff", 0o444, diff)]
+    for e in src["dirty"]:
+        cur = src["dirty_frozen"].get(e["path"])
+        if cur is not None and not is_link_mode(cur[0]):
+            members.append(("files/" + e["path"], 0o444, cur[1]))
+    return _zip_bytes(members), meta
+
+
+def source_summary(src: dict) -> dict:
+    """可写进返回值与事件的来源摘要（不含文件字节）。"""
+    return {"kind": src["kind"], "commit": src["commit"], "tree": src["tree"], "version": src["version"],
+            "digest": src["digest"], "files": len(src["manifest"]), "commit_verified": src["commit_verified"],
+            "dirty": [dict(e) for e in src["dirty"]]}
+
+
+def source_declaration(summary: dict, tool_zip_name: str, overlay: dict = None) -> str:
+    """说明消息末尾的【工具来源】声明：附件、正文与清单取自哪里；现场改动有哪些、是否随消息提供。"""
+    lines = ["", "===== 工具来源（同源声明） ====="]
+    if summary["kind"] == "git":
+        lines.append(f"附件 {tool_zip_name}、上文的 WORKFLOW.md、本消息模板、工具版本 {summary['version']} 与文件清单，"
+                     f"全部取自工具提交 {summary['commit']}（tree {summary['tree']}）的冻结内容；附件已逐项核对与之一致。")
+    else:
+        lines.append(f"工具目录没有版本库：附件 {tool_zip_name}、上文的 WORKFLOW.md、本消息模板、工具版本 {summary['version']} "
+                     f"与文件清单取自同一次冻结快照（{summary['files']} 个清单文件，摘要 {summary['digest']}）；"
+                     "没有提交号，未核对任何原生提交。")
+    if summary.get("head_moved"):
+        lines.append(f"生成期间工具 HEAD 已移动到 {summary.get('head_now')}；以上材料仍全部取自上面固定的提交。")
+    if summary["dirty"]:
+        lines.append(f"冻结时运行现场相对该提交有 {len(summary['dirty'])} 个未提交改动，内容不在附件与正文中"
+                     "（作者、授权、审查来源未知，既未采用也未回退）：")
+        for e in summary["dirty"]:
+            tail = f"  链接 -> {e['target']}" if e.get("target") is not None else ""
+            lines.append(f"- {e['status']} {e['path']}  现场 {(e['sha256'] or '（已删除）')[:12]}  "
+                         f"基线 {(e['base_sha256'] or '（无）')[:12]}{tail}")
+        if overlay:
+            lines.append(f"现场改动已冻结为只读覆盖包 {overlay['name']}（sha256 {overlay['sha256']}，diff sha256 "
+                         f"{overlay['diff_sha256']}），留在执行端 outbox，不随本消息发送，不可安装；需要时请点名索取。"
+                         + ("" if overlay.get("read_only", True) else "（注意：覆盖包未能设为只读）"))
+    elif summary["kind"] == "git":
+        lines.append("冻结时运行现场与该提交一致，没有未提交改动。")
+    return "\n".join(lines) + "\n"
