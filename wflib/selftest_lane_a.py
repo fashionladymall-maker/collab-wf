@@ -1792,26 +1792,182 @@ def _p_absent_pos():
     from . import driver, tasks
     with tempfile.TemporaryDirectory() as td:
         a = _inst(td, "a2-x-p", {"state": "WAIT_SCHEDULE", "turn": 3, "await_executor": 3, "until": _iso(3600)})
-        tasks.add(a, 3, {"1": "执行端要做的事"})
+        added = tasks.add(a, 3, {"1": "执行端要做的事", "2": "执行端被打断的事"})
+        checkpoint = tasks.progress(a, "T3-2", "中断后尚未恢复", generation=added[1]["generation"], kind="interrupted")
         r = driver.h_wait_schedule(_ctx(a, {}))
         st = _disk(a)
+        protected = next(t for t in st["executor_tasks"] if t["id"] == "T3-2")
     ok = (r[0] == "wait" and st["state"] == "WAIT_SCHEDULE" and st.get("await_executor") == 3 and "T3-1" in r[1]
-          and st.get("recovery") is None)
-    return ok, {"ret": list(r), "state": st["state"]}
+          and st.get("recovery") is None and protected == checkpoint and tasks.interrupted(protected)
+          and tasks.status_of(protected) == "open" and "T3-2" in r[1])
+    return ok, {"ret": list(r), "state": st["state"], "interrupted_kept": protected == checkpoint}
 
 
 def _p_absent_neg():
     from . import driver, tasks
     with tempfile.TemporaryDirectory() as td:
         a = _inst(td, "a2-x-n", {"state": "WAIT_SCHEDULE", "turn": 3, "await_executor": 3, "until": _iso(-5)})
-        tasks.add(a, 3, {"1": "执行端没做完的事"})
+        added = tasks.add(a, 3, {"1": "执行端没做完的事", "2": "截止不是恢复也不是完成"})
+        checkpoint = tasks.progress(a, "T3-2", "留下执行断点", generation=added[1]["generation"], kind="interrupted")
         r = driver.h_wait_schedule(_ctx(a, {}))
         st = _disk(a)
         notes = "\n".join(p.read_text(encoding="utf-8") for p in a.wf.rglob("notes.jsonl"))
+        protected = next(t for t in st["executor_tasks"] if t["id"] == "T3-2")
+        rejected = _rej(a, lambda: tasks.done(a, "T3-2", "截止不能算完成", generation=checkpoint["generation"]))
     t = (st.get("executor_tasks") or [{}])[0]
     ok = (st["state"] not in ("BLOCKED", "AWAITING_USER", "WAIT_SCHEDULE") and "await_executor" not in st
-          and "T3-1" in notes and tasks.status_of(t) == "open")
-    return ok, {"ret": r[0], "state": st["state"], "task_status": tasks.status_of(t), "deviation_lists_task": "T3-1" in notes}
+          and "T3-1" in notes and tasks.status_of(t) == "open" and "T3-2" in notes
+          and protected == checkpoint and tasks.status_of(protected) == "open" and tasks.interrupted(protected)
+          and rejected == "unchanged")
+    return ok, {"ret": r[0], "state": st["state"], "task_status": tasks.status_of(t), "deviation_lists_task": "T3-1" in notes,
+                "interrupted_kept": protected == checkpoint, "interrupted_done": rejected}
+
+
+# ---- B2-A2b：每次观察都启动新进程，重载磁盘并实际重写临时 inbox ----
+
+def _a2b_child(root, action):
+    from . import driver, notify
+    from .core import Instance
+    inst = Instance(root)
+    result = None
+    if action == "deadline":
+        result = driver.h_wait_schedule(_ctx(inst, {}))
+    elif action != "observe":
+        raise ValueError(action)
+    rows = notify.write_inbox([inst], path=inst.root.parent / (inst.root.name + "-inbox.json"))
+    return {"pid": os.getpid(), "result": result, "state": inst.state["state"], "turn": inst.state["turn"],
+            "tasks": inst.state.get("executor_tasks") or [],
+            "inbox": [r for r in rows if "|task:" in r["key"]]}
+
+
+def _a2b_restart(inst, action="observe"):
+    from .core import WF_HOME
+    from .selftest import child_env
+    code = ("import json,sys; from wflib.selftest_lane_a import _a2b_child; "
+            "print(json.dumps(_a2b_child(sys.argv[1], sys.argv[2]), ensure_ascii=False))")
+    r = subprocess.run([sys.executable, "-c", code, str(inst.root), action], cwd=str(WF_HOME),
+                       env=child_env(os.environ, os.environ["WF_LOCAL_DIR"]), capture_output=True, text=True, timeout=60)
+    if r.returncode:
+        raise RuntimeError(f"A2b restart exit={r.returncode}: {r.stdout}\n{r.stderr}")
+    return json.loads(r.stdout)
+
+
+def _a2b_visible(snapshot, task):
+    return (next((t for t in snapshot["tasks"] if t["id"] == task["id"]), None) == task
+            and any(r["key"].endswith("|task:" + task["id"]) for r in snapshot["inbox"]))
+
+
+def _p_generation_pos():
+    from . import tasks
+    from .core import Instance
+    with tempfile.TemporaryDirectory() as td:
+        a, b = _inst(td, "a2b-gen-a"), _inst(td, "a2b-gen-b")
+        ta, tb = [tasks.add(i, 3, {"1": "当前代次任务"})[0] for i in (a, b)]
+        rc, out = _wf_cli(a.root, "task", "progress", ta["id"], "--generation", ta["generation"], "--rev", "1",
+                          "--note", "真实CLI进程写检查点")
+        p = Instance(a.root).state["executor_tasks"][0]
+        done = tasks.done(Instance(a.root), ta["id"], "当前代次完成", generation=ta["generation"], expect_rev=2)
+        snapshot = _a2b_restart(a)
+    ok = (rc == 0 and ta["generation"] != tb["generation"] and len(ta["generation"]) == len(tb["generation"]) == 32
+          and ta["project"] == a.name and tb["project"] == b.name and ta["root"] == str(a.root)
+          and tb["root"] == str(b.root) and p["rev"] == 2 and done["rev"] == 3
+          and tasks.status_of(done) == "done" and snapshot["tasks"] == [done] and snapshot["inbox"] == [])
+    return ok, {"cli_exit": rc, "cli_output": out[-200:], "distinct_generation": ta["generation"] != tb["generation"],
+                "rev": [ta["rev"], p["rev"], done["rev"]], "restart_pid": snapshot["pid"], "closed_inbox": snapshot["inbox"]}
+
+
+def _p_generation_neg():
+    from . import tasks
+    from .core import Instance
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2b-gen-reuse")
+        old = tasks.add(a, 3, {"1": "将被裁掉的旧任务"})[0]
+        tasks.done(a, old["id"], "旧任务已完成", generation=old["generation"])
+        for t in tasks.add(a, 4, {str(i): f"关闭记录{i}" for i in range(1, tasks.KEEP_DONE + 2)}):
+            tasks.close(a, t["id"], "cancelled", "裁剪负对照", generation=t["generation"])
+        tasks.add(a, 5, {"1": "触发只裁已关闭记录"})
+        trimmed = all(t["id"] != old["id"] for t in _disk(a)["executor_tasks"])
+        new = tasks.add(a, 3, {"1": "复用编号但必须换代次"})[0]
+        b = _inst(td, "a2b-gen-other")
+        other = tasks.add(b, 3, {"1": "另一项目同编号"})[0]
+        rejected = {
+            "pruned_generation": _rej(a, lambda: tasks.done(a, new["id"], "迟到旧命令", generation=old["generation"])),
+            "other_project": _rej(a, lambda: tasks.done(a, new["id"], "错项目代次", generation=other["generation"])),
+            "stale_rev": _rej(a, lambda: tasks.progress(a, new["id"], "旧修订", generation=new["generation"], expect_rev=2)),
+        }
+        before = _snap(a)
+        rc, output = _wf_cli(a.root, "task", "done", new["id"], "--generation", old["generation"], "--note", "真实旧CLI命令")
+        cli_unchanged = _snap(a) == before
+        snapshot = _a2b_restart(Instance(a.root))
+    ok = (trimmed and old["generation"] != new["generation"] and all(v == "unchanged" for v in rejected.values())
+          and rc != 0 and cli_unchanged and _a2b_visible(snapshot, new) and tasks.status_of(new) == "open")
+    return ok, {"trimmed": trimmed, "new_generation": new["generation"], "rejected": rejected,
+                "old_cli_exit": rc, "old_cli_unchanged": cli_unchanged, "old_cli_output": output[-250:],
+                "restart_pid": snapshot["pid"]}
+
+
+def _p_interrupted_pos():
+    from . import tasks
+    from .core import Instance
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2b-interrupted", {"state": "WAIT_SCHEDULE", "turn": 3, "await_executor": 3, "until": _iso(-5)})
+        initial = tasks.add(a, 3, {"1": "中断任务跨截止与轮次保留", "2": "已完成记录负对照"})
+        protected = tasks.progress(a, "T3-1", "已做第一步；下一步核对结果；证据PROJECT.md",
+                                   generation=initial[0]["generation"], kind="interrupted")
+        tasks.done(a, "T3-2", "普通任务正常完成", generation=initial[1]["generation"])
+        before = _a2b_restart(a)
+        after = _a2b_restart(a, "deadline")
+        restarted = _a2b_restart(a)
+        a = Instance(a.root)
+        report = Path(a.state["outgoing"]["file"]).read_text(encoding="utf-8")
+        for t in tasks.add(a, 5, {str(i): f"裁剪关闭项{i}" for i in range(1, tasks.KEEP_DONE + 2)}):
+            tasks.close(a, t["id"], "cancelled", "只裁已关闭记录", generation=t["generation"])
+        tasks.add(a, 6, {"1": "新轮仍保留旧中断任务"})
+        pruned = _a2b_restart(a)
+        closed = [t for t in pruned["tasks"] if tasks.status_of(t) != "open"]
+        snapshots = [before, after, restarted, pruned]
+        visible = [_a2b_visible(s, protected) for s in snapshots]
+        inbox_rows = [next((r for r in s["inbox"] if r["key"].endswith("|task:T3-1")), {}) for s in snapshots]
+    ok = (all(visible) and tasks.status_of(protected) == "open" and tasks.interrupted(protected)
+          and before["turn"] == 3 and after["turn"] == restarted["turn"] == pruned["turn"] == 4
+          and after["state"] == "COMPOSE" and after["result"][0] == "progress"
+          and "仍未完成" in report and "T3-1" in report
+          and len(closed) == tasks.KEEP_DONE and all(t["id"] != "T3-2" for t in pruned["tasks"])
+          and all(r.get("since") == inbox_rows[0].get("since") for r in inbox_rows)
+          and all(s["pid"] != os.getpid() for s in snapshots))
+    return ok, {"visible_at_restart_deadline_newturn_prune": visible, "turns": [s["turn"] for s in snapshots],
+                "subprocess_pids": [s["pid"] for s in snapshots], "closed_kept": len(closed),
+                "ordinary_closed_pruned": all(t["id"] != "T3-2" for t in pruned["tasks"]),
+                "report_lists_unfinished": "仍未完成" in report and "T3-1" in report}
+
+
+def _p_interrupted_neg():
+    from . import tasks
+    from .core import Instance
+    with tempfile.TemporaryDirectory() as td:
+        a = _inst(td, "a2b-interrupted-negative", {"state": "WAIT_SCHEDULE", "turn": 3, "await_executor": 3, "until": _iso(-5)})
+        t = tasks.add(a, 3, {"1": "中断后必须显式恢复"})[0]
+        tasks.progress(a, t["id"], "被打断", generation=t["generation"], kind="interrupted")
+        rejected = {"before_deadline": _rej(a, lambda: tasks.done(a, t["id"], "不能提前完成", generation=t["generation"]))}
+        deadline = _a2b_restart(a, "deadline")
+        a = Instance(a.root)
+        rejected["after_deadline_newturn"] = _rej(a, lambda: tasks.done(a, t["id"], "到期也不是完成", generation=t["generation"]))
+        p = tasks.progress(a, t["id"], "普通进度不是恢复", generation=t["generation"])
+        before = _snap(a)
+        rc, output = _wf_cli(a.root, "task", "done", t["id"], "--generation", t["generation"], "--note", "CLI也不能绕过")
+        cli_unchanged = _snap(a) == before
+        still_open = _a2b_restart(a)
+        resumed = tasks.progress(Instance(a.root), t["id"], "显式恢复后核对完成", generation=t["generation"], kind="resumed")
+        done = tasks.done(Instance(a.root), t["id"], "恢复后真实完成", generation=t["generation"])
+        closed = _a2b_restart(a)
+    ok = (all(v == "unchanged" for v in rejected.values()) and deadline["turn"] == 4
+          and tasks.interrupted(p) and tasks.status_of(p) == "open" and _a2b_visible(still_open, p)
+          and rc != 0 and cli_unchanged and not tasks.interrupted(resumed) and tasks.status_of(done) == "done"
+          and closed["tasks"] == [done] and closed["inbox"] == [])
+    return ok, {"done_rejections": rejected, "cli_exit": rc, "cli_unchanged": cli_unchanged,
+                "cli_output": output[-250:], "ordinary_progress_still_interrupted": tasks.interrupted(p),
+                "explicit_resume_allows_done": tasks.status_of(done), "closed_inbox": closed["inbox"],
+                "subprocess_pids": [deadline["pid"], still_open["pid"], closed["pid"]]}
 
 
 def _find_code(obj, kind="approve"):
@@ -1910,6 +2066,24 @@ def _provider(category, pos, neg):
     return run
 
 
+def _a2b_provider(category, pos, neg):
+    """新类别同时满足共享契约和既有 positive/negative 调用方，不改变旧提供方格式。"""
+    legacy = _provider(category, pos, neg)
+
+    def run():
+        out = legacy()
+        out.update(provider="A", card="B2-A2b", error=None)
+        out["cases"] = [{"name": category + "-" + kind, "polarity": polarity,
+                         "ran": out[kind]["ran"], "ok": out[kind]["ok"],
+                         "detail": json.dumps(out[kind]["evidence"], ensure_ascii=False, default=str)}
+                        for kind, polarity in (("positive", "pos"), ("negative", "neg"))]
+        if not out["ok"]:
+            out["error"] = "; ".join(c["detail"] for c in out["cases"] if not c["ok"])
+        return out
+    run.__name__ = legacy.__name__
+    return run
+
+
 C1_PROVIDERS = {
     "2R-busy": _provider("2R-busy", _p_busy_pos, _p_busy_neg),
     "2R-network": _provider("2R-network", _p_network_pos, _p_network_neg),
@@ -1918,6 +2092,8 @@ C1_PROVIDERS = {
     "2R-executor-absent": _provider("2R-executor-absent", _p_absent_pos, _p_absent_neg),
     "2S-credential": _provider("2S-credential", _p_cred_pos, _p_cred_neg),
     "2S-wrong-project": _provider("2S-wrong-project", _p_wrong_pos, _p_wrong_neg),
+    "6b-task-generation": _a2b_provider("6b-task-generation", _p_generation_pos, _p_generation_neg),
+    "6b-interrupted": _a2b_provider("6b-interrupted", _p_interrupted_pos, _p_interrupted_neg),
 }
 
 
@@ -1926,6 +2102,16 @@ def _t_a2_providers(_ok):
         r = fn()
         _ok(f"B2-A2a 提供方 {cat}：正例与反例都实际运行并通过（c1-provider/1）",
             r["ok"] and r["positive"]["ran"] and r["negative"]["ran"], json.dumps(r, ensure_ascii=False, default=str)[:1800])
+
+
+def _t_a2b_provider_contract(_ok):
+    for cat in ("6b-task-generation", "6b-interrupted"):
+        r = C1_PROVIDERS[cat]()
+        _ok(f"B2-A2b 提供方 {cat}：cases/provider/error 与旧 positive/negative 双接口都来自实际正反例",
+            r["schema"] == "c1-provider/1" and r["provider"] == "A" and r["category"] == cat and r["error"] is None
+            and r["ok"] and len(r["cases"]) == 2 and {c["polarity"] for c in r["cases"]} == {"pos", "neg"}
+            and all(c["ran"] is True and c["ok"] is True and c["detail"] for c in r["cases"]),
+            json.dumps(r, ensure_ascii=False, default=str)[:2200])
 
 
 # ---- 不变量 ----
@@ -2554,6 +2740,7 @@ TESTS = [
     ("B2-A2a r2 同一意图只计一次", _t_a2r2_unknown_key), ("B2-A2a r2 硬上限与额度时刻", _t_a2r2_deadline_quota),
     ("B2-A2a r2 坏恢复记录", _t_a2r2_corrupt),
     ("B2-A2a GPT 意图身份校验", _t_a2gpt_intent_identity),
+    ("B2-A2b 提供方契约", _t_a2b_provider_contract),
 ]
 
 
