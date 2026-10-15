@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -759,8 +760,8 @@ def _recover_tx(lock, path):
 
 
 class _InstallTx:
-    def __init__(self, lock, req, src, plan, decision):
-        exec_context = _exec_context()
+    def __init__(self, lock, req, src, plan, decision, exec_receipt=None):
+        exec_context, emit = _exec_binding(exec_receipt)
         lock.activate().verify()
         self.lock, self.req, self.plan = lock, req, plan
         self.tx_id = "tx-" + secrets.token_hex(16)
@@ -785,7 +786,7 @@ class _InstallTx:
                             "package_sha256": req["package"]["sha256"],
                             "target": {"kind": req["kind"], "root": str(lock.root)},
                             "prepared_sha256": self.prepared["body_sha256"]}
-        _emit_install_ref(self.prepared["exec"], self.install_ref)
+        emit(self.install_ref)
 
     def consume(self, target, src):
         self.lock.verify()
@@ -831,35 +832,96 @@ class _InstallTx:
             "recovery": recovery})
 
 
-def _exec_context():
-    """只关联调用者，不授予安装权限。receipt FD 仅由当前 exec 子进程继承。"""
-    raw = os.environ.get("WF_INSTALL_EXEC_CONTEXT")
-    if raw is None:
-        return None
-    context = json.loads(raw)
-    if (not isinstance(context, dict) or context.get("schema") != "install-exec/1"
-            or not isinstance(context.get("subject"), dict)
-            or not isinstance(context["subject"].get("project"), str)
-            or not Path(context["subject"].get("root", "")).is_absolute()
-            or type(context.get("turn")) is not int or context["turn"] < 1
-            or not isinstance(context.get("exec"), dict)
-            or not isinstance(context["exec"].get("id"), str)
-            or not isinstance(context["exec"].get("nonce"), str)
-            or len(context["exec"]["nonce"]) != 32):
+def _check_exec_context(context):
+    """install-exec/1，与 C5 读端（live_history.exec_binding）同形。只关联调用者，不授予安装权限。"""
+    try:
+        subject, identity = context["subject"], context["exec"]
+        ok = (isinstance(context, dict) and set(context) == {"schema", "subject", "turn", "exec"}
+              and context["schema"] == "install-exec/1"
+              and isinstance(subject, dict) and set(subject) == {"project", "root"}
+              and isinstance(subject["project"], str) and bool(subject["project"])
+              and isinstance(subject["root"], str) and Path(subject["root"]).is_absolute()
+              and type(context["turn"]) is int and context["turn"] >= 1
+              and isinstance(identity, dict) and set(identity) == {"id", "nonce"}
+              and isinstance(identity["id"], str) and re.fullmatch(r"c[0-9]{2,}", identity["id"]) is not None
+              and isinstance(identity["nonce"], str) and re.fullmatch(r"[0-9a-f]{32}", identity["nonce"]) is not None)
+    except (TypeError, KeyError):
+        ok = False
+    if not ok:
         raise WfError("exec 安装关联身份无效（install_exec_invalid）")
-    return context
+    return json.loads(json.dumps(context))
 
 
-def _emit_install_ref(context, ref):
-    if context is None:
-        return
-    fd = int(os.environ["WF_INSTALL_RECEIPT_FD"])
+def _write_receipt(fd, context, ref):
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         raise WfError("安装关联收据不是普通文件（install_exec_invalid）")
     data = review._canon({"schema": "install-exec-receipt/1", "exec": context, "install_ref": ref}) + b"\n"
     if os.write(fd, data) != len(data):
         raise WfError("安装关联收据未完整写入（install_exec_invalid）")
     os.fsync(fd)
+
+
+def _exec_context():
+    """继承路径：ops.run_exec 的子进程从自己的环境取身份；receipt FD 仅由该子进程继承。"""
+    raw = os.environ.get("WF_INSTALL_EXEC_CONTEXT")
+    if raw is None:
+        return None
+    try:
+        context = json.loads(raw)
+    except ValueError as e:
+        raise WfError("exec 安装关联身份无效（install_exec_invalid）") from e
+    return _check_exec_context(context)
+
+
+def _emit_install_ref(context, ref):
+    if context is None:
+        return
+    _write_receipt(int(os.environ["WF_INSTALL_RECEIPT_FD"]), context, ref)
+
+
+class ExecReceipt:
+    """显式路径：调用方（驱动器进程内安装）把已持久分配的 exec 身份与收据句柄作为参数交给受保护安装器。
+
+    不读也不改进程环境；只关联调用者，不授予安装权限；一次调用只能登记一个安装引用。"""
+
+    __slots__ = ("_context", "_fd", "_used")
+
+    def __init__(self, context, fd):
+        self._context = _check_exec_context(context)
+        try:
+            regular = type(fd) is int and fd >= 0 and stat.S_ISREG(os.fstat(fd).st_mode)
+        except OSError:
+            regular = False
+        if not regular:
+            raise WfError("安装关联收据不是普通文件（install_exec_invalid）")
+        self._fd, self._used = fd, False
+
+    @property
+    def context(self):
+        return json.loads(json.dumps(self._context))
+
+    def emit(self, ref):
+        if self._used:
+            raise WfError("同一 exec 身份不能登记第二个安装（install_exec_reused）")
+        self._used = True
+        _write_receipt(self._fd, self._context, ref)
+
+
+def _explicit_receipt(exec_receipt):
+    if not isinstance(exec_receipt, ExecReceipt):
+        raise WfError("exec 安装关联身份无效（install_exec_invalid）")
+    if any(os.environ.get(k) is not None for k in ("WF_INSTALL_EXEC_CONTEXT", "WF_INSTALL_RECEIPT_FD")):
+        # 两个身份同时存在时，安装归属不唯一；宁可不装。
+        raise WfError("显式调用身份与继承的 exec 身份同时存在（install_exec_ambiguous）")
+    return exec_receipt
+
+
+def _exec_binding(exec_receipt=None):
+    if exec_receipt is None:
+        context = _exec_context()
+        return context, (lambda ref: _emit_install_ref(context, ref))
+    receipt = _explicit_receipt(exec_receipt)
+    return receipt.context, receipt.emit
 
 
 def _review_source(review_id, *, target, kind, dest, zip_path=None) -> Path:
@@ -1038,14 +1100,20 @@ def _restart_hints(inst: Instance, changed) -> list:
 # ---------------- 项目 ----------------
 
 @_boundary("apply_zip")
-def apply_zip(inst: Instance, zip_path=None, by="executor", *, review_id=None) -> dict:
+def apply_zip(inst: Instance, zip_path=None, by="executor", *, review_id=None, exec_receipt=None) -> dict:
     if not review_id:
         raise WfError("安装需要 review_id（unreviewed_install）")
+    if exec_receipt is not None:
+        _explicit_receipt(exec_receipt)
     caller = inst
     root = Path(inst.root).resolve(strict=True)
     with _InstallLock(root, "project") as lock:
         # 不信任调用者缓存的 Instance；锁内重新读取 wf.json 与 protect。
         inst = _fresh_instance(root)
+        if exec_receipt is not None and (
+                exec_receipt.context["subject"] != {"project": inst.name, "root": str(root)}
+                or exec_receipt.context["turn"] != inst.state.get("turn")):
+            raise WfError("显式安装调用身份不属于本项目当前轮次（install_exec_subject_mismatch）")
         protect = inst.protect()
         if (root / ".git").exists():
             dirty = _dirty(root, protect)
@@ -1069,7 +1137,7 @@ def apply_zip(inst: Instance, zip_path=None, by="executor", *, review_id=None) -
             rel_json = f"workflow/releases/{p['version']}.json"
             decision = _allow_review_install(review_id, target=inst, kind="project", src=src)
             plan = _install_plan(req, pkg, src, root, "project", cfg=inst.cfg, archive=rel_json)
-            tx = _InstallTx(lock, req, src, plan, decision)
+            tx = _InstallTx(lock, req, src, plan, decision, exec_receipt)
             try:
                 tx.consume(inst, src)
                 inst = _fresh_instance(root, req)
