@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -128,13 +129,21 @@ def run_exec(inst: Instance, cmd: str, label=None, timeout=None, by="executor") 
         env["VIRTUAL_ENV"] = str(venv)
         env["PATH"] = str(venv / "bin") + os.pathsep + env.get("PATH", "")
     meta = {"id": cid, "cmd": cmd, "label": label, "cwd": str(inst.root), "start": now_iso()}
+    invocation = {"schema": "install-exec/1", "subject": {"project": inst.name, "root": str(inst.root)},
+                  "turn": st["turn"], "exec": {"id": cid, "nonce": secrets.token_hex(16)}}
+    meta["install_exec"] = invocation
     write_json(d / f"{cid}.json", meta)
     print(f"[wf exec {cid}] $ {cmd}", flush=True)
     t0 = time.time()
     interrupted = False
-    with open(out_p, "wb") as fo, open(err_p, "wb") as fe:
+    receipt_path = d / f"{cid}.install.jsonl"
+    with open(out_p, "wb") as fo, open(err_p, "wb") as fe, open(receipt_path, "xb") as receipts:
+        os.fchmod(receipts.fileno(), 0o600)
+        env["WF_INSTALL_EXEC_CONTEXT"] = json.dumps(invocation)
+        env["WF_INSTALL_RECEIPT_FD"] = str(receipts.fileno())
         # 输出直接写文件（不用管道），后台启动的子进程不会让这里卡住
-        p = subprocess.Popen(["bash", "-c", cmd], cwd=str(inst.root), stdout=fo, stderr=fe, env=env)
+        p = subprocess.Popen(["bash", "-c", cmd], cwd=str(inst.root), stdout=fo, stderr=fe, env=env,
+                             pass_fds=(receipts.fileno(),))
         pos = [0, 0]
 
         def pump():
@@ -172,9 +181,21 @@ def run_exec(inst: Instance, cmd: str, label=None, timeout=None, by="executor") 
         pump()
     meta.update(end=now_iso(), duration_s=round(time.time() - t0, 1), exit_code=rc,
                 interrupted=interrupted or None, out_bytes=out_p.stat().st_size, err_bytes=err_p.stat().st_size)
+    refs, receipt_error = [], None
+    try:
+        for line in receipt_path.read_text(encoding="utf-8").splitlines():
+            rec = json.loads(line)
+            if (not isinstance(rec, dict) or rec.get("schema") != "install-exec-receipt/1"
+                    or rec.get("exec") != invocation or not isinstance(rec.get("install_ref"), dict)):
+                raise ValueError("receipt identity")
+            refs.append(rec["install_ref"])
+    except (OSError, UnicodeError, ValueError) as exc:
+        receipt_error = type(exc).__name__
+    meta.update(install_refs=refs, install_receipt_error=receipt_error)
     write_json(d / f"{cid}.json", meta)
     inst.event("exec", cid=cid, cmd=cmd[:300], exit_code=rc, duration_s=meta["duration_s"],
-               interrupted=interrupted or None, by=by)
+               interrupted=interrupted or None, by=by, install_exec=invocation,
+               install_refs=refs, install_receipt_error=receipt_error)
     print(f"[wf exec {cid}] exit={rc}  耗时 {meta['duration_s']}s  证据：{d.relative_to(inst.root)}/{cid}.*", flush=True)
     return rc
 

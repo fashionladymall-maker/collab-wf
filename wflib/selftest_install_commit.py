@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from . import admin, core, release, review
+from . import admin, anomaly, core, release, review
 from .selftest import _project_md
 from .selftest_review import Env, _git
 
@@ -14,12 +14,15 @@ class InstallCommitTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="wf-install-commit-")
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        self.base = Path(self.temp.name).resolve()
         local = self.base / "local"
         for key, value in (("LOCAL", local), ("REGISTRY", local / "registry.json")):
             p = patch.object(core, key, value)
             p.start()
             self.addCleanup(p.stop)
+        p = patch.object(anomaly, "LOCAL", local)
+        p.start()
+        self.addCleanup(p.stop)
         self.env = Env(self.base)
         p = patch.object(review, "_tool_home", lambda: self.env.tool)
         p.start()
