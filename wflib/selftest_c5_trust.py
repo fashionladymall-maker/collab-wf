@@ -156,6 +156,31 @@ BRANCH_TABLE = list(BRANCH_MISSES) + [
 ]
 
 
+# C4-MULTI-INSTALL: legacy candidate set. Each row: command -> the unchanged single pick (kind, argument).
+# Real Bash decides what ran; candidates must contain every call Bash made, and every sequential candidate
+# must have run. Conditional candidates are possibilities only.
+CANDIDATE_TABLE = {
+ "wf apply p.zip; wf self-update t.zip": ("project", "p.zip"),
+ "wf self-update t.zip; wf apply p.zip": ("tool", "t.zip"),
+ "wf drill review p.zip; wf self-update t.zip": ("inner_review", None),
+ "wf self-update t.zip; wf drill review p.zip": ("inner_review", None),
+ "if true; then wf apply p.zip; else wf self-update t.zip; fi": ("project", "p.zip"),
+ "if false; then wf apply p.zip; else wf self-update t.zip; fi": ("project", "p.zip"),
+ "wf self-update a.zip; wf self-update b.zip": ("tool", "a.zip"),
+ "bash -c 'wf apply p.zip; wf self-update w.zip'": ("project", "p.zip"),
+ "sh -c 'wf self-update s.zip' && wf apply p.zip": ("tool", "s.zip"),
+ "eval 'wf apply e.zip; wf self-update e2.zip'": ("project", "e.zip"),
+ 'echo "$(wf self-update sub.zip)"; wf apply p.zip': ("tool", "sub.zip"),
+ "f(){ wf self-update f.zip; }; wf apply p.zip; f": ("project", "p.zip"),
+ "f(){ wf self-update f.zip; }; g(){ :; }; true && f; g": ("tool", "f.zip"),
+ "for i in 1 2; do wf self-update l$i.zip; done": ("tool", "l$i.zip"),
+ "if wf self-update c.zip; then wf apply p.zip; fi": ("tool", "c.zip"),
+ "f(){ wf self-update unused.zip; }; wf apply p.zip": ("project", "p.zip"),
+ "command -v wf; wf apply p.zip": ("project", "p.zip"),
+ "true || wf self-update never.zip": ("tool", "never.zip"),
+}
+
+
 def bash_trace_kind(command):
     """Run ``command`` in real Bash with a stand-in wf that only records argv."""
     import subprocess
@@ -858,6 +883,112 @@ class LegacyEntryTests(_Fixture):
         self.assertEqual(len(rows), len(BRANCH_TABLE))
         self.assertGreaterEqual(sum(e is not None for _, e, _ in rows), 18)
         self.assertGreaterEqual(sum(e is None for _, e, _ in rows), 4)
+
+    def test_legacy_candidates_agree_with_real_bash(self):
+        """Candidates never hide a call Bash made; sequential ones really ran; the single pick is unchanged."""
+        import shutil
+        import subprocess
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        version = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
+                                 capture_output=True, text=True).stdout.strip()
+        if version != "5.2":
+            self.skipTest(f"candidate oracle is pinned to real Bash 5.2, found {version}")
+        kinds = {"self-update": "tool", "apply": "project"}
+        for command, pick in CANDIDATE_TABLE.items():
+            _, _, calls = bash_trace_kind(command)
+            ran = set()
+            for call in calls:
+                words = call.split()
+                if words[:2] == ["drill", "review"]:
+                    ran.add(("inner_review", None))
+                elif words and words[0] in kinds:
+                    ran.add((kinds[words[0]], words[1] if len(words) > 1 else None))
+            candidates = live._legacy_candidates(command)
+            found = {(c["kind"], c["argument"]) for c in candidates}
+            single = live._legacy_install(command)
+            self.assertEqual((single["kind"], single["argument"]), pick, command)
+            self.assertIn((single["kind"], single["argument"]), found, command)
+            # Variables are not expanded: a candidate argument with "$" stands for any argument of its kind.
+            covers = lambda r: r in found or any(k == r[0] and "$" in str(a) for k, a in found)
+            self.assertTrue(all(covers(r) for r in ran), (command, calls, candidates))
+            sequential = {(c["kind"], c["argument"]) for c in candidates if c["sequential"] and c["kind"] != "inner_review"}
+            self.assertTrue(all(s in ran or ("$" in str(s[1]) and any(r[0] == s[0] for r in ran)) for s in sequential),
+                            (command, calls, candidates))
+            if any(r[0] == "tool" for r in ran):
+                self.assertTrue(live._tool_candidates(command), command)   # a real tool call is never hidden
+        self.assertEqual(live._legacy_candidates("ls; echo wf"), [])
+        self.assertEqual(live._legacy_candidates('wf self-update "x'),
+                         [{"entry": None, "kind": None, "parsed": False, "argument": None, "sequential": True}])
+
+    def criterion4_of(self, command):
+        from unittest.mock import patch
+        original, self._c4_n = self.project, getattr(self, "_c4_n", 0) + 1
+        with patch.object(self, "project", lambda name: original(f"{name} {self._c4_n}")):
+            inst, _ = self.legacy_only_fixture({"mixed": command})
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")), \
+             patch.object(live, "_directory_source", side_effect=AssertionError("replay listed disk")), \
+             patch.object(Path, "resolve", side_effect=AssertionError("replay resolved a path")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)
+        self.assertEqual(result["authorization"], "unavailable")   # legacy candidates never grant
+        rows = snap.descriptor["review_inputs"]["entries"]
+        return inst, snap, result, next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4), rows
+
+    def test_criterion4_counts_every_tool_candidate_per_exec(self):
+        """C4-MULTI-INSTALL: order, inner review, branch candidates and several self-updates."""
+        one = {"total": 1, "ok": 1, "timeout": 0, "unknown": 0, "failed": 0}
+        for command in ("wf apply p.zip; wf self-update t.zip", "wf self-update t.zip; wf apply p.zip"):
+            _, _, _, c4, rows = self.criterion4_of(command)
+            self.assertEqual(c4["attempts"], one, command)   # order no longer hides the tool install
+            self.assertFalse(c4["ok"], command)
+            self.assertEqual(c4["tool_candidates"], {
+                "unit": "static legacy tool/unknown candidates; attempts.total counts exec events",
+                "execs": 1, "candidates": 1, "conditional": 0, "bound_tool_references": 0}, command)
+            self.assertEqual(len(rows[0]["legacy_candidates"]), 2, command)
+        _, _, _, c4, rows = self.criterion4_of("wf drill review p.zip; wf self-update t.zip")
+        self.assertEqual(c4["attempts"], one)
+        self.assertFalse(c4["ok"])
+        self.assertIn(live.MIXED_INNER_REVIEW_DIAGNOSTIC, c4["why"])
+        [row] = rows
+        self.assertEqual((row["reference"], row["state"], row["legacy_command"]["kind"]), (None, "unknown", "inner_review"))
+        self.assertEqual(row["diagnostics"], [live.INNER_REVIEW_DIAGNOSTIC, live.MIXED_INNER_REVIEW_DIAGNOSTIC])
+        _, _, _, c4, _ = self.criterion4_of("if true; then wf apply p.zip; else wf self-update t.zip; fi")
+        self.assertEqual(c4["attempts"], one)   # one exec that possibly installed the tool
+        self.assertEqual((c4["tool_candidates"]["candidates"], c4["tool_candidates"]["conditional"]), (1, 1))
+        self.assertIn("条件分支候选，不代表已执行", c4["why"])
+        _, _, _, c4, _ = self.criterion4_of("wf self-update a.zip; wf self-update b.zip")
+        self.assertEqual(c4["attempts"], one)   # the unit is the exec event, not the candidate
+        self.assertEqual((c4["tool_candidates"]["execs"], c4["tool_candidates"]["candidates"]), (1, 2))
+        self.assertEqual(c4["why"], "安装前审查：没有记录、没有记录")
+        _, _, _, c4, rows = self.criterion4_of("wf self-update t.zip")
+        self.assertEqual(c4["attempts"], one)
+        self.assertEqual(c4["why"], "安装前审查：没有记录")   # single candidate: report text unchanged
+        self.assertNotIn("legacy_candidates", rows[0])
+        _, _, _, c4, rows = self.criterion4_of("wf apply p.zip")
+        self.assertEqual(c4["status"], "not_applicable")
+        self.assertNotIn("tool_candidates", c4)
+
+    def test_every_tool_candidate_is_frozen(self):
+        """Both packages and review results are frozen; a later change makes the old descriptor stale."""
+        from unittest.mock import patch
+        inst, snap, result, c4, _ = self.criterion4_of("wf self-update a.zip; wf self-update b.zip")
+        for name in ("a", "b"):
+            self.assertIn(json.dumps(str(inst.root / f"{name}.zip")), snap.descriptor_json)
+            self.assertIn(json.dumps(str(live.LOCAL / "reviews" / f"{name}.result.json")), snap.descriptor_json)
+        reviews = live.LOCAL / "reviews"
+        reviews.mkdir(parents=True, exist_ok=True)
+        (inst.root / "a.zip").write_bytes(b"a")
+        (reviews / "a.result.json").write_text(json.dumps({"verdict": "block"}), encoding="utf-8")
+        self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        with patch.object(live, "_file_source", side_effect=AssertionError("replay read disk")):
+            self.assertEqual(live._evaluate_snapshot(snap), result)   # the old snapshot still shows the old facts
+        fresh = live._capture_inputs(inst, rounds=1)
+        now = next(c for c in live._evaluate_snapshot(fresh)["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+        self.assertEqual(now["why"], "安装前审查：block、没有记录")
+        self.assertTrue(live._revalidate_inputs(inst, fresh.descriptor)["valid"])
 
     def test_pre_receipt_events_and_classifier(self):
         reader = SimpleNamespace(bytes=lambda path: None,
