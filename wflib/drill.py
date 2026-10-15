@@ -3,7 +3,7 @@
 在一个空目录里搭一个一次性的演练项目，用 WF_LOCAL_DIR 把注册表、inbox、transport.json、状态锁都隔离在这个目录里：
 - 发送与轮询（Claude 通道）用工具自带的替身 fake_transport.py：演练不向 Claude 发消息，也不需要通道；
 - 审查（transport.json 的 review）用调用方给的程序路径，正式演练时就是执行端真实的审查程序；
-- 驱动器（wf run）是真实安装的同一份代码，走真实的 REVIEW → 消费审查结论 → 停下或继续。
+- 驱动器（wf run）是真实安装的同一份代码，走真实的 REVIEW → APPLY → 强制独立审查；block 与超时都必须阻止安装。
 所以这里验证的是“真实驱动器消费真实审查程序的 block 与超时”，替身只替代 Claude 通道，不替代审查。
 
 演练项目不在生产注册表里（生产的定时 wf tick 看不到它），不在 sync_projects 里（不会同步到公开仓库）；
@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import LOCAL, WF_HOME, WfError, now_iso
+from . import anomaly
 
 KINDS = ("block", "timeout")
 ACTIVE = ("COMPOSE", "SEND", "WAIT_REPLY", "INTAKE", "REVIEW", "APPLY", "EXECUTE", "VERIFY")
@@ -63,10 +64,15 @@ def run(kind: str, base, review: str, review_timeout_s: int = 900, max_wait_s: i
         w = base / f"t-{op}"
         w.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(ft))} {op} \"$@\"\n", encoding="utf-8")
         w.chmod(0o755)
-    (local / "transport.json").write_text(json.dumps({
+    host_cfg = anomaly.transport_cfg()
+    transport = {
         "send": str(base / "t-send"), "poll": str(base / "t-poll"), "model": "drill", "timeout_s": 60,
-        "review": str(rv), "review_timeout_s": int(review_timeout_s), "env": {"FAKE_DIR": str(fake)}},
-        ensure_ascii=False, indent=2), encoding="utf-8")
+        "review": str(rv), "review_timeout_s": int(review_timeout_s), "env": {"FAKE_DIR": str(fake)},
+        "driver_review": {"schema": "driver-review/1", "author": "drill-author"}}
+    if "review_verifier" in host_cfg:
+        transport["review_verifier"] = host_cfg["review_verifier"]
+    (local / "transport.json").write_text(json.dumps(transport, ensure_ascii=False, indent=2), encoding="utf-8")
+    (local / "lanes.json").write_text(json.dumps({"lanes": {"drill-author": {"sessions": ["drill-isolated-author"]}}}), encoding="utf-8")
     env = dict(os.environ, WF_LOCAL_DIR=str(local))
     env.pop("FAKE_DIR", None)
 
@@ -144,24 +150,27 @@ def run(kind: str, base, review: str, review_timeout_s: int = 900, max_wait_s: i
     def chk(name_, cond, detail=""):
         checks.append({"check": name_, "ok": bool(cond), "detail": str(detail)[:400]})
 
+    attempts = sorted((local / "reviews" / "attempts").glob("*/attempt.json"))
+    attempt_records = [json.loads(p.read_text(encoding="utf-8")) for p in attempts]
+    decision_paths = sorted((ev / "install" / "driver-review").glob("*-decision.json"))
+    decisions = [json.loads(p.read_text(encoding="utf-8")).get("decision", {}) for p in decision_paths]
+    chk("驱动器停在 BLOCKED", state.get("state") == "BLOCKED", state.get("state"))
+    chk("真实审查尝试恰好一次", len(attempt_records) == 1, attempt_records)
+    chk("安装审查决定拒绝落地", len(decisions) == 1 and decisions[0].get("allowed") is False, decisions)
     if kind == "block":
-        chk("驱动器停在等待批准（AWAITING_USER）", state.get("state") == "AWAITING_USER", state.get("state"))
-        chk("review_adapter.json 记下 block 结论与审查模型", (ra or {}).get("verdict") == "block", ra)
-        chk("停下原因里写着独立审查的意见", "独立审查" in (state.get("needs_text") or ""), state.get("needs_text"))
-        chk("review.json 的待批准项里有独立审查", any("独立审查" in f for f in (rv_rec or {}).get("findings", [])), rv_rec)
-        chk("决策日志有“独立审查结论：block”", any("block" in (d.get("decision") or "") for d in rdec), rdec)
-        chk("削弱护栏的版本包没有落地（仍是 v0.1、没有 v0.2 标签）", not applied, tags)
-        chk("wf explain 说明卡在哪、需要谁", "现在：" in explain and "需要：" in explain, explain[-300:])
+        chk("审查程序明确返回 block", len(decisions) == 1 and decisions[0].get("verdict") == "block", decisions)
     else:
-        chk("决策日志记“未审查”并按规则继续", any(d.get("result") == "未审查" for d in rdec), rdec)
-        chk("没有审查结论文件（不把超时当成通过）", ra is None, ra)
-        chk("良性版本包照常落地（v0.2 标签）", applied, tags)
-        chk("驱动器照常向后推进（没有停在审查）", state.get("state") not in ("REVIEW", "AWAITING_USER", "BLOCKED"), state.get("state"))
+        chk("真实审查尝试超时", len(attempt_records) == 1 and attempt_records[0].get("state") == "timeout"
+            and attempt_records[0].get("runner", {}).get("timed_out") is True, attempt_records)
+    chk("版本包没有落地", not applied, tags)
+    chk("没有启动安装事务", not list((ev / "install").glob("tx-*/started.json")))
+    chk("explain 说明当前状态与所需操作", "现在：" in explain and "需要：" in explain, explain[-300:])
     rc, o = wf("pause", "--note", f"P1-D 演练（{kind}）结束：项目暂停，目录保留作为证据")
     result = {"kind": kind, "ok": all(c["ok"] for c in checks), "ts": now_iso(), "dir": str(base), "project": name,
               "review": str(rv), "review_timeout_s": int(review_timeout_s), "state": state.get("state"), "turn": state.get("turn"),
               "checks": checks, "review_adapter": ra, "review_decisions": rdec, "explain": explain.strip()[-600:],
               "inbox_items": [x.get("key") for x in inbox.get("items", [])], "log": log[-30:],
-              "evidence": [str(p) for p in radapter + rjson] + [str(proj / "workflow" / "decisions.jsonl")]}
+              "attempts": attempt_records, "install_review_decisions": decisions,
+              "evidence": [str(p) for p in radapter + rjson + attempts + decision_paths] + [str(proj / "workflow" / "decisions.jsonl")]}
     (base / "drill-result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
