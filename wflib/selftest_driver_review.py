@@ -131,6 +131,7 @@ def run(_ok):
                           "print(driver.h_apply(driver.Ctx(inst, {}, time.time()+30)), flush=True)\n")
                 child = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True, start_new_session=True,
+                    cwd=Path(__file__).resolve().parents[1],
                     env={**os.environ, "WF_LOCAL_DIR": str(base / "local")})
                 pending = []
                 try:
@@ -194,6 +195,7 @@ def run(_ok):
                           "except WfError as e: print(e)\n")
                 with driver_review.Attempt(inst, package):
                     child = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                                           cwd=Path(__file__).resolve().parents[1],
                                            env={**os.environ, "WF_LOCAL_DIR": str(base / "other-local")}, timeout=10)
                 _ok("驱动器目标锁：不同WF_LOCAL_DIR的真实子进程同一root不能同时送审",
                     child.returncode == 0 and "driver_review_busy" in child.stdout, child.stdout + child.stderr)
