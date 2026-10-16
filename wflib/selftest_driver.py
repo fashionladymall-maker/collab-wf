@@ -301,7 +301,7 @@ def run_v12(tmp: Path, env: dict, _wf, _ok, _state, _project_md, _make_zip):
     _wf(env, g, "run")
     z = tmp / "gate-v0.2.zip"
     _make_zip(z, "gate", {"PROJECT.md": _project_md("v0.2"), "CHANGELOG.md": "# CHANGELOG\n\n## v0.2 — t\n- x\n",
-                          "app.py": "print('bad')\n", "workflow/policy.json": (g / "workflow" / "policy.json").read_text()})
+                          "app.py": "print('bad')\n"})
     k = next_k() - 1
     (fake / "replies" / f"{k}.md").write_text(_reply(["echo after"], ["输出"], "发布：gate-v0.2.zip\n之后：回报\n验收 1：c1 exit=0"),
                                               encoding="utf-8")
