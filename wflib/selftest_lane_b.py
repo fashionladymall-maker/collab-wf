@@ -17,6 +17,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import stat
 import shutil
 import subprocess
 import sys
@@ -1202,10 +1203,24 @@ def _b1b_env(td: Path) -> dict:
     return {"root": root, "outside": outside, "other": other, "pol": pol, "others": [{"name": "other", "root": str(other)}]}
 
 
-def _pv(category: str, body) -> dict:
-    """c1-provider/1：每个用例都实际运行；抛异常的记 ran=False、ok=False；整体出错写 error。"""
+def _pv_refusal(category: str):
+    """隔离前提（_c1_guard）不足时的标准 c1-provider/1 拒绝结果：cases=[]、error 为拒绝原因；前提满足时返回 None。
+    B-C1-OLD2-GUARD：公开提供方在业务导入、临时目录与任何夹具之前调用。"""
+    reason = _c1_guard()
+    if reason:
+        return {"category": category, "provider": "B", "schema": "c1-provider/1", "cases": [], "error": reason}
+    return None
+
+
+def _pv(category: str, body, guard=False) -> dict:
+    """c1-provider/1：每个用例都实际运行；抛异常的记 ran=False、ok=False；整体出错写 error。
+    B-C1-PROVIDERS：error 只在真实成功时为 None——没有用例、缺正例或反例、用例重名、任一用例没运行或不成功，
+    都写出诊断；guard=True 时隔离前提不足就不运行任何用例。"""
     cases, err = [], None
-    td = Path(tempfile.mkdtemp(prefix="wf-b1b-"))
+    refused = _pv_refusal(category) if guard else None
+    if refused:
+        return refused
+    td = Path(tempfile.mkdtemp(prefix="wf-b1b-")).resolve()
 
     def case(name, polarity, fn):
         try:
@@ -1220,6 +1235,15 @@ def _pv(category: str, body) -> dict:
         err = f"{type(e).__name__}: {e}"
     finally:
         shutil.rmtree(td, ignore_errors=True)
+    if err is None:
+        names = [c["name"] for c in cases]
+        bad = [c for c in cases if not (c["ran"] and c["ok"])]
+        if not cases or {c["polarity"] for c in cases} != {"pos", "neg"}:
+            err = "缺少实际运行的正例或反例"
+        elif len(set(names)) != len(names):
+            err = "用例名重复"
+        elif bad:
+            err = "用例未通过：" + "；".join(f"{c['name']}：{c['detail']}" for c in bad)[:600]
     return {"category": category, "provider": "B", "schema": "c1-provider/1", "cases": cases, "error": err}
 
 
@@ -1406,7 +1430,11 @@ NEG_B1B = [
 
 
 def provider_destructive() -> dict:
-    """C1 第 2 条 2S-destructive-or-crossproject（提供方 B）。"""
+    """C1 第 2 条 2S-destructive-or-crossproject（提供方 B）。
+    B-C1-OLD2-GUARD：没有 WF_LOCAL_DIR 或它指向工具自己的 local/ 时，在业务导入与任何夹具之前以标准结果拒绝。"""
+    refused = _pv_refusal("2S-destructive-or-crossproject")
+    if refused:
+        return refused
     from . import core, notify, policy
 
     def body(case, td):
@@ -1516,11 +1544,15 @@ def provider_destructive() -> dict:
             s, rv, routes = _e2e_review(e2e, "e2e-neg", ["echo hi"], pol)
             return s != "AWAITING_USER" and rv["auto"] and routes == [], f"{s} {routes}"
         case("不误拦：真实 h_review 下普通命令照常通过", "neg", e2e_neg)
-    return _pv("2S-destructive-or-crossproject", body)
+    return _pv("2S-destructive-or-crossproject", body, guard=True)
 
 
 def provider_widening() -> dict:
-    """C1 第 2 条 2S-widening（提供方 B）：权限扩大不自动批准，收紧照常自动批准。"""
+    """C1 第 2 条 2S-widening（提供方 B）：权限扩大不自动批准，收紧照常自动批准。
+    B-C1-OLD2-GUARD：隔离前提不足时，在业务导入与任何夹具之前以标准结果拒绝。"""
+    refused = _pv_refusal("2S-widening")
+    if refused:
+        return refused
     import time
     from . import driver, policy
     old = {"allow": ["^a ", "^b "], "stop": [{"pattern": "x"}], "max_rounds_per_day": 24, "clean_dirs": ["build"],
@@ -1564,10 +1596,492 @@ def provider_widening() -> dict:
             return policy.status(inst, "policy")["approved"]
         case("命中：扩大的变更落地后不被驱动器自动批准", "pos", lambda: (auto_approve(widen[1][1]) is False, "未批准"))
         case("不误拦：收紧的变更落地后由驱动器自动批准", "neg", lambda: (auto_approve(narrow[1][1]) is True, "已批准"))
-    return _pv("2S-widening", body)
+    return _pv("2S-widening", body, guard=True)
 
 
-C1_PROVIDERS = {"2S-destructive-or-crossproject": provider_destructive, "2S-widening": provider_widening}
+# ---------------- M2-C1：B 车道另三类提供方（B-C1-PROVIDERS）：1-init-files、2S-unverified-install、6a-install-review ----------------
+# 只消费现有业务 API（admin.init_project、review.prepare/run/final_check/consume、release.apply_zip），不重做业务。
+# 每次运行都在私有临时宿主里：所有 wflib 模块中指向当前 LOCAL 的路径（含 REGISTRY）改指临时 local，结束时恢复；
+# 审查用 selftest_review.Env 的合成 runner/核验器，决定里如实为 synthetic。
+
+def _c1_guard() -> str:
+    from .core import LOCAL, WF_HOME
+    if not os.environ.get("WF_LOCAL_DIR"):
+        return "没有设置 WF_LOCAL_DIR，拒绝在真实 local/ 上运行"
+    if Path(LOCAL).resolve() == (WF_HOME / "local").resolve():
+        return "WF_LOCAL_DIR 指向工具自己的 local/，拒绝运行"
+    return ""
+
+
+def _c1_wflib_modules() -> list:
+    return [(n, m) for n, m in list(sys.modules.items()) if m is not None and (n == "wflib" or n.startswith("wflib."))]
+
+
+def _c1_under(p: Path, root: Path) -> bool:
+    return p == root or root in p.parents
+
+
+def _c1_remap(value, host: Path, orig: Path):
+    """宿主路径换回调用方 LOCAL 下的同一相对位置；返回 (新值, 是否改了)。只认 Path 与绝对路径字符串，以及一层容器。"""
+    if isinstance(value, Path):
+        try:
+            return orig / value.relative_to(host), True
+        except ValueError:
+            return value, False
+    if isinstance(value, str):
+        h = str(host)
+        if value == h or value.startswith(h + os.sep):
+            return str(orig) + value[len(h):], True
+        return value, False
+    if isinstance(value, (list, tuple, set, frozenset)):
+        items = [_c1_remap(v, host, orig) for v in value]
+        return (type(value)(v for v, _ in items), True) if any(c for _, c in items) else (value, False)
+    if isinstance(value, dict):
+        items = [(_c1_remap(k, host, orig), _c1_remap(v, host, orig)) for k, v in value.items()]
+        if any(kc or vc for (_, kc), (_, vc) in items):
+            return {k: v for (k, _), (v, _) in items}, True
+        return value, False
+    return value, False
+
+
+def _c1_host_refusal(old: Path, new: Path, registry) -> str:
+    """进入宿主前的全部拒绝条件（B-C1-F4）；纯检查：不建目录、不改任何模块属性或环境变量，返回拒绝原因或空串。
+    - 调用方 LOCAL 与宿主都必须是绝对路径；词法上相等、互相包含都拒绝；
+    - REGISTRY 必须是 LOCAL 之下的 Path，且相对部分不含 ..（否则进入后会落到宿主之外）；
+    - 解析后（跟随 symlink、按真实顺序处理 ..）宿主与 LOCAL、REGISTRY 交叠拒绝；
+    - 已加载的 wflib 模块里进入前就有指向宿主的值时拒绝：退出时宿主路径会被换回 LOCAL，不能误改调用方原有的值。"""
+    if not (old.is_absolute() and new.is_absolute()):
+        return f"宿主 {new} 或调用方 LOCAL {old} 不是绝对路径，拒绝运行"
+    if _c1_under(new, old) or _c1_under(old, new):
+        return f"宿主 {new} 与调用方 LOCAL {old} 交叠，拒绝运行"
+    if not isinstance(registry, Path) or not _c1_under(registry, old) or ".." in registry.relative_to(old).parts:
+        return f"REGISTRY {registry} 不在 LOCAL {old} 之下，拒绝对真实注册表运行"
+    old_real, new_real, registry_real = (p.resolve(strict=False) for p in (old, new, registry))
+    if (_c1_under(new_real, old_real) or _c1_under(old_real, new_real)
+            or _c1_under(new_real, registry_real) or _c1_under(registry_real, new_real)):
+        return f"宿主解析路径 {new_real} 与调用方 LOCAL/REGISTRY 交叠，拒绝运行"
+    pre = [f"{n}.{a}" for n, m in _c1_wflib_modules() for a, v in list(vars(m).items()) if _c1_remap(v, new, old)[1]]
+    if pre:
+        return f"进入前已有模块引用宿主 {new}：" + "、".join(pre[:8]) + "，拒绝运行"
+    return ""
+
+
+@contextlib.contextmanager
+def _c1_host(td: Path):
+    """私有宿主（B-C1-PROVIDERS-REWORK F1；B-C1-F4）。
+    进入前：_c1_host_refusal 的全部拒绝都在建目录与改任何状态之前完成，拒绝时直接抛出原因——此时还没有进入，
+    不执行下面的恢复与换回，所以调用方 core.LOCAL/REGISTRY、WF_LOCAL_DIR 与所有已加载模块的值都是原来的同一个对象。
+    进入时：已导入的 wflib 模块里指向当前 LOCAL 的 Path 属性改指宿主；REGISTRY 必须随之落在宿主内，否则拒绝。
+    退出时（只对已进入的宿主；正常、用例异常、初始化或执行异常都走 finally）：
+    - 进入前已有的属性恢复为原来的同一个对象；
+    - 上下文内才加载的模块（以及进入前已有模块里新出现的宿主引用）原地把宿主路径换回调用方 LOCAL 下的同一相对位置，
+      所以宿主外早已持有的模块对象也一起恢复；不删 sys.modules 条目，不改与宿主无关的属性；
+    - 之后扫描全部 wflib 模块，仍有任何宿主路径就抛错（失败关闭）。
+    支持嵌套：内层的“调用方 LOCAL”就是外层宿主。"""
+    from . import core
+    old, new = Path(core.LOCAL), Path(td) / "host-local"
+    refusal = _c1_host_refusal(old, new, core.REGISTRY)
+    if refusal:
+        raise RuntimeError(refusal)
+    new.mkdir(parents=True)   # 失败时同样还没有改动任何状态，不进入恢复阶段
+    patched, saved = [], os.environ.get("WF_LOCAL_DIR")
+    try:
+        for name, mod in _c1_wflib_modules():
+            for attr, val in list(vars(mod).items()):
+                if isinstance(val, Path) and _c1_under(val, old):
+                    patched.append((mod, attr, val))
+                    setattr(mod, attr, new / val.relative_to(old))
+        if not _c1_under(Path(core.REGISTRY), new):
+            raise RuntimeError(f"REGISTRY {core.REGISTRY} 不在 LOCAL {old} 之下，拒绝对真实注册表运行")
+        os.environ["WF_LOCAL_DIR"] = str(new)
+        yield new
+    finally:
+        for mod, attr, val in reversed(patched):
+            setattr(mod, attr, val)
+        if saved is None:
+            os.environ.pop("WF_LOCAL_DIR", None)
+        else:
+            os.environ["WF_LOCAL_DIR"] = saved
+        restored = {id(mod): {attr for m, attr, _ in patched if m is mod} for mod, _a, _v in patched}
+        for name, mod in _c1_wflib_modules():
+            keep = restored.get(id(mod), set())
+            for attr, val in list(vars(mod).items()):
+                if attr in keep:
+                    continue
+                remapped, changed = _c1_remap(val, new, old)
+                if changed:
+                    setattr(mod, attr, remapped)
+        leaks = [f"{n}.{a}" for n, m in _c1_wflib_modules() for a, v in vars(m).items() if _c1_remap(v, new, old)[1]]
+        if leaks:
+            raise RuntimeError("退出宿主后仍有宿主路径：" + "、".join(leaks[:8]))
+
+
+def _target_state(root: Path) -> tuple:
+    """目标完整状态：每个路径的类型、mode 与字节（不进 .git），加 HEAD 与 git status。"""
+    out = {}
+    for dp, dns, fns in os.walk(root, followlinks=False):
+        if Path(dp) == root:
+            dns[:] = [d for d in dns if d != ".git"]
+        for n in sorted(dns + fns):
+            p = Path(dp) / n
+            st = os.lstat(p)
+            body = p.read_bytes() if stat.S_ISREG(st.st_mode) else os.readlink(p) if stat.S_ISLNK(st.st_mode) else None
+            out[str(p.relative_to(root))] = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), body)
+    from .selftest_review import _git as rgit
+    return out, rgit(root, "rev-parse", "HEAD"), rgit(root, "status", "--porcelain", "--untracked-files=all")
+
+
+@contextlib.contextmanager
+def _c1_review_host(td: Path):
+    from . import review
+    from .selftest_review import Env
+    with _c1_host(td):
+        env = Env(td / "review-env")
+        with _patched(review, "_tool_home", lambda: env.tool):
+            yield env
+
+
+def _c1_project(env, td: Path, tag: str):
+    from . import admin
+    from .selftest import _project_md
+    from .selftest_review import _git as rgit
+    inst = admin.init_project(td / tag, name=f"c1b-{tag}-{os.getpid()}")
+    rgit(inst.root, "init", "-q")
+    rgit(inst.root, "add", "-A")
+    rgit(inst.root, "commit", "-qm", "initial")
+    pkg = env.pkg(f"c1b-{tag}", {"PROJECT.md": _project_md("v0.2").encode(),
+                                 "CHANGELOG.md": "# CHANGELOG\n\n## v0.2 — c1b\n- installed\n".encode(),
+                                 "app.py": ("v0.2-" + tag).encode()})
+    return inst, pkg
+
+
+def _c1_install(inst, pkg, rid) -> tuple:
+    """真实 release.apply_zip；返回 (结果或拒绝原文, 目标前后完全相同, 新增的 started 记录)。"""
+    from . import release
+    from .core import WfError
+    store = inst.root / "workflow" / "evidence" / "install"
+    started0 = set(store.glob("tx-*/started.json"))
+    before = _target_state(inst.root)
+    try:
+        r = release.apply_zip(inst, pkg, review_id=rid)
+        outcome = "installed " + str(r.get("install_tx"))
+    except WfError as e:
+        outcome = "refused: " + str(e)
+    return outcome, _target_state(inst.root) == before, sorted(set(store.glob("tx-*/started.json")) - started0)
+
+
+def _c1_refused(outcome, same, started, want) -> tuple:
+    return (outcome.startswith("refused") and want in outcome and same and not started,
+            f"{outcome[:180]} | 目标字节/mode/HEAD/status 不变={same} | started={len(started)}")
+
+
+def provider_init_files() -> dict:
+    """C1 第 1 条 1-init-files（提供方 B）：新建项目的默认文件与写入边界。init 不执行门禁，本类不代表 1-init-gates-real。"""
+    import subprocess as sp
+    from . import admin, core, goals, policy
+    from .core import Instance, WfError, read_json, read_jsonl
+
+    def body(case, td):
+        with _c1_host(td):
+            def fresh_defaults():
+                seen, real_popen = [], sp.Popen
+
+                class Spy(real_popen):
+                    def __init__(self, args, *a, **k):
+                        seen.append(args if isinstance(args, str) else [str(x) for x in args])
+                        super().__init__(args, *a, **k)
+                root = td / "init-new"
+                root.mkdir()
+                _git(root, "init", "-q")
+                with _patched(sp, "Popen", Spy):
+                    inst = admin.init_project(root, f"c1b-init-new-{os.getpid()}")
+                pol = json.loads((inst.wf / "policy.json").read_text(encoding="utf-8"))
+                gl = json.loads((inst.wf / "goals.json").read_text(encoding="utf-8"))
+                gates = [(g.get("name"), g.get("cmd"), g.get("pass")) for g in pol.get("gates", [])]
+                ev = [e for e in read_jsonl(inst.events_path) if e.get("type") == "init"]
+                flat = [" ".join(x) if isinstance(x, list) else x for x in seen]
+                ok = (gates == [(n, c, {"exit": 0}) for n, c in admin.INIT_GATES]
+                      and [c for _, c in admin.INIT_GATES] == ["wf self-check", "wf self-check --probes"]
+                      and pol.get("allow") == [] and pol.get("auto_apply") is False and pol.get("auto_self_update") is False
+                      and pol.get("auto_new_conversation") is False
+                      and all(policy.readonly_check(c) for c in _init_cmds(pol, gl))
+                      and goals.validate(gl) == [] and gl.get("_skeleton") == goals.SKELETON_VERSION
+                      and not policy.status(inst, "policy")["approved"] and not policy.status(inst, "goals")["approved"]
+                      and not (inst.wf / "approvals.json").exists() and policy.load(Instance(inst.root)) is None
+                      and len(ev) == 1 and ev[0].get("defaults") == list(admin.INIT_DEFAULT_FILES)
+                      and bool(seen) and all((x[0] if isinstance(x, list) else x.split()[0]) == "git" for x in seen)
+                      and not any("self-check" in f or "wf.py" in f or "/bin/wf" in f for f in flat))
+                return ok, json.dumps({"gates": gates, "allow": pol.get("allow"),
+                                       "auto": [pol.get(k) for k in ("auto_apply", "auto_self_update", "auto_new_conversation")],
+                                       "approved": [policy.status(inst, k)["approved"] for k in ("policy", "goals")],
+                                       "subprocesses": sorted({(x[0] if isinstance(x, list) else x.split()[0]) for x in seen})},
+                                      ensure_ascii=False)
+            case("写出：新项目默认 policy/goals（allow 空、三项 auto 关、两道固定只读门禁 exit 0、都未批准、无自批准；init 只启动 git）",
+                 "pos", fresh_defaults)
+
+            def existing_kept():
+                root = td / "init-existing"
+                (root / "workflow").mkdir(parents=True)
+                mine_p, mine_g = b'{"allow": ["^echo "]}\n', b'{"goals": "user-owned"}'
+                (root / "workflow" / "policy.json").write_bytes(mine_p)
+                (root / "workflow" / "goals.json").write_bytes(mine_g)
+                inst = admin.init_project(root, f"c1b-init-existing-{os.getpid()}")
+                ev = [e for e in read_jsonl(inst.events_path) if e.get("type") == "init"][-1]
+                return ((root / "workflow" / "policy.json").read_bytes() == mine_p
+                        and (root / "workflow" / "goals.json").read_bytes() == mine_g and ev.get("defaults") == []
+                        and ev.get("defaults_kept") == list(admin.INIT_DEFAULT_FILES)), json.dumps(ev, ensure_ascii=False)[:200]
+            case("不覆写：已有 policy/goals 字节不变，事件记为保留", "neg", existing_kept)
+
+            def adopt_writes_none():
+                root = td / "init-adopt"
+                root.mkdir()
+                (root / "PROJECT.md").write_text("# PROJECT.md\n", encoding="utf-8")
+                calls = []
+                with _patched(goals, "default_goals", lambda *a, **k: calls.append(a) or {}):
+                    admin.init_project(root, f"c1b-init-adopt-{os.getpid()}", adopt=True)
+                return (not (root / "workflow" / "policy.json").exists() and not (root / "workflow" / "goals.json").exists()
+                        and calls == []), f"skeleton_calls={len(calls)}"
+            case("不写：--adopt 不写默认文件、不调用骨架接口", "neg", adopt_writes_none)
+
+            def refused_without_residue(tag, patch_obj, attr, value, exc):
+                root, name = td / tag, f"c1b-{tag}-{os.getpid()}"
+                reg = read_json(core.REGISTRY, None)
+                try:
+                    with _patched(patch_obj, attr, value):
+                        admin.init_project(root, name)
+                    return False, "接受了"
+                except exc as e:
+                    return (not root.exists() and read_json(core.REGISTRY, None) == reg), f"{type(e).__name__}: {str(e)[:120]}"
+            case("不留半套：骨架不合格时整次拒绝，不建目录、不注册", "neg",
+                 lambda: refused_without_residue("init-bad-skeleton", goals, "default_goals",
+                                                 lambda *a, **k: {"goals": []}, WfError))
+            real_write = admin._write_new
+            n = [0]
+
+            def flaky(p, data):
+                n[0] += 1
+                if n[0] == 2:
+                    raise OSError(28, "c1b 注入：写第二份时磁盘满")
+                return real_write(p, data)
+            case("不留半套：写第二份默认文件失败时撤回第一份，不建目录、不注册", "neg",
+                 lambda: refused_without_residue("init-half", admin, "_write_new", flaky, OSError))
+
+            def linked_workflow():
+                outside = td / "init-link-target"
+                outside.mkdir()
+                (outside / "marker.txt").write_bytes(b"OUTSIDE-UNCHANGED\n")
+                root = td / "init-link"
+                root.mkdir()
+                os.symlink(str(outside), root / "workflow")
+                before, reg = _tree_snapshot(outside), read_json(core.REGISTRY, None)
+                try:
+                    admin.init_project(root, f"c1b-init-link-{os.getpid()}")
+                    return False, "接受了"
+                except WfError as e:
+                    return (_tree_snapshot(outside) == before and read_json(core.REGISTRY, None) == reg
+                            and os.path.islink(root / "workflow")), str(e)[:120]
+            case("写入前拒绝：workflow 是指向项目外的符号链接，链接目标与注册表都不变", "neg", linked_workflow)
+    return _pv("1-init-files", body, guard=True)
+
+
+def provider_unverified_install() -> dict:
+    """C1 第 2 条 2S-unverified-install（提供方 B）：未经独立核验的安装被真实拒绝且目标完整不变；合法核验后可消费。"""
+    from . import review
+
+    def body(case, td):
+        with _c1_review_host(td) as env:
+            def none_rid():
+                inst, pkg = _c1_project(env, td, "u-none")
+                return _c1_refused(*_c1_install(inst, pkg, None), "unreviewed_install")
+            case("拒绝：没有 review_id（未核验的安装）", "pos", none_rid)
+
+            def claimed_only():
+                from .selftest import _project_md
+                inst, _pkg = _c1_project(env, td, "u-claimed")
+                z = env.pkg("c1b-u-claimed-selfclaim", {
+                    "PROJECT.md": _project_md("v0.2").encode(), "CHANGELOG.md": "# CHANGELOG\n\n## v0.2 — c1b\n- x\n".encode(),
+                    "app.py": b"v0.2-claimed", "review.json": json.dumps(
+                        {"verdict": "pass", "provenance": {"verified": True, "level": "platform_verified"}}).encode()})
+                rid = review.prepare(inst, z, kind="project", author="B")["request_id"]   # 只有宿主请求，没有审查运行
+                return _c1_refused(*_c1_install(inst, z, rid), "no_review")
+            case("拒绝：包内自带 review.json 自称已核验、宿主没有审查运行", "pos", claimed_only)
+
+            def pin_mismatch():
+                inst, pkg = _c1_project(env, td, "u-pin")
+                rid = review.prepare(inst, pkg, kind="project", author="B")["request_id"]
+                env.set_transport(pinned="0" * 64)
+                try:
+                    d = review.run(rid)
+                finally:
+                    env.set_transport()
+                ok, detail = _c1_refused(*_c1_install(inst, pkg, rid), "verifier_sha256_mismatch")
+                return ok and not d["allowed"], detail
+            case("拒绝：核验器 sha 与宿主固定值不符", "pos", pin_mismatch)
+
+            def blocked():
+                inst, pkg = _c1_project(env, td, "u-block")
+                rid = review.prepare(inst, pkg, kind="project", author="B")["request_id"]
+                env.behave(verdict="block")
+                try:
+                    d = review.run(rid)
+                finally:
+                    env.behave()
+                ok, detail = _c1_refused(*_c1_install(inst, pkg, rid), "blocked")
+                return ok and d["verdict"] == "block", detail
+            case("拒绝：独立审查给出 block", "pos", blocked)
+
+            def verified_consumed():
+                inst, pkg = _c1_project(env, td, "u-ok")
+                req = review.prepare(inst, pkg, kind="project", author="B")
+                d = review.run(req["request_id"])
+                outcome, same, started = _c1_install(inst, pkg, req["request_id"])
+                recs = list((review._reviews() / "installs" / req["content_id"]).glob("*.json"))
+                done = list((inst.root / "workflow" / "evidence" / "install").glob("tx-*/completed.json"))
+                ok = (d["allowed"] and d["provenance"]["synthetic"] is True and outcome.startswith("installed")
+                      and not same and len(started) == 1 and len(done) == 1 and len(recs) == 1
+                      and (inst.root / "app.py").read_bytes() == b"v0.2-u-ok")
+                return ok, f"{outcome[:80]} synthetic={d['provenance']['synthetic']} consumed={len(recs)} completed={len(done)}"
+            case("可消费：合法独立核验（合成宿主，如实 synthetic）后安装真实写入并登记消费", "neg", verified_consumed)
+    return _pv("2S-unverified-install", body, guard=True)
+
+
+def _c1_flat(x, prefix=""):
+    if isinstance(x, dict):
+        out = {}
+        for k, v in x.items():
+            out.update(_c1_flat(v, f"{prefix}.{k}" if prefix else str(k)))
+        return out
+    return {prefix: x}
+
+
+def _c1_frozen_drift(frozen: dict, decision: dict) -> list:
+    """安装开始绑定的决定与审查完成时的冻结决定逐字段比较（含 provenance 的审查身份、核验器 sha、模型）。
+    只有两处合法差异：phase 由 review 变为 install；times.install_started 由空变为实际时刻。其余任何不同都算漂移。"""
+    a, b, missing = _c1_flat(frozen), _c1_flat(decision), object()
+    drift = sorted(k for k in set(a) | set(b) if k not in ("phase", "times.install_started")
+                   and a.get(k, missing) != b.get(k, missing))
+    if a.get("phase") != "review" or b.get("phase") != "install":
+        drift.append("phase")
+    if a.get("times.install_started") is not None or not isinstance(b.get("times.install_started"), str):
+        drift.append("times.install_started")
+    return drift
+
+
+def provider_install_review() -> dict:
+    """C1 第 6a 条 6a-install-review（提供方 B）：安装开始绑定冻结的审查身份；审查后包、基线、配置、规则漂移都在开始前拒绝。"""
+    from . import review
+    from .selftest_review import _git as rgit
+
+    def body(case, td):
+        with _c1_review_host(td) as env:
+            def approved(tag):
+                inst, pkg = _c1_project(env, td, tag)
+                req = review.prepare(inst, pkg, kind="project", author="B")
+                d = review.run(req["request_id"])
+                if not d["allowed"]:
+                    raise RuntimeError("fixture review not allowed: " + "；".join(d["reasons"]))
+                return inst, pkg, req, d
+
+            def bound():
+                inst, pkg, req, d = approved("r-bind")
+                frozen = json.loads(json.dumps(d))   # 独立观察源：真实 review.run 完成时返回的冻结决定（安装之前取得）
+                outcome, _same, started = _c1_install(inst, pkg, req["request_id"])
+                if len(started) != 1:
+                    return False, outcome[:200]
+                st = json.loads(started[0].read_bytes())
+                prepared = json.loads((started[0].parent / "prepared.json").read_bytes())
+                [rec] = [json.loads(p.read_bytes()) for p in (review._reviews() / "installs" / req["content_id"]).glob("*.json")]
+                t = st["decision"]["times"]
+                d_start, d_record = _c1_frozen_drift(frozen, st["decision"]), _c1_frozen_drift(frozen, rec["decision"])
+                ok = (outcome.startswith("installed") and not d_start and not d_record and st["decision"] == rec["decision"]
+                      and frozen["provenance"]["synthetic"] is True and frozen["request_id"] == req["request_id"]
+                      and frozen["content_id"] == req["content_id"] and rec["attempt_id"] == frozen["attempt_id"]
+                      and rec["request_id"] == frozen["request_id"] and rec["content_id"] == frozen["content_id"]
+                      and rec["install_context"] == {"tx_id": started[0].parent.name, "target_root": str(inst.root),
+                                                     "lock_token": prepared["lock"]["token"],
+                                                     "prepared_sha256": prepared["body_sha256"]}
+                      and t["review_started"] <= t["review_completed"] <= t["result_registered"] <= t["install_started"]
+                      and rec["install_started"] == t["install_started"])
+                return ok, json.dumps({"drift_vs_frozen": {"start": d_start, "record": d_record},
+                                       "attempt": frozen["attempt_id"], "tx": started[0].parent.name}, ensure_ascii=False)[:300]
+            case("绑定：安装开始记录与审查登记的冻结决定、attempt、时刻、事务上下文一致", "neg", bound)
+
+            def package_drift():
+                inst, pkg, req, _d = approved("r-pkg")
+                env.pkg(f"c1b-r-pkg", {"PROJECT.md": b"# drifted\n", "app.py": b"drifted"})   # 同一路径换了字节
+                return _c1_refused(*_c1_install(inst, pkg, req["request_id"]), "package_mismatch")
+            case("拒绝：审查后调用方的包被换", "pos", package_drift)
+
+            def base_drift():
+                inst, pkg, req, _d = approved("r-base")
+                (inst.root / "app.py").write_text("目标在审查后被改\n", encoding="utf-8")
+                rgit(inst.root, "add", "-A")
+                rgit(inst.root, "commit", "-qm", "drift after review")
+                return _c1_refused(*_c1_install(inst, pkg, req["request_id"]), "material_changed；diff_changed")
+            case("拒绝：审查后目标基线被改（已提交）", "pos", base_drift)
+
+            def config_drift():
+                inst, pkg, req, _d = approved("r-cfg")
+                cfg = json.loads(inst.cfg_path.read_text(encoding="utf-8"))
+                cfg["protect"] = ["secret/"]
+                inst.cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                rgit(inst.root, "add", "-A")
+                rgit(inst.root, "commit", "-qm", "config after review")
+                return _c1_refused(*_c1_install(inst, pkg, req["request_id"]), "material_changed；diff_changed")
+            case("拒绝：审查后项目配置被改（已提交）", "pos", config_drift)
+
+            def rules_drift():
+                inst, pkg, req, _d = approved("r-rules")
+                rules = env.tool / "docs" / "REVIEW.md"
+                old = rules.read_bytes()
+                rules.write_bytes(old + b"\n# rules changed after review\n")
+                try:
+                    return _c1_refused(*_c1_install(inst, pkg, req["request_id"]), "material_changed")
+                finally:
+                    rules.write_bytes(old)
+            case("拒绝：审查后审查规则被改", "pos", rules_drift)
+    return _pv("6a-install-review", body, guard=True)
+
+
+C1_PROVIDERS_B1B = {"2S-destructive-or-crossproject": provider_destructive, "2S-widening": provider_widening}
+C1_PROVIDERS_NEW = {"1-init-files": provider_init_files, "2S-unverified-install": provider_unverified_install,
+                    "6a-install-review": provider_install_review}
+C1_CASE_KEYS = {"name", "polarity", "ran", "ok", "detail"}
+
+
+def _c1_shape_problems(r, category) -> list:
+    """c1-provider/1 严格机器检查（BATCH2_CONTRACT provider_api）。"""
+    if not isinstance(r, dict):
+        return ["not a dict"]
+    p = []
+    if set(r) != {"category", "provider", "schema", "cases", "error"}:
+        p.append("keys " + repr(sorted(r)))
+    if r.get("schema") != "c1-provider/1" or r.get("provider") != "B" or r.get("category") != category:
+        p.append("schema/provider/category")
+    cases = r.get("cases")
+    if not isinstance(cases, list):
+        return p + ["cases not a list"]
+    for c in cases:
+        if not isinstance(c, dict) or set(c) != C1_CASE_KEYS:
+            p.append("case keys")
+            continue
+        if not isinstance(c["name"], str) or not c["name"] or c["polarity"] not in ("pos", "neg") \
+                or type(c["ran"]) is not bool or type(c["ok"]) is not bool or not isinstance(c["detail"], str):
+            p.append("case types " + str(c.get("name")))
+        if c["ok"] and not c["ran"]:
+            p.append("ok without ran")
+    names = [c.get("name") for c in cases if isinstance(c, dict)]
+    if len(set(names)) != len(names):
+        p.append("duplicate case names")
+    success = (bool(cases) and {c.get("polarity") for c in cases if isinstance(c, dict)} == {"pos", "neg"}
+               and all(isinstance(c, dict) and c.get("ran") is True and c.get("ok") is True for c in cases))
+    if success and r.get("error") is not None:
+        p.append("error on success")
+    if not success and not (isinstance(r.get("error"), str) and r["error"]):
+        p.append("missing error on failure")
+    return p
+
+C1_PROVIDERS = {**C1_PROVIDERS_B1B, **C1_PROVIDERS_NEW}
 
 
 def _pv_ok(r: dict) -> tuple:
@@ -1580,10 +2094,382 @@ def _pv_ok(r: dict) -> tuple:
 
 
 def _t_b1b_providers(_ok, base: Path):
-    for cat, fn in C1_PROVIDERS.items():
+    for cat, fn in C1_PROVIDERS_B1B.items():
         r = fn()
         good, detail = _pv_ok(r)
         _ok(f"B2-B1b 提供方 {cat}：c1-provider/1，正例与反例都实际运行且全部符合（{detail.split(' 失败')[0]}）", good, detail)
+
+
+def _c1_failed(r, category, broken) -> bool:
+    """失败关闭：结构仍合格，error 写出，被破坏的那一极至少有一个用例失败；未破坏的那一极全部仍是自己的真实成功。"""
+    kept = "neg" if broken == "pos" else "pos"
+    return (not _c1_shape_problems(r, category) and isinstance(r["error"], str) and bool(r["error"])
+            and any(c["polarity"] == broken and not c["ok"] for c in r["cases"])
+            and all(c["ran"] and c["ok"] for c in r["cases"] if c["polarity"] == kept))
+
+
+def _t_c1b_providers(_ok, base: Path):
+    """B-C1-PROVIDERS：五个 B 提供方各调用一次，严格结构检查；新三类各有真实正反例且全部成功、error=None。"""
+    seen = {}
+    for cat, fn in C1_PROVIDERS.items():
+        r = fn()
+        seen[cat] = r
+        probs = _c1_shape_problems(r, cat)
+        pos = [c for c in r["cases"] if c["polarity"] == "pos"]
+        neg = [c for c in r["cases"] if c["polarity"] == "neg"]
+        _ok(f"B-C1-PROVIDERS 提供方 {cat}：c1-provider/1 严格结构、provider=B、category 准确、正例 {len(pos)} 反例 {len(neg)} 都实际运行成功、error=None",
+            not probs and r["error"] is None and pos and neg and all(c["ran"] and c["ok"] for c in r["cases"]),
+            json.dumps([probs, r], ensure_ascii=False)[:1800])
+    names = [c["name"] for cat in C1_PROVIDERS_NEW for c in seen[cat]["cases"]]
+    _ok("B-C1-PROVIDERS 三个新类别的用例互不复用：用例名在三类之间不重复，每类的结果来自各自的真实运行",
+        len(names) == len(set(names)) and all(seen[c]["category"] == c for c in C1_PROVIDERS_NEW), str(len(names)))
+
+
+def _t_c1b_mutations(_ok, base: Path):
+    """B-C1-PROVIDERS 受控变异：业务层分别破坏正例与反例，提供方必须失败关闭；guard 不足、用例异常、整体异常都不绿。"""
+    from . import admin, review, selftest_review
+    from .core import WfError
+    real_policy = admin.init_default_policy
+    with _patched(admin, "init_default_policy", lambda: {**real_policy(), "auto_apply": True}):
+        r1 = provider_init_files()
+    with _patched(admin, "_refuse_linked_workflow", lambda wf: None):
+        r2 = provider_init_files()
+    _ok("B-C1-PROVIDERS 1-init-files 变异：默认白名单打开 auto_apply 只让正例失败；去掉链接拒绝只让反例失败；两次都不绿",
+        _c1_failed(r1, "1-init-files", "pos") and _c1_failed(r2, "1-init-files", "neg"),
+        json.dumps([r1["cases"], r2["cases"]], ensure_ascii=False)[:1800])
+    real_fc = review.final_check
+    with _patched(review, "final_check", lambda rid, **kw: {**real_fc(rid, **kw), "allowed": True, "reasons": []}):
+        r3 = provider_unverified_install()
+    with _patched(review, "consume", lambda *a, **k: (_ for _ in ()).throw(WfError("c1b mutation: consume broken"))):
+        r4 = provider_unverified_install()
+    _ok("B-C1-PROVIDERS 2S-unverified-install 变异：安装前复核一律放行时未核验安装真实写入、正例失败；消费损坏时合法安装失败、反例失败",
+        _c1_failed(r3, "2S-unverified-install", "pos") and _c1_failed(r4, "2S-unverified-install", "neg"),
+        json.dumps([r3["cases"], r4["cases"]], ensure_ascii=False)[:1800])
+    real_lir, real_consume = review.load_install_request, review.consume
+    with _patched(review, "load_install_request", lambda rid, **kw: real_lir(rid, **{**kw, "zip_path": None})):
+        r5 = provider_install_review()
+    with _patched(review, "consume", lambda *a, **k: {**real_consume(*a, **k), "attempt_id": "c1b-mutated-attempt"}):
+        r6 = provider_install_review()
+    _ok("B-C1-PROVIDERS 6a-install-review 变异：不再核对调用方包时换包正例失败；开始记录不再绑定登记的 attempt 时绑定反例失败",
+        _c1_failed(r5, "6a-install-review", "pos") and _c1_failed(r6, "6a-install-review", "neg"),
+        json.dumps([r5["cases"], r6["cases"]], ensure_ascii=False)[:1800])
+    saved = os.environ.pop("WF_LOCAL_DIR")
+    try:
+        guarded = {cat: fn() for cat, fn in C1_PROVIDERS_NEW.items()}
+    finally:
+        os.environ["WF_LOCAL_DIR"] = saved
+    with _patched(admin, "init_project", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("c1b injected"))):
+        raised = provider_init_files()
+    with _patched(selftest_review, "Env", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("c1b env broken"))):
+        broken = provider_install_review()
+    _ok("B-C1-PROVIDERS 失败关闭：隔离前提不足时三类都不运行用例并写 error；用例抛异常记 ran=False；夹具整体抛异常写 error；都不绿",
+        all(not _c1_shape_problems(r, c) and r["cases"] == [] and "WF_LOCAL_DIR" in r["error"] for c, r in guarded.items())
+        and not _c1_shape_problems(raised, "1-init-files") and raised["error"]
+        and all(c["ran"] is False and c["ok"] is False for c in raised["cases"])
+        and not _c1_shape_problems(broken, "6a-install-review") and broken["cases"] == [] and "c1b env broken" in broken["error"],
+        json.dumps([guarded, raised["error"], broken["error"]], ensure_ascii=False)[:1500])
+
+
+def _t_c1b_host_restore(_ok, base: Path):
+    """F1：上下文内才加载的模块（这里用真实 wflib/admin.py 以新模块名加载），宿主外保留它的引用；正常退出、用例异常、
+    嵌套三种情况离开后，经该引用看到的路径都回到调用方 LOCAL；全部 wflib 模块不留宿主路径；调用方 local 字节与 mode 不变；
+    REGISTRY 不在 LOCAL 之下时拒绝且不改动任何状态。"""
+    import importlib.util
+    from . import admin, core
+    orig = {"LOCAL": core.LOCAL, "REGISTRY": core.REGISTRY, "env": os.environ.get("WF_LOCAL_DIR")}
+    local_before = _tree_snapshot(Path(core.LOCAL))
+    modes_before = {str(p): stat.S_IMODE(os.lstat(p).st_mode) for p in Path(core.LOCAL).rglob("*")}
+    probes = []
+
+    def load(tag):
+        name = f"wflib._c1b_probe_{tag}_{os.getpid()}"
+        spec = importlib.util.spec_from_file_location(name, admin.__file__)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        probes.append(name)
+        spec.loader.exec_module(mod)
+        return mod
+    res = {}
+    try:
+        with _c1_host(base / "n") as host:
+            held_n = load("normal")
+            res["normal_inside"] = _c1_under(Path(held_n.LOCAL), host) and _c1_under(Path(held_n.REGISTRY), host)
+        res["normal_after"] = (held_n.LOCAL, held_n.REGISTRY) == (orig["LOCAL"], orig["REGISTRY"])
+        try:
+            with _c1_host(base / "e") as host:
+                held_e = load("exception")
+                raise RuntimeError("c1b injected case exception")
+        except RuntimeError as e:
+            res["exception_propagated"] = "injected" in str(e)
+        res["exception_after"] = (held_e.LOCAL, held_e.REGISTRY) == (orig["LOCAL"], orig["REGISTRY"])
+        with _c1_host(base / "o") as outer:
+            with _c1_host(base / "i") as inner:
+                held_x = load("nested")
+                res["nested_inside"] = _c1_under(Path(held_x.LOCAL), inner)
+            res["nested_back_to_outer"] = held_x.LOCAL == outer and held_x.REGISTRY == outer / "registry.json"
+        res["nested_after"] = (held_x.LOCAL, held_x.REGISTRY) == (orig["LOCAL"], orig["REGISTRY"])
+        with _patched(core, "REGISTRY", base / "elsewhere" / "registry.json"):
+            try:
+                with _c1_host(base / "r"):
+                    res["registry_outside"] = "entered"
+            except RuntimeError as e:
+                res["registry_outside"] = "refused" if "REGISTRY" in str(e) and core.LOCAL == orig["LOCAL"] else str(e)
+        alias = base / "caller-local-alias"
+        alias.symlink_to(Path(core.LOCAL), target_is_directory=True)
+        alias_host = alias / "resolved-overlap-host"
+        try:
+            with _c1_host(alias_host):
+                res["resolved_alias"] = "entered"
+        except RuntimeError as e:
+            res["resolved_alias"] = "refused" if "解析路径" in str(e) and core.LOCAL == orig["LOCAL"] else str(e)
+        res["resolved_alias_no_write"] = not (Path(core.LOCAL) / "resolved-overlap-host" / "host-local").exists()
+        hosts = [str(base / x) for x in ("n", "e", "o", "i", "r")]
+        res["no_host_path_left"] = not [f"{n}.{a}" for n, m in _c1_wflib_modules() for a, v in vars(m).items()
+                                        if any(_c1_remap(v, Path(h) / "host-local", Path("/"))[1] for h in hosts)]
+        res["globals_restored"] = (core.LOCAL, core.REGISTRY, os.environ.get("WF_LOCAL_DIR")) == \
+            (orig["LOCAL"], orig["REGISTRY"], orig["env"])
+        res["caller_local_unchanged"] = _tree_snapshot(Path(core.LOCAL)) == local_before and \
+            {str(p): stat.S_IMODE(os.lstat(p).st_mode) for p in Path(core.LOCAL).rglob("*")} == modes_before
+    finally:
+        import wflib
+        for name in probes:
+            sys.modules.pop(name, None)
+            if hasattr(wflib, name.split(".", 1)[1]):
+                delattr(wflib, name.split(".", 1)[1])
+    _ok("B-C1-PROVIDERS-REWORK F1 宿主恢复：上下文内新加载的模块经宿主外引用在正常退出、用例异常、嵌套后都回到调用方 LOCAL；"
+        "无宿主路径残留，全局与调用方 local（字节、mode）不变；REGISTRY 不在 LOCAL 下及 symlink alias 解析交叠时拒绝",
+        all(v is True for k, v in res.items() if k not in ("registry_outside", "resolved_alias"))
+        and res.get("registry_outside") == "refused" and res.get("resolved_alias") == "refused",
+        json.dumps(res, ensure_ascii=False, default=str))
+    saved = core.REGISTRY
+    with _patched(core, "REGISTRY", base / "elsewhere2" / "registry.json"):
+        rr = provider_unverified_install()
+    _ok("B-C1-PROVIDERS-REWORK F1 宿主初始化失败（REGISTRY 不在 LOCAL 下）：提供方失败关闭，没有用例、error 写明原因",
+        rr["cases"] == [] and rr["error"] and "REGISTRY" in rr["error"] and core.REGISTRY == saved
+        and not _c1_shape_problems(rr, "2S-unverified-install"), json.dumps(rr, ensure_ascii=False)[:600])
+
+
+def _c1_inventory(top: Path) -> dict:
+    """不跟随链接的完整清单：{相对路径: (类型, mode, 字节或链接目标)}，含目录本身。"""
+    out = {}
+    for dp, dns, fns in os.walk(top, followlinks=False):
+        for n in sorted(dns + fns):
+            p = Path(dp) / n
+            st = os.lstat(p)
+            body = p.read_bytes() if stat.S_ISREG(st.st_mode) else os.readlink(p) if stat.S_ISLNK(st.st_mode) else None
+            out[str(p.relative_to(top))] = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), body)
+    return out
+
+
+def _c1_attr_objects() -> dict:
+    return {(n, a): v for n, m in _c1_wflib_modules() for a, v in list(vars(m).items())}
+
+
+def _c1_object_drift(before: dict, after: dict) -> list:
+    """逐个模块属性按对象同一性（is）比较；值相等但换了对象也算变化。"""
+    return sorted([f"{n}.{a}" for (n, a), v in before.items() if (n, a) not in after or after[(n, a)] is not v]
+                  + [f"{n}.{a}(新增)" for (n, a) in after if (n, a) not in before])
+
+
+@contextlib.contextmanager
+def _c1_mkdir_spy():
+    calls, real = [], (Path.mkdir, os.mkdir, os.makedirs)
+
+    def path_mkdir(self, *a, **k):
+        calls.append(("Path.mkdir", str(self)))
+        return real[0](self, *a, **k)
+
+    def os_mkdir(p, *a, **k):
+        calls.append(("os.mkdir", str(p)))
+        return real[1](p, *a, **k)
+
+    def os_makedirs(p, *a, **k):
+        calls.append(("os.makedirs", str(p)))
+        return real[2](p, *a, **k)
+    with _patched(Path, "mkdir", path_mkdir), _patched(os, "mkdir", os_mkdir), _patched(os, "makedirs", os_makedirs):
+        yield calls
+
+
+def _t_c1b_host_refusal(_ok, base: Path):
+    """B-C1-F4：_c1_host 的每个前置拒绝都发生在建目录与改任何状态之前——拒绝原因是原样的前置原因（不被退出扫描覆盖），
+    Path.mkdir/os.mkdir/os.makedirs 调用 0 次，场景根目录（类型、mode、字节、symlink 目标）不变，全部已加载 wflib 模块的
+    每个属性都是原来的同一个对象（含 core.LOCAL/REGISTRY），WF_LOCAL_DIR 不变。contains-old（td/host-local/inside）是
+    F3-N1 原反例。另有嵌套内层拒绝与可进入的对照（证明 mkdir 侦测与对象同一性侦测不是空转）。"""
+    from . import core
+    base = base.resolve()
+
+    def mk(p: Path, *files):
+        p.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            (p / f).write_bytes(b"CALLER-" + f.encode() + b"\n")
+        return p
+
+    def contains_old(r):
+        td = r / "parent"
+        local = mk(td / "host-local" / "inside", "registry.json", "marker")
+        return local, local / "registry.json", td, "宿主 /"
+
+    def equal(r):
+        td = r / "parent"
+        local = mk(td / "host-local", "registry.json")
+        return local, local / "registry.json", td, "宿主 /"
+
+    def host_in_local(r):
+        local = mk(r / "local", "registry.json")
+        return local, local / "registry.json", local / "sub", "宿主 /"
+
+    def symlink_alias(r):
+        local = mk(r / "local", "registry.json")
+        (r / "alias").symlink_to(local, target_is_directory=True)
+        return local, local / "registry.json", r / "alias" / "sub", "宿主解析路径"
+
+    def symlink_dotdot(r):
+        local = mk(r / "local", "registry.json")
+        mk(local / "deep")
+        (r / "lnk").symlink_to(local / "deep", target_is_directory=True)
+        return local, local / "registry.json", r / "lnk" / "..", "宿主解析路径"
+
+    def local_is_symlink(r):
+        real = mk(r / "real", "registry.json")
+        (r / "locallink").symlink_to(real, target_is_directory=True)
+        return r / "locallink", r / "locallink" / "registry.json", real / "x", "宿主解析路径"
+
+    def registry_outside(r):
+        local = mk(r / "local")
+        mk(r / "elsewhere", "registry.json")
+        return local, r / "elsewhere" / "registry.json", r / "td", "REGISTRY "
+
+    def registry_dotdot(r):
+        local = mk(r / "local")
+        mk(r / "elsewhere", "registry.json")
+        return local, local / ".." / "elsewhere" / "registry.json", r / "td", "REGISTRY "
+
+    def registry_symlink_into_host(r):
+        local = mk(r / "local")
+        (local / "registry.json").symlink_to(r / "td" / "host-local" / "registry.json")
+        return local, local / "registry.json", r / "td", "宿主解析路径"
+
+    scenarios = [("contains-old：调用方 LOCAL = td/host-local/inside（F3-N1 原反例）", contains_old),
+                 ("equal：td/host-local 就是调用方 LOCAL", equal),
+                 ("宿主在调用方 LOCAL 之内", host_in_local),
+                 ("规范化别名：经指向 LOCAL 的 symlink 进入", symlink_alias),
+                 ("symlink 之后的 ..：解析后宿主落在 LOCAL 内", symlink_dotdot),
+                 ("调用方 LOCAL 本身是 symlink，宿主在其真实目录内", local_is_symlink),
+                 ("REGISTRY 在 LOCAL 之外", registry_outside),
+                 ("REGISTRY 词法在 LOCAL 下但含 ..", registry_dotdot),
+                 ("REGISTRY 是指向宿主内的 symlink", registry_symlink_into_host)]
+    for i, (label, build) in enumerate(scenarios):
+        r = base / f"s{i}"
+        r.mkdir()
+        local, registry, td, want = build(r)
+        with _patched(core, "LOCAL", local), _patched(core, "REGISTRY", registry):
+            inv, objs, env0 = _c1_inventory(r), _c1_attr_objects(), os.environ.get("WF_LOCAL_DIR")
+            exc = None
+            with _c1_mkdir_spy() as calls:
+                try:
+                    with _c1_host(td):
+                        exc = "entered"
+                except Exception as e:   # noqa: BLE001
+                    exc = f"{type(e).__name__}: {e}"
+            drift = _c1_object_drift(objs, _c1_attr_objects())
+            obs = {"exc": exc[:200], "mkdir": calls, "inventory_same": _c1_inventory(r) == inv, "object_drift": drift,
+                   "LOCAL_after": str(core.LOCAL), "LOCAL_is_caller": core.LOCAL is local,
+                   "REGISTRY_is_caller": core.REGISTRY is registry, "env_same": os.environ.get("WF_LOCAL_DIR") == env0}
+        _ok(f"B-C1-F4 前置拒绝 {label}：原样前置原因、mkdir 0 次、场景目录不变、全部模块属性同一对象、环境不变",
+            exc.startswith("RuntimeError: " + want) and "退出宿主后" not in exc and not calls and obs["inventory_same"]
+            and not drift and obs["LOCAL_is_caller"] and obs["REGISTRY_is_caller"] and obs["env_same"],
+            json.dumps(obs, ensure_ascii=False, default=str)[:900])
+
+    r = base / "preref"
+    local, td = mk(r / "local", "registry.json"), r / "td"
+    name = f"wflib._c1b_preref_{os.getpid()}"
+    pre = type(sys)(name)
+    pre.HOSTREF, pre.HOSTSTR = td / "host-local" / "cache", str(td / "host-local")
+    held = (pre.HOSTREF, pre.HOSTSTR)
+    sys.modules[name] = pre
+    try:
+        with _patched(core, "LOCAL", local), _patched(core, "REGISTRY", local / "registry.json"):
+            inv, objs = _c1_inventory(r), _c1_attr_objects()
+            with _c1_mkdir_spy() as calls:
+                try:
+                    with _c1_host(td):
+                        exc = "entered"
+                except Exception as e:   # noqa: BLE001
+                    exc = f"{type(e).__name__}: {e}"
+            drift = _c1_object_drift(objs, _c1_attr_objects())
+            same_inv = _c1_inventory(r) == inv
+    finally:
+        sys.modules.pop(name, None)
+    _ok("B-C1-F4 前置拒绝：进入前已加载模块里已有指向宿主的 Path/字符串时拒绝，这些值保持原对象，不建目录",
+        exc.startswith("RuntimeError: 进入前已有模块引用宿主") and not calls and same_inv and not drift
+        and pre.HOSTREF is held[0] and pre.HOSTSTR is held[1],
+        json.dumps({"exc": exc[:200], "mkdir": calls, "drift": drift, "inventory_same": same_inv}, ensure_ascii=False))
+
+    r = base / "nested"
+    local = mk(r / "local", "registry.json")
+    nest = {}
+    with _patched(core, "LOCAL", local), _patched(core, "REGISTRY", local / "registry.json"):
+        caller_objs, env0 = _c1_attr_objects(), os.environ.get("WF_LOCAL_DIR")
+        with _c1_host(r / "outer") as outer:
+            inv, objs, env1 = _c1_inventory(r), _c1_attr_objects(), os.environ.get("WF_LOCAL_DIR")
+            with _c1_mkdir_spy() as calls:
+                try:
+                    with _c1_host(r / "outer"):   # 内层宿主 outer/host-local 就是此刻的调用方 LOCAL（外层宿主）
+                        nest["exc"] = "entered"
+                except Exception as e:   # noqa: BLE001
+                    nest["exc"] = f"{type(e).__name__}: {e}"
+            nest.update(mkdir=calls, inside_drift=_c1_object_drift(objs, _c1_attr_objects()),
+                        inventory_same=_c1_inventory(r) == inv, still_outer=core.LOCAL == outer,
+                        env_inside_same=os.environ.get("WF_LOCAL_DIR") == env1 == str(outer))
+        nest.update(after_outer_drift=_c1_object_drift(caller_objs, _c1_attr_objects()),
+                    env_after=os.environ.get("WF_LOCAL_DIR") == env0, LOCAL_is_caller=core.LOCAL is local)
+    _ok("B-C1-F4 嵌套：外层宿主内的内层前置拒绝（equal）不改外层状态、不建目录；外层退出后调用方全部属性恢复为同一对象",
+        nest["exc"].startswith("RuntimeError: 宿主 /") and "退出宿主后" not in nest["exc"] and not nest["mkdir"]
+        and not nest["inside_drift"] and nest["inventory_same"] and nest["still_outer"] and nest["env_inside_same"]
+        and not nest["after_outer_drift"] and nest["env_after"] and nest["LOCAL_is_caller"],
+        json.dumps(nest, ensure_ascii=False, default=str)[:900])
+
+    r = base / "control"
+    local = mk(r / "local", "registry.json", "marker")
+    ctl = {}
+    with _patched(core, "LOCAL", local), _patched(core, "REGISTRY", local / "registry.json"):
+        objs, env0, local_inv = _c1_attr_objects(), os.environ.get("WF_LOCAL_DIR"), _c1_inventory(local)
+        with _c1_mkdir_spy() as calls:
+            with _c1_host(r / "td") as host:
+                ctl["inside"] = (core.LOCAL == host and core.REGISTRY == host / "registry.json"
+                                 and os.environ.get("WF_LOCAL_DIR") == str(host))
+                ctl["drift_detected_inside"] = _c1_object_drift(objs, _c1_attr_objects())
+        ctl.update(mkdir=len(calls), after_drift=_c1_object_drift(objs, _c1_attr_objects()),
+                   env_after=os.environ.get("WF_LOCAL_DIR") == env0, local_same=_c1_inventory(local) == local_inv,
+                   LOCAL_is_caller=core.LOCAL is local)
+    _ok("B-C1-F4 对照：不交叠的宿主照常进入（mkdir 被侦测到、宿主内对象变化被侦测到）且退出后同一对象恢复、调用方 local 不变",
+        ctl["inside"] and ctl["mkdir"] > 0 and "wflib.core.LOCAL" in ctl["drift_detected_inside"]
+        and not ctl["after_drift"] and ctl["env_after"] and ctl["local_same"] and ctl["LOCAL_is_caller"],
+        json.dumps(ctl, ensure_ascii=False, default=str)[:900])
+
+
+def _t_c1b_frozen_identity(_ok, base: Path):
+    """F2：在真实 review.final_check 的允许决定里改冻结身份（审查者会话、核验器 sha、核验模型）——业务层变异，
+    不碰检查函数。真实 consume 与 apply_zip 照常安装，两份持久记录都带改后的身份；6a 提供方必须失败关闭，只有绑定反例失败。"""
+    from . import review
+    real = review.final_check
+    res = {}
+    for label, change in (("reviewer_identity", lambda p: {**p, "reviewer_identity": {"platform": "synthetic",
+                                                                                       "session": "c1b-swapped"}}),
+                          ("verifier_sha256", lambda p: {**p, "verifier_sha256": "0" * 64}),
+                          ("model_verified", lambda p: {**p, "model_verified": "c1b-swapped-model"})):
+        def mutated(rid, _change=change, **kw):
+            d = real(rid, **kw)
+            return {**d, "provenance": _change(d["provenance"])} if d.get("allowed") else d
+        with _patched(review, "final_check", mutated):
+            r = provider_install_review()
+        bound = next(c for c in r["cases"] if c["polarity"] == "neg")
+        res[label] = {"fail_closed": _c1_failed(r, "6a-install-review", "neg"),
+                      "installed_anyway": bound["detail"].startswith("{") and label in bound["detail"],
+                      "detail": bound["detail"][:160]}
+    _ok("B-C1-PROVIDERS-REWORK F2 冻结身份漂移（审查者、核验器 sha、核验模型）：真实安装照常完成，6a 提供方以冻结决定为独立来源逐项核对，"
+        "三种漂移都失败关闭且只有绑定反例失败",
+        all(v["fail_closed"] and v["installed_anyway"] for v in res.values()), json.dumps(res, ensure_ascii=False))
 
 
 def _t_b1b_mutations(_ok, base: Path):
@@ -1639,11 +2525,101 @@ def _t_b1b_mutations(_ok, base: Path):
         real and not fooled, f"{real} {fooled}")
 
 
+def _t_b1b_guard(_ok, base: Path):
+    """B-C1-OLD2-GUARD：原两类公开提供方（provider_destructive、provider_widening）在隔离前提不足时——没有 WF_LOCAL_DIR，
+    或 WF_LOCAL_DIR/LOCAL 指向工具自己的 local/——在业务导入、临时目录与任何夹具之前以标准 c1-provider/1 拒绝：
+    cases=[]、error 写明原因；不建临时目录、不 mkdir、不导入 wflib 业务模块、不调用夹具，LOCAL、工具目录与临时目录不变。
+    “工具自己的 local/”用 base 下的假工具目录模拟（core.WF_HOME/LOCAL 指向它），守卫失效时也写不到真实工具目录。
+    对照：守卫关掉时同一组侦测器能看到临时目录、业务导入与夹具调用（侦测不是空转）。配置了私有 LOCAL 时原两类仍 198/13 全绿。"""
+    import builtins
+    from . import core
+    me = sys.modules[__name__]
+    fake_home = base.resolve() / "fake-tool"
+    (fake_home / "local").mkdir(parents=True)
+    (fake_home / "local" / "marker").write_bytes(b"TOOL-LOCAL\n")
+    old2 = [("2S-destructive-or-crossproject", provider_destructive, 198), ("2S-widening", provider_widening, 13)]
+
+    def observe(fn, wf_local, local, home, stop_fixtures=False):
+        imports, temps, fixtures = [], [], []
+        real_import, real_mkdtemp = builtins.__import__, tempfile.mkdtemp
+        real_env, real_proj = me._b1b_env, me._mk_project
+
+        def spy_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if level > 0 or name.startswith("wflib"):
+                imports.extend([name] if name else list(fromlist or ()))
+            return real_import(name, globals, locals, fromlist, level)
+
+        def spy_mkdtemp(*a, **k):
+            temps.append(1)
+            return real_mkdtemp(*a, **k)
+
+        def fixture(real, tag):
+            def f(*a, **k):
+                fixtures.append(tag)
+                if stop_fixtures:
+                    raise RuntimeError("c1b old2 control stop")
+                return real(*a, **k)
+            return f
+        saved_env = os.environ.get("WF_LOCAL_DIR")
+        tmp_top = sorted(os.listdir(tempfile.gettempdir()))
+        inv = (_c1_inventory(Path(local)), _c1_inventory(fake_home))
+        try:
+            if wf_local is None:
+                os.environ.pop("WF_LOCAL_DIR", None)
+            else:
+                os.environ["WF_LOCAL_DIR"] = wf_local
+            with _patched(core, "LOCAL", local), _patched(core, "WF_HOME", home), \
+                    _patched(me, "_b1b_env", fixture(real_env, "_b1b_env")), \
+                    _patched(me, "_mk_project", fixture(real_proj, "_mk_project")), \
+                    _patched(tempfile, "mkdtemp", spy_mkdtemp), _c1_mkdir_spy() as mk, \
+                    _patched(builtins, "__import__", spy_import):
+                r = fn()
+            mkdirs = list(mk)
+        finally:
+            if saved_env is None:
+                os.environ.pop("WF_LOCAL_DIR", None)
+            else:
+                os.environ["WF_LOCAL_DIR"] = saved_env
+        business = sorted({n for n in imports if n not in ("core", "wflib.core")})
+        same = (_c1_inventory(Path(local)), _c1_inventory(fake_home)) == inv \
+            and sorted(os.listdir(tempfile.gettempdir())) == tmp_top
+        return r, {"error": r.get("error"), "n_cases": len(r.get("cases") or []), "temps": len(temps), "mkdir": mkdirs,
+                   "business_imports": business, "fixtures": fixtures, "inventory_same": same,
+                   "env_restored": os.environ.get("WF_LOCAL_DIR") == saved_env}
+
+    envs = [("没有 WF_LOCAL_DIR", None, core.LOCAL, core.WF_HOME, "没有设置 WF_LOCAL_DIR"),
+            ("WF_LOCAL_DIR 指向工具自己的 local/", str(fake_home / "local"), fake_home / "local", fake_home,
+             "指向工具自己的 local/")]
+    for label, wf_local, local, home, want in envs:
+        for cat, fn, _n in old2:
+            r, obs = observe(fn, wf_local, local, home)
+            _ok(f"B-C1-OLD2-GUARD {cat}：{label}时以标准 c1-provider/1 拒绝（cases=[]、error 写明原因），"
+                "业务导入、临时目录、mkdir、夹具都没有发生，LOCAL 与工具目录不变",
+                not _c1_shape_problems(r, cat) and r["cases"] == [] and isinstance(r["error"], str) and want in r["error"]
+                and not obs["temps"] and not obs["mkdir"] and not obs["business_imports"] and not obs["fixtures"]
+                and obs["inventory_same"] and obs["env_restored"], json.dumps(obs, ensure_ascii=False, default=str)[:900])
+    ctl = {}
+    with _patched(me, "_c1_guard", lambda: ""):
+        for cat, fn, _n in old2:
+            r, obs = observe(fn, None, core.LOCAL, core.WF_HOME, stop_fixtures=True)
+            ctl[cat] = {**obs, "mkdir": len(obs["mkdir"]), "error": str(r["error"])[:120]}
+    _ok("B-C1-OLD2-GUARD 对照：守卫关掉时同一组侦测器看到临时目录、wflib 业务导入与夹具调用（夹具在写入前被截停），证明侦测不是空转",
+        all(v["temps"] >= 1 and "policy" in v["business_imports"] and v["fixtures"] and v["error"] and v["env_restored"]
+            for v in ctl.values()), json.dumps(ctl, ensure_ascii=False, default=str)[:900])
+    full = {cat: fn() for cat, fn, _n in old2}
+    _ok("B-C1-OLD2-GUARD 配置了私有 LOCAL：原两类照常运行，2S-destructive-or-crossproject 198 例、2S-widening 13 例，"
+        "全部实际运行成功、error=None、结构合格",
+        all(not _c1_shape_problems(full[cat], cat) and full[cat]["error"] is None and len(full[cat]["cases"]) == n
+            and all(c["ran"] and c["ok"] for c in full[cat]["cases"]) for cat, _fn, n in old2),
+        json.dumps({cat: [len(r["cases"]), r["error"]] for cat, r in full.items()}, ensure_ascii=False)[:600])
+
+
 TESTS = [_t_clean, _t_dirty5, _t_freeze_once, _t_head_moved, _t_nogit, _t_failures, _t_compat, _t_short,
          _t_r1_attributes, _t_r1_verify, _t_r2_walk_errors, _t_r3_symlinks_git, _t_r3_symlinks_nogit,
          _t_r4_publish, _t_r5_short, _t_r6_restore_retry, _t_r7_parent_swap, _t_r7_capability,
          _t_b1a_init_new, _t_b1a_init_existing, _t_b1a_init_refuse, _t_b1a_init_safe, _t_b1a_workflow_link,
-         _t_b1b_providers, _t_b1b_mutations]
+         _t_b1b_providers, _t_b1b_mutations, _t_c1b_providers, _t_c1b_mutations, _t_c1b_host_restore,
+         _t_c1b_frozen_identity, _t_c1b_host_refusal, _t_b1b_guard]
 
 
 def run_lane_b(_ok) -> None:
