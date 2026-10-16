@@ -99,14 +99,18 @@ class GateProviderTests(unittest.TestCase):
         names0 = [n for n, _ in v18.active_groups(0)]
         names1 = [n for n, _ in v18.active_groups(1)]
         old = [n for n, _ in v18.TESTS]
-        self.assertEqual((len(names0), len(names1), names1, names0[:len(old)], names0[-1]),
-                         (len(old) + 1, len(old), old, old, v18.GATE_GROUP))
-        self.assertEqual(set(names0) - set(names1), {v18.GATE_GROUP})
-        self.assertNotIn(v18.BASELINE_GROUP, names0)   # the strict 21-category aggregate is not registered here
+        # Depth 0 = the old probes + 真实默认门禁 + 门禁基线 (strict 21-category aggregate, C-C1-STRICT21);
+        # depth 1 = the old probes only. Counts come from the one selector, never from a constant.
+        self.assertEqual((len(names0), len(names1), names1, names0[:len(old)], names0[-2:]),
+                         (len(old) + 2, len(old), old, old, [v18.GATE_GROUP, v18.BASELINE_GROUP]))
+        self.assertEqual(set(names0) - set(names1), {v18.GATE_GROUP, v18.BASELINE_GROUP})
+        self.assertIn(v18.BASELINE_GROUP, names0)      # registered at depth 0 ...
+        self.assertNotIn(v18.BASELINE_GROUP, names1)   # ... and never nested
         self.assertEqual(len(set(names0)), len(names0))
         probe = self.details["G0-default-gates"]["gate2_probe"]   # a real depth-1 `wf self-check --probes`
         self.assertEqual((probe["groups"], probe["gate_group_present"], probe["total"]),
                          (len(old), False, f"探针结果：{len(old)} / {len(old)} 通过"))
+        self.assertIs(probe["baseline_group_present"], False)   # the real nested run excludes 门禁基线 too
 
     def test_bad_depth_is_refused_before_any_spawn(self):
         bad = ["2", "3", "-1", "", "x", "01", " 1", "1 ", "+1"]

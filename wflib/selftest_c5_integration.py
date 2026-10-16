@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -140,23 +141,48 @@ class C5IntegrationTests(unittest.TestCase):
         entry = snap.descriptor["review_inputs"]["entries"][0]
         path = inst.evidence / "install" / entry["reference"]["tx_id"] / "completed.json"
         raw, mode = path.read_bytes(), path.stat().st_mode & 0o777
-        path.unlink()
-        result = live._evaluate_snapshot(live._capture_inputs(inst, rounds=1))
-        self.assertEqual(result["window_inputs"]["review_inputs"]["entries"][0]["state"], "unknown")
-        path.write_bytes(b'{"duplicate":1,"duplicate":2}')
-        result = live._evaluate_snapshot(live._capture_inputs(inst, rounds=1))
-        self.assertEqual(result["window_inputs"]["review_inputs"]["entries"][0]["state"], "corrupt")
-        path.unlink()
-        outside = self.base / "completed-copy.json"
-        outside.write_bytes(raw)
-        path.symlink_to(outside)
-        result = live.check(inst, rounds=1)
-        self.assertEqual(result["input_problem"]["state"], "unsupported")
-        path.unlink()
-        path.write_bytes(raw)
-        path.chmod(mode)
-        # Recreating a file changes its identity; the old snapshot stays invalid.
-        self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+
+        def frozen(node):
+            if isinstance(node, dict):
+                if node.get("path") == str(path) and "identity" in node:
+                    yield tuple(node["identity"])
+                for value in node.values():
+                    yield from frozen(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from frozen(value)
+        # Linux may give a freed inode number to the next file created, and a
+        # recreated file with the same bytes, mode and [dev, ino] is exactly an
+        # in-place restore (accepted as stable by test_changed_raw_material).
+        # Hold the original inode open for the whole sequence: an open inode
+        # cannot be reused, so the recreated file is a different object by
+        # construction, not by allocator luck.
+        with open(path, "rb") as held:
+            old = os.fstat(held.fileno())
+            self.assertEqual(set(frozen(snap.descriptor)), {(old.st_dev, old.st_ino)})
+            path.unlink()
+            result = live._evaluate_snapshot(live._capture_inputs(inst, rounds=1))
+            self.assertEqual(result["window_inputs"]["review_inputs"]["entries"][0]["state"], "unknown")
+            path.write_bytes(b'{"duplicate":1,"duplicate":2}')
+            result = live._evaluate_snapshot(live._capture_inputs(inst, rounds=1))
+            self.assertEqual(result["window_inputs"]["review_inputs"]["entries"][0]["state"], "corrupt")
+            path.unlink()
+            outside = self.base / "completed-copy.json"
+            outside.write_bytes(raw)
+            path.symlink_to(outside)
+            result = live.check(inst, rounds=1)
+            self.assertEqual(result["input_problem"]["state"], "unsupported")
+            path.unlink()
+            path.write_bytes(raw)
+            path.chmod(mode)
+            kept, new = os.fstat(held.fileno()), path.lstat()
+            self.assertEqual((kept.st_dev, kept.st_ino), (old.st_dev, old.st_ino))
+            self.assertEqual(held.read(), raw)
+            self.assertNotEqual((new.st_dev, new.st_ino), (old.st_dev, old.st_ino))
+            self.assertEqual((path.read_bytes(), new.st_mode & 0o777), (raw, mode))
+            # Recreating a file changes its identity; the old snapshot stays invalid.
+            self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        self.assertTrue(held.closed)
         fresh = live._capture_inputs(inst, rounds=1)
         self.assertTrue(live._evaluate_snapshot(fresh)["report"]["summary"]["passed_strict"])
         self.assertTrue(live._revalidate_inputs(inst, fresh.descriptor)["valid"])

@@ -87,11 +87,22 @@ def _mine(x: dict, name: str) -> bool:
 # ---- C5-G1: legacy installation entries (reporting only, never a reference) ----
 LEGACY_INSTALL_SCHEMA = "legacy-install-command/1"
 _LEGACY_ENTRIES = {"apply": "project", "self-update": "tool"}
+# C4-OPERAND-FAILCLOSED: the lexer drops quotes and keeps expansion syntax in the word text, and the classifier
+# never evaluates the shell. A word with parameter/command substitution, a glob, brace or tilde syntax may stand
+# for another path (or several), and a quoted or escaped literal cannot be told from it; such a word is
+# unresolved, never a path.
+_UNRESOLVED_WORD = r"[$`*?\[{]|^~"
+
+
+def _unresolved(word):
+    import re
+    return isinstance(word, str) and re.search(_UNRESOLVED_WORD, word) is not None
 _WRAPPERS = {"env", "command", "exec", "nohup", "time", "nice", "timeout", "sudo"}
 _WRAPPER_VALUE_OPTIONS = {"-u", "-g", "-n", "-s", "-k", "-C", "-p"}
 _DRILL_VALUE_OPTIONS = {"--kind", "--dir", "--review", "--review-timeout-s"}
 INNER_REVIEW_DIAGNOSTIC = "inner_review_child_project_not_bound"
 INNER_REVIEW_RECEIPT_DIAGNOSTIC = "inner_review_receipt_not_grafted"
+MIXED_INNER_REVIEW_DIAGNOSTIC = "mixed_inner_review_tool"
 
 
 _SHELL_SEPARATORS = {";", "&", "&&", "|", "||", "|&", ";;", "(", ")"}
@@ -564,8 +575,68 @@ def _shell_items(tokens):
     return _parse_items(tokens)[0]
 
 
+LEGACY_CANDIDATES_SCHEMA = "legacy-install-candidates/1"
+# While _legacy_candidates runs, every install entry the walker creates (a leaf, before any _pick_legacy
+# collapses it) is recorded with whether it was reached only on a conditional path. The classifier itself
+# is unchanged; outside _legacy_candidates nothing is recorded.
+_CANDIDATE_SINKS = []
+_CONDITIONAL_DEPTH = [0]
+
+
+def _leaf(hit):
+    if _CANDIDATE_SINKS:
+        _CANDIDATE_SINKS[-1].append((hit, _CONDITIONAL_DEPTH[0] > 0))
+    return hit
+
+
+class _conditional:
+    """Classification inside it runs only on some paths (&&/||, if/case branches, loops, possible definitions)."""
+
+    def __enter__(self):
+        _CONDITIONAL_DEPTH[0] += 1
+
+    def __exit__(self, *exc):
+        _CONDITIONAL_DEPTH[0] -= 1
+
+
 def _unknown_legacy():
-    return {"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False, "argument": None}
+    return _leaf({"schema": LEGACY_INSTALL_SCHEMA, "entry": None, "kind": None, "parsed": False, "argument": None})
+
+
+def _legacy_candidates(cmd):
+    """Every install entry the classifier can reach in ``cmd``: static candidates, not executions.
+
+    Same walker and scope rules as ``_legacy_install`` (wrappers, eval, substitutions, function scope, branch
+    union, unknown); nothing is collapsed. Each distinct ``{entry, kind, parsed, argument}`` is listed once in
+    first-seen order with ``sequential``: True when it is reached outside every conditional construct (it
+    runs whenever the command runs), False when it is only a possibility (``&&``/``||``, if/case branches,
+    loops, a possibly-defined function). ``_legacy_install(cmd)`` is always one of them. Candidates are
+    reporting facts only; they never authorize, and a conditional candidate is not a claim that it ran.
+    """
+    sink = []
+    _CANDIDATE_SINKS.append(sink)
+    saved, _CONDITIONAL_DEPTH[0] = _CONDITIONAL_DEPTH[0], 0
+    try:
+        _legacy_install(cmd)
+    finally:
+        _CANDIDATE_SINKS.pop()
+        _CONDITIONAL_DEPTH[0] = saved
+    out = []
+    for hit, conditional in sink:
+        row = {"entry": hit["entry"], "kind": hit["kind"], "parsed": hit["parsed"], "argument": hit.get("argument")}
+        if "unresolved" in hit:
+            row["unresolved"] = hit["unresolved"]
+        same = next((c for c in out if all(c[k] == row[k] for k in row)), None)
+        if same is None:
+            out.append(dict(row, sequential=not conditional))
+        elif not conditional:
+            same["sequential"] = True
+    return out
+
+
+def _tool_candidates(cmd):
+    """Conservative criterion-4 predicate: every tool or unknown candidate (sequential or conditional)."""
+    return [c for c in _legacy_candidates(cmd) if c["kind"] in ("tool", None)]
 
 
 def _pick_legacy(hits):
@@ -586,7 +657,8 @@ def _env_copy(env):
 def _run_maybe(env, run):
     """Run on a trial copy; merge every changed name back as a possibility."""
     trial = _env_copy(env)
-    hits = run(trial)
+    with _conditional():
+        hits = run(trial)
     for name, entry in trial.items():
         if env.get(name) != entry:
             before = env.get(name) or {"defs": [], "external": True}
@@ -623,24 +695,31 @@ def _classify_structure(structure, depth, env):
     definition made in one iteration reaches calls in the next). The outcomes are merged into ``env``."""
     hits, outcomes = [], []
     if "branches" in structure:
+        # The first part of every alternative (the ``if`` condition list, the ``case`` subject) always runs;
+        # every later part (branch bodies, ``elif`` conditions, case clauses) only possibly.
         for branch in structure["branches"]:
             trial = _env_copy(env)
-            for items in branch:
-                hits.extend(_classify_items(items, depth, trial))
+            for n, items in enumerate(branch):
+                if n == 0:
+                    hits.extend(_classify_items(items, depth, trial))
+                    continue
+                with _conditional():
+                    hits.extend(_classify_items(items, depth, trial))
             outcomes.append(trial)
     else:
         header, body = structure["loop"]
         trial = _env_copy(env)
-        hits.extend(_classify_items(header, depth, trial))
+        hits.extend(_classify_items(header, depth, trial))   # the first header evaluation always runs
         outcomes.append(_env_copy(trial))
-        for _ in range(_LOOP_PASSES):
-            hits.extend(_classify_items(body, depth, trial))
-            hits.extend(_classify_items(header, depth, trial))
-            if trial == outcomes[-1]:
-                break
-            outcomes.append(_env_copy(trial))
-        else:
-            hits.append(_unknown_legacy())   # no fixpoint within the bound: explicitly unknown
+        with _conditional():
+            for _ in range(_LOOP_PASSES):
+                hits.extend(_classify_items(body, depth, trial))
+                hits.extend(_classify_items(header, depth, trial))
+                if trial == outcomes[-1]:
+                    break
+                outcomes.append(_env_copy(trial))
+            else:
+                hits.append(_unknown_legacy())   # no fixpoint within the bound: explicitly unknown
     _merge_outcomes(env, outcomes)
     return hits
 
@@ -786,6 +865,10 @@ def _legacy_command(argv, i, depth, functions=None):
             i += 1   # duration operand
     if i >= n:
         return None
+    if _unresolved(argv[i]) and any(w in _LEGACY_ENTRIES or w == "drill" for w in argv[i + 1:]):
+        # The command word is an unevaluated expansion followed by a wf entry: it may run wf, so it is an
+        # explicit unknown candidate, never silently ordinary.
+        return _unknown_legacy()
     name = argv[i].rsplit("/", 1)[-1]
     if name in ("bash", "sh", "zsh", "dash", "ksh"):
         j, inline = i + 1, False
@@ -806,6 +889,8 @@ def _legacy_command(argv, i, depth, functions=None):
             j += 2 if argv[j] in ("-X", "-W") else 1
         if j < n and argv[j].rsplit("/", 1)[-1] == "wf.py":
             rest = argv[j + 1:]
+        elif j < n and _unresolved(argv[j]) and any(w in _LEGACY_ENTRIES or w == "drill" for w in argv[j + 1:]):
+            return _unknown_legacy()   # the script path is an unevaluated expansion
     if rest is None:
         return None
     k = 0
@@ -829,8 +914,8 @@ def _legacy_command(argv, i, depth, functions=None):
             else:
                 break
         if m < len(rest) and rest[m] == "review":
-            return {"schema": LEGACY_INSTALL_SCHEMA, "entry": "drill review", "kind": "inner_review",
-                    "parsed": True, "argument": None}
+            return _leaf({"schema": LEGACY_INSTALL_SCHEMA, "entry": "drill review", "kind": "inner_review",
+                          "parsed": True, "argument": None})
         return None
     if k >= len(rest) or rest[k] not in _LEGACY_ENTRIES:
         return None
@@ -847,8 +932,12 @@ def _legacy_command(argv, i, depth, functions=None):
             argument = token
             break
         m += 1
-    return {"schema": LEGACY_INSTALL_SCHEMA, "entry": entry, "kind": _LEGACY_ENTRIES[entry],
-            "parsed": True, "argument": argument}
+    hit = {"schema": LEGACY_INSTALL_SCHEMA, "entry": entry, "kind": _LEGACY_ENTRIES[entry],
+           "parsed": True, "argument": argument}
+    if _unresolved(argument):
+        # Known entry, undeterminable package: no argument, so nothing is read or frozen as if it were the path.
+        hit.update(argument=None, unresolved=argument)
+    return _leaf(hit)
 
 
 def _history_required(events):
@@ -1114,12 +1203,13 @@ def _bound_histories(inst, events, reader, *, local, tool_root, turns=(), store_
     counted.
     """
     from .live_history import collect_bound_histories, exec_binding
-    classified, inner, identities = {}, set(), set()
+    classified, candidates, inner, identities = {}, {}, set(), set()
     for event in events:
         if event.get("type") != "exec":
             continue
         if event.get("install_exec") is None:
             classified[event["seq"]] = _legacy_install(event.get("cmd"))
+            candidates[event["seq"]] = _legacy_candidates(event.get("cmd"))
             continue
         binding = exec_binding(inst, event, reader)
         key = (binding["invocation"]["turn"], binding["invocation"]["exec"]["id"])
@@ -1127,7 +1217,9 @@ def _bound_histories(inst, events, reader, *, local, tool_root, turns=(), store_
         if key in identities or nonce in identities:
             raise _InputProblem("corrupt", inst.events_path, "duplicate installation invocation identity")
         identities.update((key, nonce))
-        classified[event["seq"]] = _legacy_install(_invocation_command(inst, event, reader))
+        command = _invocation_command(inst, event, reader)
+        classified[event["seq"]] = _legacy_install(command)
+        candidates[event["seq"]] = _legacy_candidates(command)
         if (classified[event["seq"]] or {}).get("kind") == "inner_review":
             inner.add(event["seq"])
     provided = collect_bound_histories(inst, [event for event in events if event.get("seq") not in inner],
@@ -1138,9 +1230,16 @@ def _bound_histories(inst, events, reader, *, local, tool_root, turns=(), store_
         row = {"seq": event["seq"], "turn": event.get("turn"), "reference": None, "state": "unknown"}
         if bound:
             row.update(exit_code=event.get("exit_code"), interrupted=event.get("interrupted"))
+        found = candidates.get(event["seq"]) or []
+        if (legacy or {}).get("kind") == "inner_review" and any(c["kind"] in ("tool", None) for c in found):
+            # The child review stays unbound, and the tool install in the same exec stays visible.
+            diagnostics = diagnostics + [MIXED_INNER_REVIEW_DIAGNOSTIC]
         row["diagnostics"] = diagnostics
         if legacy:
             row["legacy_command"] = {k: legacy[k] for k in ("schema", "entry", "kind", "parsed")}
+        if len(found) > 1:
+            # Static candidates of this command (not executions); the single legacy_command above is unchanged.
+            row["legacy_candidates"] = [{k: c[k] for k in ("entry", "kind", "parsed", "sequential")} for c in found]
         rows.append(row)
 
     for event in events:
@@ -1174,12 +1273,13 @@ def _bound_histories(inst, events, reader, *, local, tool_root, turns=(), store_
 
 
 def _install_try(event, histories, history_entries):
-    """Criterion-4 tool attempt: structured tool reference or legacy tool entry."""
+    """Criterion-4 tool attempt: structured tool reference, or any legacy tool/unknown candidate of the
+    command (sequential or conditional). One exec event is one attempt however many candidates it has;
+    candidates never stand for executions."""
     if event.get("type") != "exec":
         return False
     if event.get("install_exec") is None or histories is None:
-        legacy = _legacy_install(event.get("cmd"))
-        return bool(legacy) and legacy["kind"] in ("tool", None)
+        return bool(_tool_candidates(event.get("cmd")))
     for row in history_entries:
         if row.get("seq") != event.get("seq"):
             continue
@@ -1188,7 +1288,24 @@ def _install_try(event, histories, history_entries):
         if row.get("reference") is None and isinstance(row.get("legacy_command"), dict) \
                 and row["legacy_command"].get("kind") in ("tool", None):
             return True
+        if row.get("reference") is None and any(
+                isinstance(c, dict) and c.get("kind") in ("tool", None) for c in row.get("legacy_candidates") or []):
+            return True
     return False
+
+
+def _exec_tool_candidates(event, histories, history_entries):
+    """The legacy tool/unknown candidates behind one criterion-4 attempt (empty for structured references)."""
+    if event.get("install_exec") is None or histories is None:
+        return _tool_candidates(event.get("cmd"))
+    out = []
+    for row in history_entries:
+        if row.get("seq") != event.get("seq") or row.get("reference") is not None:
+            continue
+        listed = row.get("legacy_candidates") or ([dict(row["legacy_command"], sequential=True)]
+                                                   if isinstance(row.get("legacy_command"), dict) else [])
+        out += [c for c in listed if isinstance(c, dict) and c.get("kind") in ("tool", None)]
+    return out
 
 
 REPORT_AUTHORIZATION_SCHEMA = "live-report-authorization/1"
@@ -1360,7 +1477,7 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None, _route=Tr
                 na={"condition": "本轮没有 wf self-update 命令", "scope": "第 4 段（审查在先）",
                     "reason": "没有安装工具版本，审查在先无从核对", "by": "live.check"})
         else:
-            vs = []
+            vs, oks = [], []
             for e in ups:
                 if e.get("install_exec") is not None and histories is not None:
                     from .live_history import entry_problem
@@ -1369,28 +1486,57 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None, _route=Tr
                                if (row.get("reference") or {}).get("target", {}).get("kind") == "tool"]
                     problems = [entry_problem(row) for row in entries]
                     unknown = [d for row in rows if row.get("reference") is None for d in row.get("diagnostics") or []]
-                    vs.append("pass" if entries and not any(problems) and not unknown
+                    good = bool(entries) and not any(problems) and not unknown
+                    vs.append("pass" if good
                               else "历史安装无法核对（" + "、".join([p for p in problems if p] + unknown
                                                                     or ["missing_receipt"]) + "）")
+                    oks.append(good)
                     continue
-                legacy = _legacy_install(e.get("cmd")) or {}
-                if not legacy.get("argument"):
-                    # Explicitly unknown: no package operand can be parsed.
-                    vs.append("旧版安装命令无法解析（unknown）")
+                candidates = _legacy_candidates(e.get("cmd"))
+                if any(c["kind"] == "inner_review" for c in candidates):
+                    # The child review is never bound; the tool install beside it cannot be checked apart.
+                    vs.append(f"同一执行里有内层审查与工具安装，无法分别核对（{MIXED_INNER_REVIEW_DIAGNOSTIC}）")
+                    oks.append(False)
                     continue
-                zp = inst.root / legacy["argument"]
-                rr = read_doc(LOCAL / "reviews" / f"{zp.stem}.result.json", {}) or {}
-                v = rr.get("verdict") or "没有记录"
-                if v in ("pass", "concerns"):
-                    if not exists(zp) or hashlib.sha256(read_bytes(zp)).hexdigest() != rr.get("zip_sha256"):
-                        v += "（版本包哈希对不上或已不在）"
-                    else:
-                        v += _review_timing(rr, e)   # 1.9.4：按安装开始的时刻比，空时刻不放过
-                vs.append(v)
-            ok4 = all(v in ("pass", "concerns") for v in vs)
+                for candidate in [c for c in candidates if c["kind"] in ("tool", None)]:
+                    # A conditional candidate is checked like any other, but never presented as executed.
+                    note = "" if candidate["sequential"] else "（条件分支候选，不代表已执行）"
+                    if "unresolved" in candidate:
+                        vs.append(f"旧版安装命令的版本包参数含未求值的 shell 展开（{candidate['unresolved']}），"
+                                  "无法确定实际文件（unresolved_operand）" + note)
+                        oks.append(False)
+                        continue
+                    if not candidate.get("argument"):
+                        # Explicitly unknown: no package operand can be parsed.
+                        vs.append("旧版安装命令无法解析（unknown）" + note)
+                        oks.append(False)
+                        continue
+                    zp = inst.root / candidate["argument"]
+                    rr = read_doc(LOCAL / "reviews" / f"{zp.stem}.result.json", {}) or {}
+                    v = rr.get("verdict") or "没有记录"
+                    if v in ("pass", "concerns"):
+                        if not exists(zp) or hashlib.sha256(read_bytes(zp)).hexdigest() != rr.get("zip_sha256"):
+                            v += "（版本包哈希对不上或已不在）"
+                        else:
+                            v += _review_timing(rr, e)   # 1.9.4：按安装开始的时刻比，空时刻不放过
+                    oks.append(v in ("pass", "concerns"))
+                    vs.append(v + note)
+            ok4 = all(oks)
             add(4, ok4, "安装前审查：" + "、".join(vs) + txnote, status="attempt_failed" if (ok4 and bad_try) else None)
         if att["total"]:
             crit[-1]["attempts"] = att
+        legacy_tools = [_exec_tool_candidates(e, histories, history_entries) for e in tries]
+        if any(legacy_tools):
+            # Static candidates, reported beside the attempt count, never as installs that happened.
+            crit[-1]["tool_candidates"] = {
+                "unit": "static legacy tool/unknown candidates; attempts.total counts exec events",
+                "execs": sum(1 for c in legacy_tools if c),
+                "candidates": sum(len(c) for c in legacy_tools),
+                "conditional": sum(1 for c in legacy_tools for x in c if not x.get("sequential", True)),
+                "bound_tool_references": sum(
+                    1 for e in tries for row in history_entries
+                    if row.get("seq") == e.get("seq")
+                    and (row.get("reference") or {}).get("target", {}).get("kind") == "tool")}
         man = [f"{e.get('type')}（{e.get('by')}/{e.get('actor') or '?'}）"
                for e in tev if _manual(e) and not bound_auto_apply(e)]
         add(5, not man, "人工改动：" + ("、".join(man[:5]) if man else "无"))
@@ -1992,13 +2138,13 @@ def _capture_inputs(inst, *, rounds=3, budget_s=300, output_contract=None):
         # the report. Structural receipts never fall back to command parsing.
         for event in events:
             if event.get("type") == "exec" and event.get("install_exec") is None and event.get("exit_code") == 0:
-                legacy = _legacy_install(event.get("cmd"))
-                if legacy and legacy["kind"] in ("tool", None) and legacy.get("argument"):
-                    # Absence is a frozen fact the report shows; it does not
-                    # abort collection of the remaining window.
-                    zp = fresh.root / legacy["argument"]
-                    source(zp, "bytes", required=False)
-                    source(LOCAL / "reviews" / f"{zp.stem}.result.json", "json", required=False)
+                # Every tool candidate the report checks (not only the first one) is frozen. Absence is a
+                # frozen fact the report shows; it does not abort collection of the remaining window.
+                for candidate in _tool_candidates(event.get("cmd")):
+                    if candidate.get("argument"):
+                        zp = fresh.root / candidate["argument"]
+                        source(zp, "bytes", required=False)
+                        source(LOCAL / "reviews" / f"{zp.stem}.result.json", "json", required=False)
         task_rows = state.get("executor_tasks", [])
         if not isinstance(task_rows, list) or any(not isinstance(x, dict) for x in task_rows):
             raise _InputProblem("corrupt", fresh.state_path, "executor_tasks must be object list")

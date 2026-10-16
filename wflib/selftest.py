@@ -156,13 +156,17 @@ def _run_gate_provider_tests():
 
 
 def _register_unittests(*classes):
-    """One _ok per test method; errors, failures, skips, expected failures and unexpected successes all fail."""
+    """One _ok per test method; errors, failures, skips, expected failures and unexpected successes all fail.
+    A class list that yields zero methods fails too (it can never vanish from the count)."""
     import io
     import unittest
     from contextlib import redirect_stdout, redirect_stderr
 
     cases = [test for cls in classes
              for test in unittest.defaultTestLoader.loadTestsFromTestCase(cls)]
+    if not cases:
+        _ok(f"unittest 登记：{', '.join(c.__name__ for c in classes)} 没有任何测试方法，按未通过处理", False, "0 cases")
+        return
     result = unittest.TestResult()
     output = io.StringIO()
     with redirect_stdout(output), redirect_stderr(output):
@@ -181,6 +185,77 @@ def _register_unittests(*classes):
             detail + output.getvalue()[-2000:] if detail else "")
 
 
+# ---------------------------------------------------------------- suite registration (C-C1-STRICT21-IMPLEMENT)
+# Every component suite is either registered below (actual entry, scope, depth policy, budget) or listed in
+# ACCEPTANCE_SUITES with the reason it is not in the regular count. Budgets are finite and measured on the
+# composed parent (Linux, one CPU; SEND 5 s, B3 fixtures 6.6 s, FX-TX 24 s, C provider focused ~5 s, aggregate
+# focused ~25 s): several times the observed time, never "no timeout".
+REGULAR_SUITES = (
+    # (label, kind, entry, depths, budget_s, reason)
+    ("A-B3-SEND", "unittest", ["wflib.selftest_b3_send:B3SendTests"], (0, 1), 300,
+     "9 unittest methods; real driver.h_send/_prepare_send/h_wait_reply against fake_transport; no Gate"),
+    ("B3 夹具自检", "okfn", "wflib.selftest_b3_fixtures:run_b3_fixtures", (0, 1), 300,
+     "custom _ok entry (not unittest); each actual _ok recorded in order, strict bool; 0 assertions fail"),
+    ("FX-TX 16 链与 CL-CT5", "fxtx", None, (0, 1), 180,
+     "own entry python -B -S -m wflib.selftest_install_fixtures --mode new (setsid child, source read-only digest);"
+     " each structured report verdict is one assertion; no Gate, no wf selftest recursion"),
+    ("C1 提供方 focused", "unittest", ["wflib.selftest_c1_providers:*"], (0, 1), 120,
+     "lane C provider adapter contract tests; not delegated by lane C (live timing is, so it is not listed)"),
+    ("C1 严格聚合 focused", "unittest", ["wflib.selftest_c1_aggregate:*"], (0,), 600,
+     "strict aggregate registry/validation/process-boundary tests; synthetic providers; spawns aggregate jobs, "
+     "so depth 0 only (never nested)"),
+)
+ACCEPTANCE_SUITES = (
+    # (label, entry, inputs, reason not in the regular count)
+    ("B3 first-upgrade recovery (Upgrade19)", "python3 -m unittest wflib.selftest_b3_first_upgrade_recovery",
+     "git objects fafef7e6 (old tree) and the candidate tree (B3_CANDIDATE_TREE) in this checkout's .git",
+     "needs historical Git objects that an installed package (no .git) and a plain clone do not carry; "
+     "missing objects make setUpClass skip, which must never count as a pass"),
+    ("FX-S06 behaviour (S06)", "python3 -m unittest wflib.selftest_b3_s06",
+     "B3_S06_LEGACY_V2 and B3_S06_LEGACY_B1: two caller-prepared full Git checkouts (never fetched here)",
+     "needs two historical full checkouts; the product selftest must not require the network or old versions"),
+)
+
+
+def _run_registered_suites():
+    """Run REGULAR_SUITES for this depth in bounded child jobs; print the acceptance-only suites (not run)."""
+    from .selftest_v18 import probe_depth
+    from . import selftest_c1_aggregate as agg
+    depth = probe_depth()
+    counts = []
+    for label, kind, entry, depths, budget, _reason in REGULAR_SUITES:
+        if depth not in depths:
+            print(f"  （深度 {depth} 不运行、不登记：{label}）", flush=True)
+            continue
+        if kind == "unittest":
+            counts.append(agg.register_unittest_job(_ok, label, entry, total_s=budget))
+        elif kind == "fxtx":
+            counts.append(agg.register_fxtx(_ok, label, total_s=budget))
+        else:
+            counts.append(agg.register_okfn_job(_ok, label, entry, total_s=budget))
+    for c in counts:
+        print(f"  {c['label']}：登记 {c.get('loaded', c.get('asserts'))}，实际运行 {c.get('run', c.get('asserts'))}，"
+              f"通过 {c['passed']}", flush=True)
+    for label, entry, inputs, reason in ACCEPTANCE_SUITES:
+        print(f"  （验收扩展，未纳入常规计数、此处未运行：{label}；入口 {entry}；输入 {inputs}）", flush=True)
+
+
+def _run_lane_c_once():
+    """Lane C runs once per run. At depth 0 inside a selftest run it ran in the strict-aggregate job child
+    (the same records the six C providers read) and is replayed here in order; otherwise it runs in-process."""
+    from .selftest_v18 import probe_depth
+    from . import selftest_c1_aggregate as agg
+    run = agg.current_run()
+    if probe_depth() == 0 and run is not None and run.lane_c:
+        agg.replay_lane_c(run, _ok)
+        return
+    from .selftest_lane_c import run_lane_c
+    run_lane_c(_ok)
+
+
+SELFTEST_CHILD_BUDGET_S = 1500 + 1500   # old cap (parent measured 431 s) + registered-suite caps (sum 1500)
+
+
 def run() -> int:
     from .selftest_v18 import ProbeDepthError, probe_depth
     try:   # before CHILD_FLAG: being inside the isolation child is never a way around the depth bound
@@ -191,18 +266,25 @@ def run() -> int:
     if os.environ.get(CHILD_FLAG) != "1":
         tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-env-"))
         try:
-            r = subprocess.run([sys.executable, str(WF_HOME / "wf.py"), "selftest"], env=child_env(os.environ, tmp / "local"),
-                               timeout=1500)
-            return r.returncode
-        except subprocess.TimeoutExpired:
-            print("自检子进程超过 1500 秒没有结束，按未通过处理", flush=True)
-            return 1
+            from .selftest_c1_aggregate import run_bounded
+            r = run_bounded([sys.executable, str(WF_HOME / "wf.py"), "selftest"], cwd=Path.cwd(),
+                            env=child_env(os.environ, tmp / "local"), timeout=SELFTEST_CHILD_BUDGET_S)
+            if r["timed_out"]:   # the whole process tree is stopped and killed, not only the direct child
+                print(f"自检子进程超过 {SELFTEST_CHILD_BUDGET_S} 秒没有结束，已结束整个进程树，按未通过处理", flush=True)
+                return 1
+            return r["rc"]
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     return _run_checks()
 
 
 def _run_checks() -> int:
+    from . import selftest_c1_aggregate as agg
+    with agg.run_scope(lane_c=True):   # one run: Gate group, 门禁基线 and the lane C replay share one execution
+        return _run_all_checks()
+
+
+def _run_all_checks() -> int:
     print(f"collab-wf 自检（{(WF_HOME / 'VERSION').read_text().strip()}，Python {sys.version.split()[0]}）")
     from .selftest_v15 import run_v15   # 1.5.0 新增检查：纯函数与解析回归，计入总数
     run_v15(_ok)
@@ -211,8 +293,7 @@ def _run_checks() -> int:
     # IC-2（批次 1）：只接入已合入 integ/batch1 的车道检查，计入总数；与上面一样运行在本子进程的隔离环境里
     # （WF_NOTIFY=0、临时 WF_LOCAL_DIR）。尚未合入的车道不在这里导入。
     print("  —— B1-C 车道检查（证据分层与不适用）——", flush=True)
-    from .selftest_lane_c import run_lane_c
-    run_lane_c(_ok)
+    _run_lane_c_once()
     print("  —— B1-B 车道检查（bootstrap 材料同源）——", flush=True)
     from .selftest_lane_b import run_lane_b
     run_lane_b(_ok)
@@ -224,6 +305,8 @@ def _run_checks() -> int:
     run_review(_ok)
     _run_install_regressions()
     _run_gate_provider_tests()
+    print("  —— 组件 suite 登记（C1 严格聚合卡）——", flush=True)
+    _run_registered_suites()
     tmp = Path(tempfile.mkdtemp(prefix="wf-selftest-"))
     env = {**os.environ, "WF_LOCAL_DIR": str(tmp / "local"), "WF_NOTIFY": "0"}   # 子进程里本来就是 0，这里照旧写明
     env.pop("VIRTUAL_ENV", None)

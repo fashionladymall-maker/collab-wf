@@ -397,9 +397,51 @@ command string. Conditions are not evaluated: commands in `if`/`case`/loop
 branches and after `&&`/`||` are counted as if they run, and definitions there
 form a set of possible definitions (conservative). Scripts, aliases, variables, `lastpipe`,
 functions defined outside the command (for example in a sourced file) and
-other indirection are not resolved. Criterion 4 counts tool references and legacy tool entries; the legacy
-report path reads the parsed first package operand and reports
-`旧版安装命令无法解析（unknown）` when none exists. A missing legacy package or
+other indirection are not resolved. Criterion 4 counts tool references and legacy tool entries (C4-MULTI-INSTALL):
+
+- The single classification `_legacy_install` is unchanged (same `kind` and
+  `argument`; an inner review anywhere wins, then the first parsed entry, then
+  unknown). It still decides `legacy_command`, and an inner review still keeps
+  the whole exec away from B's provider.
+- `_legacy_candidates(cmd)` lists every install entry the same walker reaches
+  (wrappers, `eval`, substitutions, invoked functions, branch union, unknown),
+  each once, with `sequential`: true when it lies outside every conditional
+  construct, false when it is only possible (`&&`/`||`, if/case branches and
+  `elif` conditions, loop bodies, possibly-defined functions). The if
+  condition, the case subject and a loop's first header run. Candidates are
+  static facts, not executions, and never authorize. History rows carry
+  `legacy_candidates` (entry/kind/parsed/sequential) only when a command has
+  more than one.
+- An exec is a criterion-4 attempt when it has a structured tool reference or
+  any tool/unknown candidate, sequential or conditional, so neither the order
+  of commands nor an inner review hides a tool install. `attempts.total` keeps
+  its unit: exec events with a tool attempt plus unbound transactions; it is
+  never derived from candidates. A `tool_candidates` block next to it reports
+  `execs`, `candidates`, `conditional` and the really bound
+  `bound_tool_references`.
+- Without a receipt the report checks every tool candidate's package operand
+  (`旧版安装命令无法解析（unknown）` when none can be parsed) and frozen review
+  result; a conditional candidate is marked `条件分支候选，不代表已执行`. An exec
+  with an inner review and a tool candidate gets the diagnostic
+  `mixed_inner_review_tool` and fails criterion 4: the child review stays
+  unbound and the tool install cannot be checked apart from it. Every tool
+  candidate's package and review result is frozen; a later change makes the
+  old descriptor stale.
+- Package operands are never evaluated (C4-OPERAND-FAILCLOSED). The lexer drops
+  quotes and keeps expansion syntax, so an operand containing `$` (variables,
+  `${...}`, `$(...)`), a backquote, a glob (`*`, `?`, `[`), a brace or a leading
+  `~` cannot be mapped to the file Bash would pass (a variable's value, a glob's
+  matches, or the literal itself when quoted). Such a candidate keeps its entry
+  and kind, has no `argument` and carries `unresolved` with the raw word;
+  nothing is read or frozen under that name, and criterion 4 fails with
+  `unresolved_operand`, whatever file or review exists under the literal name.
+  Compatibility: a quoted or escaped literal such as `'[ab].zip'` is treated the
+  same way (it cannot be told from the unquoted glob), so legacy entries with
+  such package names are no longer verified and fail closed. `$'...'` text and
+  plain names stay resolved; candidates inside command substitutions are kept.
+- A command word (or the script of `python wf.py`) that is such an expansion and
+  is followed by a wf entry (`$W self-update x.zip`, `"$(command -v wf)" apply
+  p.zip`) is an explicit unknown candidate instead of an ordinary command. A missing legacy package or
 review result is frozen as an absent source and reported (`没有记录` /
 `版本包哈希对不上或已不在`) instead of aborting the whole collection. Project legacy entries are
 visible as unknown history rows and block authorization.
