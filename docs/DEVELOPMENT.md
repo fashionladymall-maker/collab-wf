@@ -57,6 +57,245 @@ C1 provider 格式为 c1-provider/1。每个必需类别要实际运行至少一
 
 正式 R1 要有连续三轮真实链路及规定段证据，U1 前置满足后由用户最终确认。任何模拟、局部绿灯或缺失日志都不补作正式验收。T3 退出后的常驻唤醒与接管未验证前，不能宣称已无人值守运行，也不能停用原执行端。
 
+## 2026-10-15 契约修订（MAIN-CONTRACT-B3）
+
+本节取代上文"截至代码基线 96f0321…"一段中关于进度的描述，那一段保留为历史记录。机读内容见 BATCH2_CONTRACT.json 中的 revision、acceptance_levels、acceptance_records、open_defects、frozen_exceptions、active_cards 与 task_protocol。
+
+### 当前基线
+
+- **integ/batch2**：b523be4（tree 0d4ce5ad），PR1–31 已合入。本卡在 Linux 上复现完整自检为 636/636。
+- **PR32**：71514c1，尚未合入。
+  - 它与 batch2 的组合 tree 为 094cba73。本卡在 Linux 上复现 lane C 182/182、完整自检 665/665，组合树比 batch2 恰好多出 29 项 C5 检查。
+  - GPT 报告该 tree 在 Linux 与 m4 上完整自检均为 665/665、安装历史 16/16；其中 m4 结果本卡没有复现。
+  - **机械全绿不等于可以合入。** P1-1（目标授予依赖否定式的 synthetic 声明）和 P1-2（driver 真实落地没有 exec 回执）仍然阻止合入。
+
+### 验收层级
+
+| 层级 | 含义 |
+|---|---|
+| L0 | 合成证据：夹具、替身审查器或 verifier、探针 |
+| L1 | 模块级：单张卡的定向测试 |
+| L2 | Linux 集成：组合树上的总聚合自检加反例 |
+| L3 | 目标 Mac：m4 上用真实 Python 3.9 运行 |
+| L4 | 批次 3 正规候选：尚未开始 |
+| L5 | 生产：真实安装、R1 连续三轮、U1 用户确认；未授权 |
+
+规则：
+- 各层级不能互相替代。
+- 他方报告的结果必须注明来源，并标明是否经过本方复现。
+- 任何合成结果都不能被引用为生产就绪的依据。
+
+### 所有权、冻结例外与并行
+
+- **补登记 owner。** B2 期间新增或改动但未登记的文件现已补登：
+  - A：drill.py、driver_review.py 及其测试；
+  - B：install_history.py、安装与审查测试；
+  - C：live_history.py 与 C5 测试（这几项目前只在 PR32 上，尚未合入）。
+- **未分配的旧模块。** B2 从未触碰的 1.9.7 模块目前没有 owner，任何改动之前都必须先登记卡片和 owner。
+- **docs/REVIEW.md 只能由已登记的 B 卡修改。** 它的字节会被绑定进每次审查请求，一旦改动，已有审查的复用就会全部失效。
+- **MANIFEST.json。** 开发分支上的 MANIFEST.json 仍是 1.9.7 的发布清单，只在候选阶段于临时副本中重建。
+- **冻结文件 ops.py 的例外。**
+  - PR31 的改动属于事后补登：它在登记例外之前就已合入 batch2。
+  - 那次改动之后，每个 exec 事件都带有 install_exec（包括非安装命令）。回执文件描述符和 nonce 对整个 `bash -c` 进程树可见，因此回执只能用于关联，不能作为来源证明。
+  - D1 卡对 ops.py 的改动正在进行，条件是：不得改变非安装命令的行为，除非有测试覆盖；必须单独提 PR 并接受 GPT 独立审查。
+  - D1 同时持有 B 线 release.py 的写租约；在 D1 合入或撤回之前，B 线不写 release.py。
+- **进行中的卡片（文件互不重叠）。**
+  - G1：goals.py、live.py、C5_HISTORY.md，以及新的信任测试。
+  - D1：driver.py、driver_review.py、release.py、ops.py，以及新的身份测试。
+  - MAIN-CONTRACT-B3：本文、契约 JSON、B3_FIXTURES.md、b3_fixtures.py 及其测试。
+  - 以上两个对话 ID 来自 MAIN 消息，本卡未作核验。
+- **排队中的卡片（只是提议，须由 MAIN 派发后才开始）。**
+  - C-L1：旧式安装写法被丢弃（GPT-CT5）。
+  - A-DR1：drill 被拦截或超时但外层 exit 0 时漏记尝试（GPT-CT3）。
+  - C-TX1：没有回执的失败事务被隐藏（CL-CT5）。
+  - A-B3-SEND：accepted 发送意图崩溃保护与 NO_REF 调整。
+
+### 任务与证据协议的现状
+
+**已有能力：**
+- `wf task` 支持 list、done、cancel、supersede、progress。
+- 每个待办带代次（generation）和修订号（rev）；修改时必须带上当前代次。
+- done 必须写非空结果。
+- `--evidence` 可以是项目内的文件（记录相对路径和 sha256），也可以是一个 64 位十六进制摘要。
+
+**尚不存在：**
+- 没有认领（claim）或租约动作。
+- 证据不绑定 commit、tree、命令、解释器、环境、退出码、计数或耗时。
+- 裸摘要被直接接受，不核实它摘要的是什么。
+- 没有跨机器或平台的执行背书。
+- 开发卡片不是 wf 待办，它们只在对话和 PR 中跟踪。
+
+因此，在这样的协议真正实现并通过测试之前，不得把 task claim/done 称为证据协议。本契约中的记录属于文档，不是经机器核验的证据。
+
+### 测试环境规则（增补）
+
+- 以非 root 身份、在独立会话（setsid）中运行。
+- 使用没有启动 `.pth` 钩子的解释器。注意，PATH 上的 `python3` 同样会影响结果，不只是 `sys.executable`。
+- 使用私有的解释器路径，并在每次运行前后记录它的整树摘要。本次复核期间，一条共享的 /opt 路径曾被另一个执行者替换。
+- 每条记录都要绑定 commit、tree、命令、解释器摘要、退出码、计数、耗时和日志摘要。
+
+### B3 合成夹具
+
+见 B3_FIXTURES.md。
+
+- 生成器分两层：第一层只用标准库、可按字节复现；第二层在隔离子进程中复用 B2 的合成审查夹具。
+- 它覆盖的状态包括：旧宿主首次升级、NO_REF、accepted 意图崩溃、额度阻塞、dirty 变体、旧版实景记录、安装事务的各种中间态、回滚目标缺失、事件损坏，以及审查过期、事后拦截、verifier 变更。
+- 它的证据最多到 L0/L1，没有登记进总聚合；它从不接触真实 local、WorkBuddy、原 dirty 或第 149 轮。
+
+## 2026-10-16 FX-R 修订（B3-MAIN-FXR-20261016-1）
+
+本节在 2026-10-15 修订的基础上更新当前基线与卡片状态，旧内容保留为历史。
+
+### 当前基线
+
+- **PR33**：head d01192d0b9e9f444238e5dcbf34499544198329a，tree 3e72a969241e4b095be5058615538a5f494753af，仍是 draft。本卡只通过 git fetch 核对了 head 和 tree。
+  - 它包含 G1（0235bf5）、D1（10d15c8、7b85f45），以及 d01192d"enumerate legacy and failed install attempts"。
+  - **GPT 报告**：Linux 与 m4 上用真实 Python 3.9.6 运行总自检为 719/719；G1/D1/C5/history/commit 为 44/44，edges 为 8/8，全部 exit 0。以上数字本卡**没有复现**。
+- **正在进行**：C 线在修 C-TX1（无 exec 的失败事务），AB 车道在做 A-B3-SEND。本卡不写 live、driver、ops。
+- **MAIN-CONTRACT-B3**：原提交 308e99e（tree f680a141）已被 MAIN 回收为本地 4bf3d5a，正在接受独立审查。本卡的改动以 308e99e 为父提交。
+
+### 夹具等级与验收层级
+
+夹具分为"布局"、"字段"、"行为"三个等级，三者给出的证据都只到 L0/L1，具体分类见 B3_FIXTURES.md。
+
+- "行为"只表示表中列出的那一个消费者函数，在合成输入上给出了预期结论。
+- L4 是在正式候选包上做的真实演练，任何夹具等级都不能替代，也不能写成"B3 已验收"。
+
+### FX-R 结果
+
+- **第二层依赖契约**：
+  - 静态层钉住 14 项源码指纹，在写入夹具之前检查；
+  - 行为层在子进程内运行时检查，即使有人只刷新了指纹，替身一旦不再自报 synthetic 也会被拦下。
+- **修复的真实反例**：
+  - CX2：TMPDIR=/ 会让"只写临时目录"的护栏失效；
+  - CX3：清单不记录目录，删除 0700 空安装库后察觉不到。修复后新增了 `verify()`。
+- **经核实不是反例**：第二层子进程中的 PathLike 写入本来就会被审计钩子拒绝，本次只补了回归测试。
+- **定向测试**：Linux 上 3.9.25 与 3.12.3 均为 45/45，PR33 叠加线上 3.9.25 为 45/45；用新测试运行原版生成器为 34/37、rc=1。
+
+### 卡片
+
+- **进行中**：C-TX1（C 线）、A-B3-SEND（AB 车道）、FX-R（本卡）。
+- **下一张小卡**：FX-S06 与 FX-TX，其接口与验收标准见 B3_FIXTURES.md。
+- **仍在排队的提议**：FX-SEQ、FX-SEND、FX-UPG、FX-AGG、FX-MAC，须由 MAIN 派发后才开始。
+
+## 2026-10-16 GUARD 返工（B3-MAIN-GUARD-20261016-1）
+
+独立审查在 4bf3d5a 上发现三个真实反例，本卡先在 FX-R 版（5a3daed）上逐一复现，再做最小返工。owner 仍是同样五个文件。
+
+| 反例 | 现象 | 修复 |
+|---|---|---|
+| GUARD-R1 | `generate()` 接受了当前配置的空 LOCAL 及其子目录 | 根目录不得是 LOCAL 本体、其子目录或其祖先目录；同时按词法与规范形式比较，覆盖符号链接别名；在任何写入之前拒绝 |
+| GUARD-R2 | `_Writer.mkdir("../outside")` 越过根目录建了目录 | 四个写原语共用同一条路径规则 |
+| GUARD-R3 | 审计前缀下的普通孙进程能写到根目录之外 | 子进程只允许启动 git 与两个替身脚本；文档改为如实描述"进程内控制，不是 OS 沙箱" |
+
+- **定向回归**：Linux 上 3.9.25 与 3.12.3 均为 51/51，PR33 叠加线上 3.9.25 为 51/51；用新测试运行旧版生成器为 46/51、rc=1。
+- **说明**：以前正常的 36/36 和 45/45 都覆盖不到这三个反例。这再次说明：只有"机械通过"、没有专门的反例，并不能证明边界是安全的。
+- **边界与层级**：本卡不涉及生产安装、第 149 轮、原 dirty 或权限修改；证据层级仍为 L1，不是 L4。
+
+## 2026-10-16 SEQ 卡（B3-MAIN-SEQ-20261016-1）
+
+**更正：** "没有消费者拒绝重复 seq"这一说法有误，此前给 FX-SEQ 提出的"缺号放行"建议也一并撤回。
+
+**实际情况：**
+- 语法层的 `live._strict_log` 单独接受重复 seq；
+- 完整消费者 `_capture_inputs` 与 `_revalidate_inputs` 对重复或倒序的 seq 判为 corrupt；
+- 对"state 领先"和"内部缺号且 state=max"判为 unknown；
+- batch2 与 PR33 中的这段规则完全相同。
+
+**新增测试：** 用最小的隔离真实 scaffold，覆盖连续、重复、倒序、state 领先、事故续写、正常续写六类 case，详见 B3_FIXTURES.md 的 SEQ 节。
+- 事故类 case 只在真实 save 与真实 append 之间发送 SIGKILL；
+- 每个 case 都报告实际调用的 API、状态和原因，并确认授权没有被错误获得。
+
+**`check()` 在两条线上不同：** PR33 版仅在事件中含带 `install_exec` 的 exec 时才经由采集；batch2 版直接读日志，因此不计为拒绝者。
+
+**策略保持失败关闭：**
+- core 可以在事故后继续写入；
+- 但在没有可验证的恢复证据时，LIVE 授权判为 unknown；
+- 不得放宽为"严格递增且 state=max"，也不得重排、重编号或修补原日志。
+
+**结果：** batch2 线 57/57，PR33 叠加线 58/58。本卡没有修改 live、core、goals 或聚合入口；证据层级为 L1。
+
 ## 模型调用
 
 架构、可信边界、复杂恢复和依赖绑定采用 Claude Opus 5.5 最高努力；范围明确的普通卡采用高档。GPT 以 6.1 系列适当档位做独立审查与集成，高风险边界增加 Astra 反证。实际模型与努力档记录应如实区分当前运行配置、UI 选择和后端可信背书；不能把 UI 选择当成平台 attestation，也不能声称未实际切换的档位。
+
+## 2026-10-16 候选修订（B-CANDIDATE-DOCS-20261016-1）
+
+本节与 `BATCH2_CONTRACT.json` 的 `candidate_revision` 对应，是 1.9.8 候选的当前说明。前面各节是截至
+`B3-MAIN-SEQ-20261016-1` 的历史记录，原样保留来源；其中“进行中、排队、未完成”的状态不是当前事实，以本节为准。
+本节没有提到的历史项保持原记录，本修订不重新核实；已记录的失败与未知不抹除。本节不凭文档宣称任何任务完成。
+
+### 基线与写入者
+
+- 基线 PR46 `17b9c535001093dfa691f74296bde0ad2091d21d`，tree `a09580de371cba40fc54f4af5e232e623b96adf6`
+  （分支 `fix/driver-selftest-regression-20261016`）。PR45 `b5efa9e7` 是它的祖先，直接父提交是 `be27c603`。
+- 唯一集成写入者是 root/T3；本卡期间没有其他文档实现者。本文件与 `BATCH2_CONTRACT.json` 仍归 MAIN，本卡只有一次性 B 文档租约，交付后释放，不转移任何产品代码所有权。
+
+### 恢复的历史
+
+PR35–44 吸收审计确认，PR36 的这两份文档从未被组合纳入，也没有经批准的后继替代。现从 PR36 最新 head
+`98b77f85c812`（tree `e45a1a7ec653`）逐字节恢复，只在其后追加。基线上这两份文件仍是合并基点 `d01192d0` 的版本，所以没有覆盖任何后来的文字。
+
+### 已纳入候选（纳入不等于验收）
+
+- PR35 首次升级代码恢复（B）、PR37 发送崩溃防护与 NO_REF（A）、PR38 七类旧提供方共享结构（A）、PR41 FX-TX（B）、
+  PR42 S06（C）、PR43 B 提供方、PR44 C 提供方，均以精确文件或明确后继纳入候选；PR39、PR40 是候选祖先。
+  依据是 root 的吸收审计；本卡只核对了相关文件在基线中存在。
+- PR46 只有两处改动：gate 测试夹具不再携带受保护的 policy；刷新 S06 审查过的 `_capture_inputs` 接口指纹。两者都没有放宽安装或回滚。
+
+### 自检接入（按基线源码）
+
+- `wf selftest` 的常规套件（`wflib/selftest.py` 的 `REGULAR_SUITES`）：A-B3-SEND（9 项）、B3 夹具、FX-TX 16 条链与 CL-CT5、
+  C1 提供方 focused、C1 严格聚合 focused（只在深度 0）。另运行 `selftest_gate_provider.GateProviderTests`（6 项）。
+- `selftest_v18` 的“门禁基线”组以一项断言计入本次运行的严格 21 类聚合（只在深度 0）。21 类的产品职责与提供方不变。
+- 验收套件不计入常规计数：Upgrade19 需要历史 Git 对象，S06 需要两份历史完整检出；跳过永远不算通过。
+- 先前“B3 发送/夹具套件未接入”“21 类未实现”的说法由此取代。已发生的 MAIN 聚合兼容卡记为已完成的限定跨线租约，
+  不是长期同时写入许可；哪些提交在该租约下写成，git 元数据里没有记录，保持未知。
+
+### 所有权补登记
+
+只登记基线中真实存在、有来源提交的文件，沿用各车道既有职责，不改变任何旧 owner：
+
+| 文件 | owner | 来源 |
+|---|---|---|
+| tools/b3_first_upgrade_recovery.py、wflib/selftest_b3_first_upgrade_recovery.py、docs/B3_FIRST_UPGRADE_RECOVERY.md | B | b8c1279（PR35） |
+| wflib/install_fixtures.py、wflib/selftest_install_fixtures.py | B | b8c1279（FX-TX，PR41） |
+| wflib/selftest_b3_send.py、docs/B3_SEND.md | A | 7cd80b5（PR37） |
+| wflib/selftest_driver_install_identity.py | A | 10d15c8（D1，原记录为 A 车道） |
+| wflib/selftest_c5_trust.py | C | 0235bf5（G1，原记录为 C 车道） |
+| wflib/selftest_b3_s06.py | C | cf309a7（FX-S06，PR42） |
+| wflib/selftest_c1_providers.py、wflib/selftest_c1_live_timing.py | C | 665b7ec（PR44） |
+| wflib/selftest_c1_aggregate.py | C | b8ac61d（C-C1-STRICT21-IMPLEMENT） |
+| wflib/selftest_gate_provider.py | C | 89dd046（C-B3-GATE-PROVIDER） |
+| VERSION、CHANGELOG.md、docs/WORKFLOW.md、docs/CAPABILITIES.md | B | 本卡派发 |
+
+`bin/wf` 与 `docs/` 下其余未登记的文档没有找到来源，owner 保持未知；`frozen` 与 `unassigned_legacy` 列表不变。
+
+### 版本
+
+- `VERSION` 改为 1.9.8，作为候选阶段对冻结文件的明确例外。远程与本地都没有 git 标签，远程引用不含 1.9.8，
+  CHANGELOG 历史止于 1.9.7；1.9.8 只出现在 `wflib/b3_fixtures.py` 的合成命令字符串里。候选身份由 root 记录。
+- `MANIFEST.json` 不由本卡修改，仍写 1.9.7，由 root 的正规 BUILD 重新生成。
+
+### 任务协议
+
+与上次记录相同：原生待办有代次、rev、进度与完成；没有 claim，没有跨机或平台的执行证明，裸 64 位十六进制摘要不核验其内容。本修订不新增引擎或协议。
+
+### 证据层级与已有证据
+
+开发证据（L0–L3）、L4 正式候选、真实 LIVE（L5）与最终用户验收分层不变；最终用户验收 U1 由用户本人确认，不由模型代签。
+以下是 root 记录的输入，本卡没有复跑，都不是 1.9.8 安装包的 L4：
+
+- Linux 无 .pth venv 全量 990/990：运行于 `be27c603`，早于 S06 指纹提交 `17b9c535`，缺完整运行元数据。
+- m4 Apple Python 3.9.6 / Bash 3.2：987/990，3 项只适用于 Bash 5.2 的探针被明确跳过，不计为通过。
+- strict21 21/21；Gate 深度 0 为 45 项、深度 1 为 43 项、更深退出码 3；C4 独审通过；C5 Linux 229/229；S06 在 `17b9c535` 上 8/8。
+- Upgrade19 19/19 的对象是历史 tree `3e72a969`，不属于 `17b9c535` 或新包；恢复实现为限定范围的 PASS。
+
+### 尚未完成
+
+- 真实独立 review 来源。
+- 最终候选上的全量自检与默认门禁；正规 MANIFEST 与 ZIP。
+- 最终包的首次升级与恢复；有状态的安装→回滚→重装（L4）。
+- 正式三轮 LIVE、真实双项目、接管。
+- 生产、149、原 dirty 工作区与停用 WorkBuddy：本卡未获批准。
+- 五项原 dirty 的实际处置另行决定；文档只映射候选机制，缺来源、作者、授权的字段保持未知。

@@ -1,5 +1,70 @@
 # CHANGELOG（collab-wf）
 
+## 1.9.8 — 2026-10-16（候选，未发布）
+
+本条目只写候选源码（PR46 `17b9c535` 加本版本号与文档修订）实际具备的机制，每条注明来源符号与回归；证据层级见末尾。
+这是候选条目，不是正式发布，也不代表通过了最终验收或接管了生产。
+
+发送与身份
+- 发送槽租约按项目（名称与规范化 root）、轮次与唯一 lease_id 授予与精确释放，不借用他人 token；外发前持久写入标记，
+  收养只认租约自身的标记，不认适配器日志。〔arbiter.acquire / release / mark_sending；selftest_lane_a 的
+  _t_legacy_no_adopt、_t_crash_points、_t_adopt_proof_table、_t_unknown_no_adopt、_t_no_borrow、_t_mark_fail、_t_log_irrelevant〕
+- 发送结果不明、已接受但登记未完成：保留意图，只轮询核对，不重发、不取新租约。缺 ref 时只凭本轮持久证据按时刻与正文
+  定位，定位前重核外发正文身份，否则按 NO_REF 停下。〔driver._verify_pending / _accepted_unfinished / _ref_less_locate /
+  _sent_message；selftest_b3_send.B3SendTests 9 项，已登记为 wf selftest 常规套件 A-B3-SEND〕
+- 执行端待办以（项目、编号、代次）为身份，修改带 rev 校验；“被打断”之后先记“已恢复”才能完成。〔tasks.add / done /
+  progress / close；selftest_lane_a 的 _t_a1_identity、_t_a1_stale_cas、_t_a1_aba、_t_a1_interrupt、_t_a1fix_* 等〕
+
+恢复与额度
+- 暂时故障与额度用尽进入统一恢复期（recovery/1）：额度默认最长 8 天（691200 秒）、12 次，暂时故障 4 小时、24 次；
+  policy 只能调小；记录损坏时失败关闭；只有“发送已接受”或“回复已落地”能结束恢复期。〔recovery.DEFAULTS / note /
+  close / limits；selftest_lane_a 的 _t_a2_recovery_unit、_t_a2_concurrency、_t_a2r2_*〕
+- 额度等待（QUOTA_WAIT）到期回到原步骤：发送时退出码 3 按适配器契约视为未接受，清掉本次意图、按本次令牌释放发送槽，
+  等待后再发；等回复时的退出码 3 保留原对话、ref 与意图，回到等回复继续核对，不重发。等待时刻：重置时刻在未来则至少
+  等 60 秒，否则第 k 次等 min(2^(k−1), 24) 小时，不越过恢复期截止；计算出错时兜底约 1 小时。〔recovery.quota_until；
+  driver.h_send / h_wait_reply / _anomaly / h_quota_wait；selftest_lane_a 的 _p_quota_pos、_p_quota_neg〕
+- 驱动器不自动切换账户或资源，也没有自动跨资源迁移；经用户授权的人工切换车队/账号、开新对话照 WORKFLOW 第 10 节交接，
+  并保留原对话用于核对在途消息。
+
+安装与审查
+- 项目安装（apply）与工具升级（self-update），手动与自动，一律要求 review_id，未审查即拒绝（unreviewed_install）。
+  〔release._review_source / apply_zip / self_update 的检查；selftest_lane_b 的 2S-unverified-install 提供方含“没有
+  review_id”拒绝用例〕回滚按 baseline 资格进行（release 的 baseline_id）；本卡未核实其专属回归名，不在此列出。
+- 首次升级（1.9.7 安装器不写验证基线）的代码恢复工具 tools/b3_first_upgrade_recovery.py。〔selftest_b3_first_upgrade_recovery
+  （Upgrade19），属验收套件，需要历史 Git 对象，不计入常规 wf selftest〕
+
+验收分层与历史
+- 机械通过与实景 verified 分层；实景授权需要冻结采集、真实安装历史与宿主正向生产信任登记；无执行回执的安装事务与
+  legacy 安装入口一律可见并阻断授权。〔live._evaluate_snapshot、production-trust/1、install-transactions/1、
+  _direct_history_route；selftest_c5_trust（本树 28 个测试方法）〕
+- legacy 安装命令：shell 作用域按 if/case/循环分支取可能定义的并集；criterion 4 看到每条命令中的全部工具候选（顺序、
+  内层审查都不能藏住工具安装），按 exec 计数；含未求值 shell 展开的包参数视为 unresolved，失败关闭。〔live._classify_structure /
+  _legacy_candidates / _tool_candidates / _unresolved；selftest_c5_trust 中对真实 Bash 5.2 的矩阵与反例〕
+- 新建项目默认两道只读门禁（工具自检、行为探针）；探针嵌套有界。〔admin.INIT_GATES；selftest_v18 的
+  real_default_gates_provider、selftest_gate_provider.GateProviderTests 6 项〕
+- C1 严格 21 类聚合：wf selftest 在深度 0 运行一次，结果以“门禁基线”一项计入。〔selftest_c1_aggregate、
+  selftest_c1_providers、selftest_v18._t_strict21_baseline；wflib/selftest.py 的 REGULAR_SUITES〕
+
+隔离夹具
+- 纯合成 B3 状态夹具与依赖契约（不是 OS 沙箱）；完整安装事务行为夹具 FX-TX（16 条真实链与 CL-CT5）；S06 行为夹具。
+  〔wflib/b3_fixtures.py、docs/B3_FIXTURES.md、selftest_b3_fixtures；wflib/install_fixtures.py、selftest_install_fixtures；
+  selftest_b3_s06。前两者已登记为 wf selftest 常规套件；S06 属验收套件，需要两份历史完整检出，不计入常规计数〕
+- PR46：gate 测试夹具不再携带受保护 policy；S06 审查过的 _capture_inputs 接口指纹刷新。两者都不放宽安装或回滚。
+
+已有证据（输入来源，本卡未复跑）
+- Linux 无 .pth venv 全量 990/990：运行于 be27c603，先于 S06 指纹提交 17b9c535，且缺完整运行元数据；不作为本候选的全量验收。
+- m4 Apple Python 3.9.6 / Bash 3.2：987/990，3 项只适用于 Bash 5.2 的探针被明确跳过；跳过不计为通过，也不是全绿。
+- strict21 21/21、Gate 深度 0 为 45 项 / 深度 1 为 43 项 / 更深退出码 3、C4 独审通过、C5 Linux 229/229、S06 在 17b9c535
+  上 8/8：均为隔离开发证据，不等于本版本安装包的 L4。
+- Upgrade19 19/19 的对象是历史 tree 3e72a969…，不属于 17b9c535 或本次新包；恢复实现为限定范围的 PASS。
+
+尚未完成（本版不宣称）
+- 最终候选上的全量与默认门禁验证、正规 MANIFEST 与 ZIP 构建，均待 root 在正规 BUILD 上执行。
+- 最终包的首次升级与恢复、有状态的安装→回滚→重装（L4）尚未在最终包上实际执行。
+- 真实独立 review 来源未就绪；synthetic 审查与 selftest registry 只是合成对照，不是生产平台 attestation。
+- 正式三轮 LIVE（wf live-check --rounds 3）、真实双项目、接管均未闭合；最终用户验收（U1）由用户本人确认，不由模型代签。
+- 生产环境、149、原 dirty 工作区的实际处置与停用 WorkBuddy 未获批准，本版不涉及。
+
 ## 1.9.7 — 2026-10-14
 
 1.9.6 作废：第 140 轮安装前审查（另一个模型系列）结论 block——声明“读取故障不消耗等待窗口”，但发送待确认的窗口与
