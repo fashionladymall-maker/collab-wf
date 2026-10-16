@@ -871,7 +871,7 @@ S06_INTERFACES = {
     "wflib/goals.py::_live_binding_valid": ("7c4b8274845819c5cbf963feec8d054a0a3017c7514bbc50ba7dd9202f49a2c5",
                                               "6ddfa762f6680aba7d56eabe0044f417141c22019a3f9a6a477971a25b8703e1"),
     "wflib/live.py::_capture_inputs": ("04b9148e0b43532757f82f9f8d3550bc044af262e05929e8fd8c94e079347026",
-                                         "54d7ba2345a61a41e7f3b657ad36ab6d16c36fdefe3368800f9616edc6bf91e7"),
+                                         "2284aed8cec632c0c4b6ef488dc53bff59ded0a55377292b7c98a959f597e9b9"),
     "wflib/live.py::_evaluate_snapshot": ("9d88f1efd949621e61b6857b5b026b0eda0cc1049d44aa0cbb4a81bac7f75bf6",
                                             "7b2ed444bece40ebc83a68043bbcf82b7948edb62ebc95c2857041447ef44e11"),
     "wflib/live.py::_revalidate_inputs": ("1da1c5b92dc7f755d34f5510d3823c836be52410fb2e70fe552a24fe3f4764da",
