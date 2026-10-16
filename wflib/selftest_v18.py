@@ -1843,7 +1843,9 @@ def _t_real_default_gates(_ok):
     from . import selftest_c1_aggregate as agg
     run = agg.current_run()
     state = None
-    if run is None:
+    # The run's record is the result of the genuine registered provider only; a replaced registry entry (a
+    # test double, a patched provider) is called itself and never answered from the run.
+    if run is None or C1_PROVIDERS.get(GATE_CATEGORY) is not real_default_gates_provider:
         res = C1_PROVIDERS[GATE_CATEGORY]()
     else:
         rec = run.ensure()

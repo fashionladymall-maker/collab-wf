@@ -1424,6 +1424,17 @@ class GateSelectorTests(_NoExport):
         self.assertIn("len(active_groups(1))", src)
         self.assertNotIn("len(TESTS)", src)
 
+    def test_replaced_gate_provider_is_called_even_inside_a_run(self):
+        from . import selftest_v18 as v18
+        bad = {"schema": SCHEMA, "category": v18.GATE_CATEGORY, "provider": "C", "error": "boom", "cases": []}
+        with run_scope(lane_c=False) as run, \
+                unittest.mock.patch.object(AggregateRun, "ensure", side_effect=AssertionError("run consulted")), \
+                unittest.mock.patch.dict(v18.C1_PROVIDERS, {v18.GATE_CATEGORY: lambda: bad}):
+            rec = []
+            v18._t_real_default_gates(lambda n, c, d="": rec.append(c))
+        self.assertEqual(rec, [False])
+        self.assertEqual(run.executions, 0)
+
     def test_invalid_depth_exits_3_before_spawning(self):
         for argv, child_flag in ((["self-check", "--probes"], "WF_PROBE_CHILD"), (["selftest"], "WF_SELFTEST_CHILD")):
             for value in ("2", "-1", "01", "", "x"):
