@@ -2,7 +2,7 @@
 
 ## 1.9.8 — 2026-10-16（候选，未发布）
 
-本条目只写候选源码（PR46 `17b9c535` 加本版本号与文档修订）实际具备的机制，每条注明来源符号与回归；证据层级见末尾。
+本条目只写候选源码（PR46 `17b9c535` 加本版本号、文档及下述自检修订）实际具备的机制，每条注明来源符号与回归；证据层级见末尾。
 这是候选条目，不是正式发布，也不代表通过了最终验收或接管了生产。
 
 发送与身份
@@ -39,7 +39,7 @@
   _direct_history_route；selftest_c5_trust（本树 28 个测试方法）〕
 - legacy 安装命令：shell 作用域按 if/case/循环分支取可能定义的并集；criterion 4 看到每条命令中的全部工具候选（顺序、
   内层审查都不能藏住工具安装），按 exec 计数；含未求值 shell 展开的包参数视为 unresolved，失败关闭。〔live._classify_structure /
-  _legacy_candidates / _tool_candidates / _unresolved；selftest_c5_trust 中对真实 Bash 5.2 的矩阵与反例〕
+  _legacy_candidates / _tool_candidates / _unresolved；selftest_c5_trust 中对真实 Bash 3.2/5.2 的矩阵与反例〕
 - 新建项目默认两道只读门禁（工具自检、行为探针）；探针嵌套有界。〔admin.INIT_GATES；selftest_v18 的
   real_default_gates_provider、selftest_gate_provider.GateProviderTests 6 项〕
 - C1 严格 21 类聚合：wf selftest 在深度 0 运行一次，结果以“门禁基线”一项计入。〔selftest_c1_aggregate、
@@ -50,6 +50,9 @@
   〔wflib/b3_fixtures.py、docs/B3_FIXTURES.md、selftest_b3_fixtures；wflib/install_fixtures.py、selftest_install_fixtures；
   selftest_b3_s06。前两者已登记为 wf selftest 常规套件；S06 属验收套件，需要两份历史完整检出，不计入常规计数〕
 - PR46：gate 测试夹具不再携带受保护 policy；S06 审查过的 _capture_inputs 接口指纹刷新。两者都不放宽安装或回滚。
+- 候选自检修订：driver review 的两个真实子进程从受验工具目录启动，避免安装器从外部目录运行自检时导入失败。
+  三个 shell oracle 在真实 Bash 3.2 和 5.2 上执行相同矩阵与断言；未验证版本仍跳过且不计为通过。原先的 Mac
+  987/990 记录保留为历史；本修订的完整包安装与回滚结论须另行绑定新包证据，不由定向测试推定。
 
 已有证据（输入来源，本卡未复跑）
 - Linux 无 .pth venv 全量 990/990：运行于 be27c603，先于 S06 指纹提交 17b9c535，且缺完整运行元数据；不作为本候选的全量验收。
