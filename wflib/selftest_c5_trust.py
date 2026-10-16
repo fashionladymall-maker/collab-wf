@@ -173,12 +173,52 @@ CANDIDATE_TABLE = {
  'echo "$(wf self-update sub.zip)"; wf apply p.zip': ("tool", "sub.zip"),
  "f(){ wf self-update f.zip; }; wf apply p.zip; f": ("project", "p.zip"),
  "f(){ wf self-update f.zip; }; g(){ :; }; true && f; g": ("tool", "f.zip"),
- "for i in 1 2; do wf self-update l$i.zip; done": ("tool", "l$i.zip"),
+ "for i in 1 2; do wf self-update l$i.zip; done": ("tool", None),   # unevaluated $i: unresolved operand
  "if wf self-update c.zip; then wf apply p.zip; fi": ("tool", "c.zip"),
  "f(){ wf self-update unused.zip; }; wf apply p.zip": ("project", "p.zip"),
  "command -v wf; wf apply p.zip": ("project", "p.zip"),
  "true || wf self-update never.zip": ("tool", "never.zip"),
 }
+
+
+# C4-OPERAND-FAILCLOSED: package operands and command words that need shell evaluation. Real Bash runs each
+# command in a folder that holds every file a glob could match; the classifier must never present a word that
+# Bash rewrites as a resolved path. (command, resolved tool argument or None, expect an unresolved/unknown tool)
+OPERAND_TABLE = [
+ ('z=actual.zip; wf apply p.zip; wf self-update "$z"', None, True),
+ ("z=actual.zip; wf self-update ${z}", None, True),
+ ("wf self-update $(echo actual).zip", None, True),
+ ("wf self-update `echo actual`.zip", None, True),
+ ("wf apply p.zip; wf self-update [ab].zip", None, True),
+ ("wf self-update *.zip", None, True),
+ ("wf self-update a?.zip", None, True),
+ ("wf self-update {a,b}.zip", None, True),
+ ("wf self-update ~/x.zip", None, True),
+ ("wf apply p.zip; wf self-update '[ab].zip'", None, True),     # quoted literal: conservatively unresolved
+ ("wf self-update \\[ab\\].zip", None, True),                 # escaped literal: conservatively unresolved
+ ("wf self-update $'x.zip'", "x.zip", False),
+ ("wf self-update x.zip", "x.zip", False),
+ ("W=wf; $W self-update x.zip", None, True),
+ ('"$(command -v wf)" self-update x.zip', None, True),
+ ('wf apply "$(wf self-update inner.zip)"', "inner.zip", False),
+]
+
+
+def bash_trace_calls(command, files=()):
+    """Real Bash in a folder holding ``files``; a stand-in wf on PATH only records its arguments."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        folder = Path(folder)
+        (folder / "bin").mkdir()
+        for name in files:
+            (folder / name).write_bytes(name.encode())
+        (folder / "bin" / "wf").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$WF_TRACE"\n')
+        (folder / "bin" / "wf").chmod(0o755)
+        trace = folder / "trace"
+        subprocess.run(["bash", "-c", command], cwd=folder, capture_output=True, timeout=20,
+                       env={"PATH": f"{folder / 'bin'}:/usr/bin:/bin", "WF_TRACE": str(trace), "HOME": str(folder)})
+        return trace.read_text().splitlines() if trace.exists() else []
 
 
 def bash_trace_kind(command):
@@ -909,17 +949,93 @@ class LegacyEntryTests(_Fixture):
             single = live._legacy_install(command)
             self.assertEqual((single["kind"], single["argument"]), pick, command)
             self.assertIn((single["kind"], single["argument"]), found, command)
-            # Variables are not expanded: a candidate argument with "$" stands for any argument of its kind.
-            covers = lambda r: r in found or any(k == r[0] and "$" in str(a) for k, a in found)
+            # An unresolved operand (no argument, ``unresolved`` set) stands for any argument of its kind.
+            loose = {c["kind"] for c in candidates if "unresolved" in c}
+            covers = lambda r: r in found or r[0] in loose
             self.assertTrue(all(covers(r) for r in ran), (command, calls, candidates))
-            sequential = {(c["kind"], c["argument"]) for c in candidates if c["sequential"] and c["kind"] != "inner_review"}
-            self.assertTrue(all(s in ran or ("$" in str(s[1]) and any(r[0] == s[0] for r in ran)) for s in sequential),
+            sequential = {(c["kind"], c["argument"], "unresolved" in c) for c in candidates
+                          if c["sequential"] and c["kind"] != "inner_review"}
+            self.assertTrue(all((k, a) in ran or (u and any(r[0] == k for r in ran)) for k, a, u in sequential),
                             (command, calls, candidates))
             if any(r[0] == "tool" for r in ran):
                 self.assertTrue(live._tool_candidates(command), command)   # a real tool call is never hidden
         self.assertEqual(live._legacy_candidates("ls; echo wf"), [])
         self.assertEqual(live._legacy_candidates('wf self-update "x'),
                          [{"entry": None, "kind": None, "parsed": False, "argument": None, "sequential": True}])
+
+    def test_unevaluated_operands_are_never_paths(self):
+        """C4-OPERAND-FAILCLOSED: compared with real Bash 5.2; no shell evaluation by the classifier."""
+        import shutil
+        import subprocess
+        if shutil.which("bash") is None:
+            self.skipTest("bash unavailable")
+        version = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
+                                 capture_output=True, text=True).stdout.strip()
+        if version != "5.2":
+            self.skipTest(f"operand oracle is pinned to real Bash 5.2, found {version}")
+        files = ("$z", "actual.zip", "[ab].zip", "a.zip", "b.zip", "x.zip", "p.zip", "inner.zip")
+        for command, resolved, unresolved in OPERAND_TABLE:
+            calls = bash_trace_calls(command, files)
+            tool_args = [c.split()[1:] for c in calls if c.split()[:1] == ["self-update"]]
+            self.assertTrue(tool_args, (command, calls))   # Bash really ran a tool install
+            tools = live._tool_candidates(command)
+            self.assertTrue(tools, command)                # ... and it is never hidden
+            for c in tools:
+                if c["argument"] is not None:
+                    # A resolved operand is exactly what Bash passed.
+                    self.assertIn([c["argument"]], tool_args, (command, calls, c))
+            self.assertEqual(any(c["argument"] is None for c in tools), unresolved, (command, tools))
+            if resolved is not None:
+                self.assertIn(resolved, [c["argument"] for c in tools], command)
+
+    def test_unresolved_operand_fails_criterion4_closed(self):
+        """The reviewed counterexamples: a literal file and a review named like the unexpanded word never pass."""
+        cases = [('z=actual.zip; wf apply p.zip; wf self-update "$z"', "$z", ["actual.zip"]),
+                 ("wf apply p.zip; wf self-update [ab].zip", "[ab].zip", ["a.zip", "b.zip"]),
+                 ("wf apply p.zip; wf self-update '[ab].zip'", "[ab].zip", ["[ab].zip"])]
+        for command, literal, actual in cases:
+            inst, snap, result, c4 = self.literal_review_window(command, literal, actual)
+            self.assertFalse(c4["ok"], command)
+            self.assertNotEqual(c4.get("status"), "passed", command)
+            self.assertIn("unresolved_operand", c4["why"], command)
+            self.assertIn(literal, c4["why"], command)
+            self.assertNotIn(json.dumps(str(inst.root / literal)), snap.descriptor_json)   # the token is not a path
+            (inst.root / actual[0]).write_bytes(b"changed-real-package")
+            again = live._evaluate_snapshot(live._capture_inputs(inst, rounds=1))
+            now = next(c for c in again["report"]["rounds"][0]["criteria"] if c["n"] == 4)
+            self.assertFalse(now["ok"], command)   # changing the real package cannot turn it into a pass
+            self.assertEqual(again["authorization"], "unavailable")
+        # Control: a determinate package with a matching pass review still passes, and is frozen.
+        inst, snap, result, c4 = self.literal_review_window("wf apply p.zip; wf self-update t.zip", "t.zip", [])
+        self.assertTrue(c4["ok"], c4)
+        self.assertIn(json.dumps(str(inst.root / "t.zip")), snap.descriptor_json)
+        (inst.root / "t.zip").write_bytes(b"changed")
+        self.assertFalse(live._revalidate_inputs(inst, snap.descriptor)["valid"])
+        # An unresolvable command word followed by a wf entry is an explicit unknown tool attempt.
+        _, _, _, c4, rows = self.criterion4_of("W=wf; $W self-update x.zip")
+        self.assertEqual(c4["attempts"]["total"], 1)
+        self.assertFalse(c4["ok"])
+        self.assertIn("旧版安装命令无法解析（unknown）", c4["why"])
+
+    def literal_review_window(self, command, literal, actual):
+        """The review card's setup: literal and actual files exist; only the literal name has a valid pass review."""
+        import hashlib
+        from unittest.mock import patch
+        original, self._c4_n = self.project, getattr(self, "_c4_n", 0) + 1
+        with patch.object(self, "project", lambda name: original(f"{name} op{self._c4_n}")):
+            inst, _ = self.legacy_only_fixture({"mix": command})
+        for name in {literal, *actual}:
+            (inst.root / name).write_bytes(name.encode())
+        events = live._strict_log(inst.events_path.read_bytes(), inst.events_path)
+        event = next(e for e in events if e.get("cmd") == command)
+        review = live.LOCAL / "reviews" / (Path(literal).stem + ".result.json")
+        review.parent.mkdir(parents=True, exist_ok=True)
+        review.write_text(json.dumps({"verdict": "pass", "ts": event["ts"],
+                                      "zip_sha256": hashlib.sha256((inst.root / literal).read_bytes()).hexdigest()}))
+        snap = live._capture_inputs(inst, rounds=1)
+        result = live._evaluate_snapshot(snap)
+        self.assertEqual(live.check(inst, rounds=1), result["report"])
+        return inst, snap, result, next(c for c in result["report"]["rounds"][0]["criteria"] if c["n"] == 4)
 
     def criterion4_of(self, command):
         from unittest.mock import patch

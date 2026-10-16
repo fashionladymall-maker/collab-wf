@@ -426,7 +426,22 @@ other indirection are not resolved. Criterion 4 counts tool references and legac
   `mixed_inner_review_tool` and fails criterion 4: the child review stays
   unbound and the tool install cannot be checked apart from it. Every tool
   candidate's package and review result is frozen; a later change makes the
-  old descriptor stale. A missing legacy package or
+  old descriptor stale.
+- Package operands are never evaluated (C4-OPERAND-FAILCLOSED). The lexer drops
+  quotes and keeps expansion syntax, so an operand containing `$` (variables,
+  `${...}`, `$(...)`), a backquote, a glob (`*`, `?`, `[`), a brace or a leading
+  `~` cannot be mapped to the file Bash would pass (a variable's value, a glob's
+  matches, or the literal itself when quoted). Such a candidate keeps its entry
+  and kind, has no `argument` and carries `unresolved` with the raw word;
+  nothing is read or frozen under that name, and criterion 4 fails with
+  `unresolved_operand`, whatever file or review exists under the literal name.
+  Compatibility: a quoted or escaped literal such as `'[ab].zip'` is treated the
+  same way (it cannot be told from the unquoted glob), so legacy entries with
+  such package names are no longer verified and fail closed. `$'...'` text and
+  plain names stay resolved; candidates inside command substitutions are kept.
+- A command word (or the script of `python wf.py`) that is such an expansion and
+  is followed by a wf entry (`$W self-update x.zip`, `"$(command -v wf)" apply
+  p.zip`) is an explicit unknown candidate instead of an ordinary command. A missing legacy package or
 review result is frozen as an absent source and reported (`没有记录` /
 `版本包哈希对不上或已不在`) instead of aborting the whole collection. Project legacy entries are
 visible as unknown history rows and block authorization.

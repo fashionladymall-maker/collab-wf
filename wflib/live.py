@@ -87,6 +87,16 @@ def _mine(x: dict, name: str) -> bool:
 # ---- C5-G1: legacy installation entries (reporting only, never a reference) ----
 LEGACY_INSTALL_SCHEMA = "legacy-install-command/1"
 _LEGACY_ENTRIES = {"apply": "project", "self-update": "tool"}
+# C4-OPERAND-FAILCLOSED: the lexer drops quotes and keeps expansion syntax in the word text, and the classifier
+# never evaluates the shell. A word with parameter/command substitution, a glob, brace or tilde syntax may stand
+# for another path (or several), and a quoted or escaped literal cannot be told from it; such a word is
+# unresolved, never a path.
+_UNRESOLVED_WORD = r"[$`*?\[{]|^~"
+
+
+def _unresolved(word):
+    import re
+    return isinstance(word, str) and re.search(_UNRESOLVED_WORD, word) is not None
 _WRAPPERS = {"env", "command", "exec", "nohup", "time", "nice", "timeout", "sudo"}
 _WRAPPER_VALUE_OPTIONS = {"-u", "-g", "-n", "-s", "-k", "-C", "-p"}
 _DRILL_VALUE_OPTIONS = {"--kind", "--dir", "--review", "--review-timeout-s"}
@@ -614,6 +624,8 @@ def _legacy_candidates(cmd):
     out = []
     for hit, conditional in sink:
         row = {"entry": hit["entry"], "kind": hit["kind"], "parsed": hit["parsed"], "argument": hit.get("argument")}
+        if "unresolved" in hit:
+            row["unresolved"] = hit["unresolved"]
         same = next((c for c in out if all(c[k] == row[k] for k in row)), None)
         if same is None:
             out.append(dict(row, sequential=not conditional))
@@ -853,6 +865,10 @@ def _legacy_command(argv, i, depth, functions=None):
             i += 1   # duration operand
     if i >= n:
         return None
+    if _unresolved(argv[i]) and any(w in _LEGACY_ENTRIES or w == "drill" for w in argv[i + 1:]):
+        # The command word is an unevaluated expansion followed by a wf entry: it may run wf, so it is an
+        # explicit unknown candidate, never silently ordinary.
+        return _unknown_legacy()
     name = argv[i].rsplit("/", 1)[-1]
     if name in ("bash", "sh", "zsh", "dash", "ksh"):
         j, inline = i + 1, False
@@ -873,6 +889,8 @@ def _legacy_command(argv, i, depth, functions=None):
             j += 2 if argv[j] in ("-X", "-W") else 1
         if j < n and argv[j].rsplit("/", 1)[-1] == "wf.py":
             rest = argv[j + 1:]
+        elif j < n and _unresolved(argv[j]) and any(w in _LEGACY_ENTRIES or w == "drill" for w in argv[j + 1:]):
+            return _unknown_legacy()   # the script path is an unevaluated expansion
     if rest is None:
         return None
     k = 0
@@ -914,8 +932,12 @@ def _legacy_command(argv, i, depth, functions=None):
             argument = token
             break
         m += 1
-    return _leaf({"schema": LEGACY_INSTALL_SCHEMA, "entry": entry, "kind": _LEGACY_ENTRIES[entry],
-                  "parsed": True, "argument": argument})
+    hit = {"schema": LEGACY_INSTALL_SCHEMA, "entry": entry, "kind": _LEGACY_ENTRIES[entry],
+           "parsed": True, "argument": argument}
+    if _unresolved(argument):
+        # Known entry, undeterminable package: no argument, so nothing is read or frozen as if it were the path.
+        hit.update(argument=None, unresolved=argument)
+    return _leaf(hit)
 
 
 def _history_required(events):
@@ -1479,6 +1501,11 @@ def check(inst, rounds: int = 3, budget_s: int = 300, *, _inputs=None, _route=Tr
                 for candidate in [c for c in candidates if c["kind"] in ("tool", None)]:
                     # A conditional candidate is checked like any other, but never presented as executed.
                     note = "" if candidate["sequential"] else "（条件分支候选，不代表已执行）"
+                    if "unresolved" in candidate:
+                        vs.append(f"旧版安装命令的版本包参数含未求值的 shell 展开（{candidate['unresolved']}），"
+                                  "无法确定实际文件（unresolved_operand）" + note)
+                        oks.append(False)
+                        continue
                     if not candidate.get("argument"):
                         # Explicitly unknown: no package operand can be parsed.
                         vs.append("旧版安装命令无法解析（unknown）" + note)
