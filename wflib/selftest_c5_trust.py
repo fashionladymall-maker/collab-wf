@@ -912,8 +912,8 @@ class LegacyEntryTests(_Fixture):
             self.skipTest("bash unavailable")
         version = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
                                  capture_output=True, text=True).stdout.strip()
-        if version != "5.2":
-            self.skipTest(f"branch oracle is pinned to real Bash 5.2, found {version}")
+        if version not in {"3.2", "5.2"}:
+            self.skipTest(f"branch oracle is validated on real Bash 3.2/5.2, found {version}")
         rows = []
         for command in BRANCH_TABLE:
             executed, classified, calls = bash_trace_kind(command)
@@ -932,8 +932,8 @@ class LegacyEntryTests(_Fixture):
             self.skipTest("bash unavailable")
         version = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
                                  capture_output=True, text=True).stdout.strip()
-        if version != "5.2":
-            self.skipTest(f"candidate oracle is pinned to real Bash 5.2, found {version}")
+        if version not in {"3.2", "5.2"}:
+            self.skipTest(f"candidate oracle is validated on real Bash 3.2/5.2, found {version}")
         kinds = {"self-update": "tool", "apply": "project"}
         for command, pick in CANDIDATE_TABLE.items():
             _, _, calls = bash_trace_kind(command)
@@ -964,15 +964,15 @@ class LegacyEntryTests(_Fixture):
                          [{"entry": None, "kind": None, "parsed": False, "argument": None, "sequential": True}])
 
     def test_unevaluated_operands_are_never_paths(self):
-        """C4-OPERAND-FAILCLOSED: compared with real Bash 5.2; no shell evaluation by the classifier."""
+        """C4-OPERAND-FAILCLOSED: real Bash 3.2/5.2; no shell evaluation by the classifier."""
         import shutil
         import subprocess
         if shutil.which("bash") is None:
             self.skipTest("bash unavailable")
         version = subprocess.run(["bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"],
                                  capture_output=True, text=True).stdout.strip()
-        if version != "5.2":
-            self.skipTest(f"operand oracle is pinned to real Bash 5.2, found {version}")
+        if version not in {"3.2", "5.2"}:
+            self.skipTest(f"operand oracle is validated on real Bash 3.2/5.2, found {version}")
         files = ("$z", "actual.zip", "[ab].zip", "a.zip", "b.zip", "x.zip", "p.zip", "inner.zip")
         for command, resolved, unresolved in OPERAND_TABLE:
             calls = bash_trace_calls(command, files)
