@@ -267,12 +267,16 @@ def _t_na(_ok):
         n1 = next(i for i in p1["items"] if i["id"] == "N1")
     _ok("B1-C 不适用：条件、排除范围、理由、判定人缺任一拒绝；exit 1 与超时 124 拒绝；失败记录在时直接写入的 NA 不生效；"
         "NA 不计入 ok 与 reached；目标改动后 NA 失效",
-        res["miss"] == ["refused"] * 4 and res["exits"] == [1, 124] and res["F1"] == "refused" and res["S1"] == "refused"
-        and lay1["F1"] == ("failed", False) and lay1["S1"] == ("pending", False) and "不能算不适用" in f1why
-        and lay1["N1"] == ("not_applicable", False) and lay1["U1"] == ("not_applicable", False)
-        and set((n1.get("na") or {})) >= {"condition", "scope", "reason", "by"}
-        and p1["done"] == 0 and p1["reached"] is False and p1["counts"]["not_applicable"] == 2
-        and lay2["N1"] == "pending" and lay2["U1"] == "pending",
+        _conj(("na.missing-field-refused", lambda: res["miss"] == ["refused"] * 4),
+              ("na.exit1-and-timeout124-records-refuse-na",
+               lambda: res["exits"] == [1, 124] and res["F1"] == "refused" and res["S1"] == "refused"),
+              ("na.handwritten-na-over-failure-ineffective",
+               lambda: lay1["F1"] == ("failed", False) and lay1["S1"] == ("pending", False) and "不能算不适用" in f1why),
+              ("na.legal-four-field-na-not-counted",
+               lambda: lay1["N1"] == ("not_applicable", False) and lay1["U1"] == ("not_applicable", False)
+               and set((n1.get("na") or {})) >= {"condition", "scope", "reason", "by"}
+               and p1["done"] == 0 and p1["reached"] is False and p1["counts"]["not_applicable"] == 2),
+              ("na.goal-drift-invalidates-na", lambda: lay2["N1"] == "pending" and lay2["U1"] == "pending")),
         json.dumps([res, lay1, f1why, lay2, p1.get("counts")], ensure_ascii=False)[:900])
 
 
@@ -481,20 +485,33 @@ def _t_verified(_ok):
         "实景不达标、安装尝试失败、工具 dirty 或没有版本库时不授予；ok 与 reached 不变；"
         "r2：严格结果不通过时窄映射也不授予（F2）、同轮失败尝试不被成功遮掉（F1）、被 git 忽略的安装源码改变摘要（F3）、"
         "机械证据改动与非规范的伪造证据不授予、live 嵌套段配置返回校验问题",
-        out.get("plain") == ("mechanical_pass", True)
-        and out.get("pos", (None,))[0] == "mechanical_pass" and out["pos"][1] is True and out["pos"][2] == 0 and out["pos"][3] is True
-        and out["pos"][4] == ["evidence_sha256", "goals_sha", "project", "project_fp", "segments", "tool_digest", "tool_dirty"]
-        and out["tamper"] == "mechanical_pass" and out["restored"] == "mechanical_pass"
-        and out["tool_dirty"] == "mechanical_pass" and out["tool_changed"] == "mechanical_pass" and out["rebound"] == "mechanical_pass"
-        and out["project_changed"] == "mechanical_pass" and out["rebound2"] == "mechanical_pass"
-        and out["goal_changed"] == "pending" and out["live_fail"] == ("mechanical_pass", True)
-        and out["attempt_failed"] == "mechanical_pass" and out["grant_dirty"] == "mechanical_pass" and out["no_git"] == "mechanical_pass"
-        and out["bad_spec"] == [True] * 6 and out["good_spec"] == []
-        and out["narrow_ok"] == "mechanical_pass" and out["f2_cross"] == ("mechanical_pass", "mechanical_pass", True, False, False)
-        and out["f1_same"] == ("mechanical_pass", "mechanical_pass", True, False, False)
-        and out["ignored"] == ("mechanical_pass", [], True, "mechanical_pass") and out["skip_rule"] is True
-        and out["restored_after_ignored"] == "mechanical_pass" and out["mech_tamper"] == "mechanical_pass"
-        and out["forged_text"] == "mechanical_pass" and out["restored_final"] == "mechanical_pass",
+        _conj(("layers.c5-unavailable-positive-stays-mechanical",
+               lambda: out.get("plain") == ("mechanical_pass", True)
+               and out.get("pos", (None,))[0] == "mechanical_pass" and out["pos"][1] is True and out["pos"][2] == 0
+               and out["pos"][3] is True
+               and out["pos"][4] == ["evidence_sha256", "goals_sha", "project", "project_fp", "segments", "tool_digest",
+                                     "tool_dirty"]),
+              ("layers.evidence-tool-project-drift-not-verified",
+               lambda: out["tamper"] == "mechanical_pass" and out["restored"] == "mechanical_pass"
+               and out["tool_dirty"] == "mechanical_pass" and out["tool_changed"] == "mechanical_pass"
+               and out["rebound"] == "mechanical_pass"
+               and out["project_changed"] == "mechanical_pass" and out["rebound2"] == "mechanical_pass"),
+              ("layers.goal-definition-change-pending", lambda: out["goal_changed"] == "pending"),
+              ("layers.live-fail-attempt-dirty-nogit-not-verified",
+               lambda: out["live_fail"] == ("mechanical_pass", True)
+               and out["attempt_failed"] == "mechanical_pass" and out["grant_dirty"] == "mechanical_pass"
+               and out["no_git"] == "mechanical_pass"),
+              ("layers.invalid-live-spec-rejected", lambda: out["bad_spec"] == [True] * 6 and out["good_spec"] == []),
+              ("layers.narrow-mapping-and-failed-attempt-not-granted",
+               lambda: out["narrow_ok"] == "mechanical_pass"
+               and out["f2_cross"] == ("mechanical_pass", "mechanical_pass", True, False, False)
+               and out["f1_same"] == ("mechanical_pass", "mechanical_pass", True, False, False)),
+              ("layers.ignored-install-source-changes-digest",
+               lambda: out["ignored"] == ("mechanical_pass", [], True, "mechanical_pass") and out["skip_rule"] is True
+               and out["restored_after_ignored"] == "mechanical_pass"),
+              ("layers.tampered-or-forged-evidence-not-verified",
+               lambda: out["mech_tamper"] == "mechanical_pass"
+               and out["forged_text"] == "mechanical_pass" and out["restored_final"] == "mechanical_pass")),
         json.dumps(out, ensure_ascii=False, default=str)[:1500])
     _ok("C2c 原旧完整字段仍不能靠 granted 自报绕过严格输入消费",
         out.get("old_self_report") == ("mechanical_pass", "unsupported", 0), repr(out.get("old_self_report")))
@@ -1143,17 +1160,22 @@ def _t_goals_empty_guard(_ok):
         p = goals.progress(k)
         res["default_done"] = (p["done"], p["total"], p["reached"])
     _ok("B2-C2a 空目标即使批准也不达成；只有人工目标时即使全部确认也不达成",
-        res["empty"] == (False, True, False, 0) and res["manual_all_confirmed"] == ("confirmed", "confirmed")
-        and res["manual_all_confirmed_p"] == (2, 2, True, False), json.dumps({k: res[k] for k in (
+        _conj(("empty-guard.empty-goals-approved-not-reached", lambda: res["empty"] == (False, True, False, 0)),
+              ("empty-guard.manual-only-all-confirmed-not-reached",
+               lambda: res["manual_all_confirmed"] == ("confirmed", "confirmed")
+               and res["manual_all_confirmed_p"] == (2, 2, True, False))), json.dumps({k: res[k] for k in (
             "empty", "manual_all_confirmed", "manual_all_confirmed_p")}, ensure_ascii=False))
     _ok("B2-C2a depends_on=all_exec 在没有可执行目标时不就绪、不通知、确认被前置保护拒绝，也不算完成；其他人工目标照常确认",
         res["manual_allexec"] == (False, False, True, False, True, "confirmed")
         and res["manual_allexec_after"] == (False, False, True, 1, 2),
         json.dumps({k: res[k] for k in ("manual_allexec", "manual_allexec_after")}, ensure_ascii=False))
     _ok("B2-C2a 可执行目标未通过、或目标未批准时人工验收不就绪、不通知、不能确认；可执行目标通过后照常就绪、确认后达成",
-        res["exec_fail"] == (False, False, True, False, True, False)
-        and res["exec_pass"] == (True, True, "confirmed", True)
-        and res["unapproved"] == (True, False, True, False, False, True),
+        _conj(("empty-guard.exec-fail-not-ready-confirm-refused",
+               lambda: res["exec_fail"] == (False, False, True, False, True, False)),
+              ("empty-guard.real-exec-pass-ready-confirmed-reached",
+               lambda: res["exec_pass"] == (True, True, "confirmed", True)),
+              ("empty-guard.unapproved-not-ready-confirm-refused",
+               lambda: res["unapproved"] == (True, False, True, False, False, True))),
         json.dumps({k: res[k] for k in ("exec_fail", "exec_pass", "unapproved")}, ensure_ascii=False))
     _ok("B2-C2a 旧的只含 contains 的判据语义不变：没有 exit 条件时不要求退出码，可执行目标通过即可达成",
         res["contains_only"] == (True, True, True), json.dumps(res["contains_only"]))
@@ -1459,8 +1481,12 @@ def _t_mech_v2(_ok):
         and out["s0"] == ["D1"] and out["deps_X1"] == ["W1"] and out["d1_detail"],
         json.dumps({k: out.get(k) for k in ("kinds", "s0", "deps_X1", "d1_detail")}, ensure_ascii=False))
     _ok("B2-C2b 无关目标变化复用（重新批准前 reached 为假）；本目标定义变化失效并连带依赖它的目标；旧式与全局绑定按全局失效",
-        out["s1u"] == (["D1", "L1"], False, False) and out["s1"] == ["D1", "L1"] and out["s2"] == ["D1", "L1"]
-        and out["s3"] == (["D1", "L1", "W1", "X1"], True) and out["s4"] == ["D1", "L1", "P1"] and out["s5"] == ["D1"],
+        _conj(("binding.unrelated-change-reuses",
+               lambda: out["s1u"] == (["D1", "L1"], False, False) and out["s1"] == ["D1", "L1"]
+               and out["s2"] == ["D1", "L1"]),
+              ("binding.own-or-dependency-definition-change-invalidates",
+               lambda: out["s3"] == (["D1", "L1", "W1", "X1"], True) and out["s4"] == ["D1", "L1", "P1"]),
+              ("binding.recheck-restores-binding", lambda: out["s5"] == ["D1"])),
         json.dumps({k: out[k] for k in ("s1u", "s1", "s2", "s3", "s4", "s5")}, ensure_ascii=False))
     exp_seq = {"dashboard": ["W1"], "selftest": ["W1"], "manifest": ["W1"], "docs": ["W1"], "tool_mode": ["W1"], "tool_local": [],
                "readme": proj, "data_content": ["P1", "P1n", "P3"] + proj, "data_mode": ["P1", "P1n", "P3"] + proj, "runtime": [],
@@ -2476,6 +2502,615 @@ def _t_c5_integration(_ok):
         _ok(*outcome)
 
 
+# ---------------- C1 提供方基础：每组只运行一次，旧断言重放，提供方消费同一份记录 ----------------
+# Every lane C group runs at most once per process. run_lane_c replays the
+# recorded _ok calls (same names, order and values); C1_PROVIDERS read the same
+# records, so a business operation never runs twice for the two formats.
+# Aggregate assertions record explicit sub-assertions through _conj; each C1
+# case consumes exactly one assertion or sub-assertion with one polarity.
+#
+# Fail-closed rules of the record (C-C1-SIX-FIX2):
+# - an assertion condition and a sub-assertion result must be a real bool;
+#   anything else (str, int 1, None, ...) is recorded as ok=False with its type
+#   named, never converted with bool() first;
+# - a group is executed only under an enforceable deadline (main thread, no
+#   outer lane C deadline, no foreign ITIMER_REAL, setitimer/SIGALRM present);
+#   otherwise it is refused before running and recorded as an error;
+# - a group that ended with an error, a timeout or without an enforced
+#   deadline contributes no C1 evidence at all, even for assertions recorded
+#   as ok before the failure.
+C1_GROUP_TIMEOUT_S = 420
+_GROUP_RECORDS = {}
+_SUB_SINK = None
+_DEADLINE_ACTIVE = False
+
+
+class _C1Timeout(BaseException):
+    """Raised by the group deadline; BaseException so ordinary handlers do not swallow it."""
+
+
+class _C1DeadlineUnavailable(RuntimeError):
+    """The group deadline cannot be enforced here; the group is refused, not run."""
+
+
+def _strict_bool(value, what):
+    """(ok, problem): a real bool passes through; any other type fails closed and is named."""
+    if type(value) is bool:
+        return value, ""
+    return False, f"non-bool {what} ({type(value).__name__}: {repr(value)[:80]}) fails closed"
+
+
+def _conj(*parts):
+    """Evaluate ``(sub_id, thunk)`` parts like one ``and`` chain of real bools.
+
+    Each part is recorded as an explicit sub-assertion of the running group.
+    When every reached part returns a real bool the truth value equals the
+    original chain. A part returning anything else (str, int, None, ...) is
+    recorded ran/ok=False with its type named and makes the chain False (it is
+    never truth-converted). An exception raised where the original chain would
+    have reached it propagates; parts after the first false one are still
+    evaluated for the record but cannot raise.
+    """
+    result = True
+    for sub_id, thunk in parts:
+        if result:
+            try:
+                raw = thunk()
+            except Exception as exc:
+                _record_sub(sub_id, False, False, f"{type(exc).__name__}: {exc}")
+                raise
+            value, problem = _strict_bool(raw, "sub-assertion result")
+            _record_sub(sub_id, True, value, problem)
+            result = value
+        else:
+            try:
+                raw = thunk()
+            except Exception as exc:   # noqa: BLE001 - the original chain never reached this part
+                _record_sub(sub_id, False, False, f"not reached by the original chain: {type(exc).__name__}")
+            else:
+                value, problem = _strict_bool(raw, "sub-assertion result")
+                _record_sub(sub_id, True, value, problem or "evaluated after an earlier false part")
+    return result
+
+
+def _record_sub(sub_id, ran, ok, detail):
+    if _SUB_SINK is not None:
+        if sub_id in _SUB_SINK:
+            raise RuntimeError(f"duplicate C1 sub-assertion id {sub_id}")
+        _SUB_SINK[sub_id] = {"id": sub_id, "ran": ran, "ok": ok, "detail": detail}
+
+
+def _deadline_refusal():
+    """Why a group deadline cannot be enforced right now ('' when it can)."""
+    import signal
+    import threading
+    if _DEADLINE_ACTIVE:
+        return "nested inside another lane C group deadline"
+    if threading.current_thread() is not threading.main_thread():
+        return f"not on the main thread ({threading.current_thread().name}): SIGALRM cannot interrupt it"
+    if not (callable(getattr(signal, "setitimer", None)) and callable(getattr(signal, "getitimer", None))
+            and hasattr(signal, "SIGALRM") and hasattr(signal, "ITIMER_REAL")):
+        return "signal.setitimer/getitimer/SIGALRM unavailable on this platform"
+    if signal.getitimer(signal.ITIMER_REAL)[0] > 0:
+        return "a foreign ITIMER_REAL timer is already armed (nested deadline)"
+    return ""
+
+
+@contextmanager
+def _deadline(seconds):
+    """Enforced SIGALRM deadline on the main thread; refuses (raises) when it cannot be enforced."""
+    import signal
+    global _DEADLINE_ACTIVE
+    refusal = _deadline_refusal()
+    if refusal:
+        raise _C1DeadlineUnavailable(refusal)
+    state = {"fired": False, "armed": True}
+
+    def alarm(signum, frame):
+        state["fired"] = True
+        if state["armed"]:
+            raise _C1Timeout(f"lane C group exceeded {seconds}s")
+    previous = signal.signal(signal.SIGALRM, alarm)
+    _DEADLINE_ACTIVE = True
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield state
+    finally:
+        while True:   # a one-shot alarm landing inside the cleanup is caught once, then disarmed
+            try:
+                state["armed"] = False
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, signal.SIG_DFL if previous is None else previous)
+                _DEADLINE_ACTIVE = False
+                break
+            except _C1Timeout:
+                state["fired"] = True
+
+
+def _run_group(name, fn):
+    """Run one lane C group once and keep its _ok calls and sub-assertions.
+
+    The group runs only under an enforced deadline; when that is impossible it
+    is refused before any business operation and the refusal is the record.
+    """
+    global _SUB_SINK
+    key = fn.__name__
+    if key in _GROUP_RECORDS:
+        return _GROUP_RECORDS[key]
+    import time
+    record = {"group": name, "fn": key, "asserts": [], "subs": {}, "error": None, "timed_out": False,
+              "deadline_enforced": False, "executed": False, "elapsed_s": None}
+
+    def recording_ok(n, cond, detail=""):
+        ok, problem = _strict_bool(cond, "assertion condition")
+        record["asserts"].append({"id": f"{key}#{len(record['asserts'])}", "name": n, "ok": ok,
+                                  "cond_type": type(cond).__name__,
+                                  "detail": detail if not problem else f"{problem}; original detail: {str(detail)[:1500]}"})
+        return cond
+    previous, started = _SUB_SINK, time.monotonic()
+    state = None
+    _SUB_SINK = record["subs"]
+    try:
+        with _deadline(C1_GROUP_TIMEOUT_S) as state:
+            record["deadline_enforced"] = True
+            record["executed"] = True
+            fn(recording_ok)
+    except _C1DeadlineUnavailable as exc:
+        record["error"] = f"{type(exc).__name__}: {exc}; group refused before running (fail closed)"
+    except _C1Timeout as exc:
+        record["timed_out"], record["error"] = True, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:   # noqa: BLE001 - recorded and replayed as the original group error
+        record["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        _SUB_SINK = previous
+        record["elapsed_s"] = round(time.monotonic() - started, 3)
+    if state is not None and state["fired"] and not record["timed_out"]:
+        record["timed_out"] = True
+        record["error"] = record["error"] or f"_C1Timeout: lane C group exceeded {C1_GROUP_TIMEOUT_S}s"
+    _GROUP_RECORDS[key] = record
+    return record
+
+
+def _delegate(_ok, label, cases):
+    """Run unittest classes once; one _ok per test (``label: Class.method``); skips fail closed."""
+    import io
+    import unittest
+    from contextlib import redirect_stdout, redirect_stderr
+    outcomes = []
+
+    class Result(unittest.TestResult):
+        def name(self, test):
+            return f"{label}: {type(test).__name__}.{test._testMethodName}"
+
+        def addSuccess(self, test):
+            super().addSuccess(test)
+            outcomes.append((self.name(test), True, ""))
+
+        def addFailure(self, test, error):
+            super().addFailure(test, error)
+            outcomes.append((self.name(test), False, self._exc_info_to_string(error, test)))
+
+        def addError(self, test, error):
+            super().addError(test, error)
+            outcomes.append((self.name(test), False, self._exc_info_to_string(error, test)))
+
+        def addSkip(self, test, reason):
+            super().addSkip(test, reason)
+            outcomes.append((self.name(test), False, "skipped (not a pass): " + str(reason)))
+
+    suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case) for case in cases)
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        suite.run(Result())
+    for outcome in outcomes:
+        _ok(*outcome)
+
+
+def _t_c5_trust_suite(_ok):
+    """C5 production trust, transaction inventory, legacy/drill entries and shell scope (real chains)."""
+    from . import selftest_c5_trust as trust
+    _delegate(_ok, "C5 trust", [trust.ProductionTrustTests, trust.MarkedSyntheticTests, trust.OutputSyntheticTests,
+                                trust.TransactionInventoryTests, trust.TransactionProtocolTests,
+                                trust.LegacyEntryTests, trust.ExeclessWindowTests])
+
+
+# ---------------- C1 提供方映射：每个用例只消费一条断言或子断言，且只有一个极性 ----------------
+# Sources: ("sub", group_fn, sub_id) | ("ok", group_fn, name_prefix) | ("ok=", group_fn, exact_name).
+# A negative case's ok=True means the expected refusal was really observed; it
+# never means a business gate or an installation succeeded.
+_EG, _NA, _VER, _CMP = "_t_goals_empty_guard", "_t_na", "_t_verified", "_t_compat"
+_V2, _RT, _ST, _DP = "_t_mech_v2", "_t_mech_runtime_inputs", "_t_mech_startup_inputs", "_t_mech_disabled_pth"
+_TRUST = "_t_c5_trust_suite"
+
+
+def _trust_case(test):
+    return ("ok=", _TRUST, "C5 trust: " + test)
+
+
+C1_MAP = {
+    "1-empty-guard": [
+        ("real-exec-pass-ready-confirmed-reached", "pos", ("sub", _EG, "empty-guard.real-exec-pass-ready-confirmed-reached")),
+        ("contains-only-real-exec-reaches", "pos", ("ok", _EG, "B2-C2a 旧的只含 contains 的判据语义不变")),
+        ("empty-goals-approved-not-reached", "neg", ("sub", _EG, "empty-guard.empty-goals-approved-not-reached")),
+        ("manual-only-all-confirmed-not-reached", "neg", ("sub", _EG, "empty-guard.manual-only-all-confirmed-not-reached")),
+        ("all-exec-empty-set-not-ready-confirm-refused", "neg",
+         ("ok", _EG, "B2-C2a depends_on=all_exec 在没有可执行目标时不就绪")),
+        ("exec-fail-not-ready-confirm-refused", "neg", ("sub", _EG, "empty-guard.exec-fail-not-ready-confirm-refused")),
+        ("unapproved-not-ready-confirm-refused", "neg", ("sub", _EG, "empty-guard.unapproved-not-ready-confirm-refused")),
+    ],
+    "3-layers": [
+        ("selftest-registry-contract-grant", "pos",
+         _trust_case("ProductionTrustTests.test_positive_registration_grants_and_registry_is_frozen")),
+        ("legacy-record-cannot-derive-verified", "neg", ("ok", _CMP, "B1-C 兼容：旧记录下")),
+        ("c5-unavailable-positive-stays-mechanical", "neg", ("sub", _VER, "layers.c5-unavailable-positive-stays-mechanical")),
+        ("evidence-tool-project-drift-not-verified", "neg", ("sub", _VER, "layers.evidence-tool-project-drift-not-verified")),
+        ("goal-definition-change-pending", "neg", ("sub", _VER, "layers.goal-definition-change-pending")),
+        ("live-fail-attempt-dirty-nogit-not-verified", "neg",
+         ("sub", _VER, "layers.live-fail-attempt-dirty-nogit-not-verified")),
+        ("invalid-live-spec-rejected", "neg", ("sub", _VER, "layers.invalid-live-spec-rejected")),
+        ("narrow-mapping-and-failed-attempt-not-granted", "neg",
+         ("sub", _VER, "layers.narrow-mapping-and-failed-attempt-not-granted")),
+        ("ignored-install-source-changes-digest", "neg", ("sub", _VER, "layers.ignored-install-source-changes-digest")),
+        ("tampered-or-forged-evidence-not-verified", "neg", ("sub", _VER, "layers.tampered-or-forged-evidence-not-verified")),
+        ("old-complete-fields-granted-self-report-refused", "neg",
+         ("ok=", _VER, "C2c 原旧完整字段仍不能靠 granted 自报绕过严格输入消费")),
+        ("unmarked-synthetic-without-registry-denied", "neg",
+         _trust_case("ProductionTrustTests.test_unmarked_fixture_without_registry_is_denied")),
+        ("registry-invalid-or-drifted-denied", "neg", _trust_case("ProductionTrustTests.test_registry_negative_matrix")),
+        ("symlinked-registry-unsupported", "neg", _trust_case("ProductionTrustTests.test_symlinked_registry_is_unsupported")),
+        ("marked-synthetic-cannot-be-registered", "neg",
+         _trust_case("MarkedSyntheticTests.test_marked_fixture_cannot_be_registered_into_production")),
+        ("output-synthetic-cannot-be-registered", "neg",
+         _trust_case("OutputSyntheticTests.test_marked_fixture_cannot_be_registered_into_production")),
+    ],
+    "4-na": [
+        ("legal-four-field-na-not-counted", "pos", ("sub", _NA, "na.legal-four-field-na-not-counted")),
+        ("missing-field-refused", "neg", ("sub", _NA, "na.missing-field-refused")),
+        ("exit1-and-timeout124-records-refuse-na", "neg", ("sub", _NA, "na.exit1-and-timeout124-records-refuse-na")),
+        ("handwritten-na-over-failure-ineffective", "neg", ("sub", _NA, "na.handwritten-na-over-failure-ineffective")),
+        ("goal-drift-invalidates-na", "neg", ("sub", _NA, "na.goal-drift-invalidates-na")),
+    ],
+    "5-binding-impact": [
+        ("v2-new-record-binding-kinds", "pos", ("ok", _V2, "B2-C2b 新记录：")),
+        ("v2-unrelated-change-reuses", "pos", ("sub", _V2, "binding.unrelated-change-reuses")),
+        ("v2-own-or-dependency-definition-change-invalidates", "neg",
+         ("sub", _V2, "binding.own-or-dependency-definition-change-invalidates")),
+        ("v2-recheck-restores-binding", "pos", ("sub", _V2, "binding.recheck-restores-binding")),
+        ("v2-closure-content-mode-member-link-drift", "neg", ("ok", _V2, "B2-C2b 依赖闭包：")),
+        ("v2-bad-hash-read-failure-evidence-drift", "neg", ("ok", _V2, "B2-C2b 坏 hash")),
+        ("v2-bad-schema-rejected", "neg", ("ok", _V2, "B2-C2b 反例 2：")),
+        ("v2-dependency-cycle-fails-closed", "neg", ("ok", _V2, "B2-C2b 依赖图：")),
+        ("v2-runtime-audit-unbound", "neg", ("ok", _V2, "B2-C2b 运行时审计：")),
+        ("v2-static-derivation-narrowing-refused", "neg", ("ok", _V2, "B2-C2b 静态推导：")),
+        ("v2-progress-consistent", "pos", ("ok", _V2, "B2-C2b progress 的 ok、layer、reached")),
+        ("fix2-venv-module-bytes", "neg", ("ok", _RT, "C2b FIX2 实际 venv 模块按字节绑定")),
+        ("fix2-environment-data", "neg", ("ok", _RT, "C2b FIX2 环境目录里的任意实际数据不豁免")),
+        ("fix2-interpreter-entry", "neg", ("ok", _RT, "C2b FIX2 命令实际解析的解释器入口绑定")),
+        ("fix2-external-exists-path", "neg", ("ok", _RT, "C2b FIX2 非字面量外部 exists")),
+        ("fix2-observer-unrelated-reuse", "pos", ("ok", _RT, "C2b FIX2 observer bootstrap/dump")),
+        ("fix2-sitecustomize-importerror-kept", "neg", ("ok", _RT, "C2b FIX2 原 sitecustomize 内部 ImportError")),
+        ("fix2-sitecustomize-read-drift", "neg", ("ok", _RT, "C2b FIX2 正常 sitecustomize 仍执行")),
+        ("fix2-module-search-shadow", "neg", ("ok", _RT, "C2b FIX2 模块搜索绑定")),
+        ("fix2-failed-import-candidates", "neg", ("ok", _RT, "C2b FIX2 失败导入也绑定搜索候选")),
+        ("fix3-pth-switch", "neg", ("ok", _ST, "C2b FIX3 真实 .pth 路径切换")),
+        ("fix3-pth-candidate-set", "neg", ("ok", _ST, "C2b FIX3 site 的 .pth 候选集合绑定")),
+        ("fix3-pth-missing-target", "neg", ("ok", _ST, "C2b FIX3 .pth 指向的缺失路径")),
+        ("fix3-pyvenv-cfg", "neg", ("ok", _ST, "C2b FIX3 pyvenv.cfg")),
+        ("fix3-observer-cache-excluded", "pos", ("ok", _ST, "C2b FIX3 中央 pycache")),
+        ("fix3-unobserved-pth-code-fails-closed", "neg", ("ok", _ST, "C2b FIX3 观察前 .pth 执行代码")),
+        ("fix4-stdlib-template-reuse", "pos", ("ok", _DP, "C2b FIX4 完整 stdlib 模板")),
+        ("fix4-local-template-reuse", "pos", ("ok", _DP, "C2b FIX4 完整 local 模板")),
+        ("fix4-environment-switch-invalidates", "neg", ("ok", _DP, "C2b FIX4 真实环境改为 local")),
+        ("fix4-missing-variable-enabled", "neg", ("ok", _DP, "C2b FIX4 local 模板变量缺失时确实启用")),
+        ("fix4-boundary-tail", "neg", ("ok", _DP, "C2b FIX4 完整匹配边界 tail：")),
+        ("fix4-boundary-second-line", "neg", ("ok", _DP, "C2b FIX4 完整匹配边界 second-line：")),
+        ("fix4-boundary-comment-tail", "neg", ("ok", _DP, "C2b FIX4 完整匹配边界 comment-tail：")),
+        ("fix4-boundary-assignment-tail", "neg", ("ok", _DP, "C2b FIX4 完整匹配边界 assignment-tail：")),
+        ("fix4-all-pth-lines-scanned", "neg", ("ok", _DP, "C2b FIX4 必须扫描全部 .pth")),
+        ("fix4-comment-and-empty-environment", "neg", ("ok", _DP, "C2b FIX4 独立注释按 site 语义忽略")),
+        ("fix4-unexecuted-module-reuse", "pos", ("ok", _DP, "C2b FIX4 禁用右支不主动导入或绑定 shim")),
+        ("fix4-pth-mode-and-link-target", "neg", ("ok", _DP, "C2b FIX4 认可 .pth 的权限与链接真实去处仍是输入")),
+        ("fix4-template-with-central-pycache", "pos", ("ok", _DP, "C2b FIX4 禁用模板与中央 pycache 共存")),
+        ("fix4-nonstandard-environ-fails-closed", "neg", ("ok", _DP, "C2b FIX4 无法确认标准 os.environ")),
+    ],
+}
+
+
+# ---- 第二组：5-window-inputs、6a-live-timing（只追加，不改第一组） ----
+_C2C, _READER, _INTEG = "_t_c2c_collection", "_t_c5_reader", "_t_c5_integration"
+_HISTORY, _TIMING = "_t_install_history_suite", "_t_c1_live_timing_suite"
+
+
+def _integ_case(test):
+    return ("ok=", _INTEG, "C5 actual history: " + test)
+
+
+def _history_case(test):
+    return ("ok=", _HISTORY, "C5 install history: HistoryTests." + test)
+
+
+def _timing_case(test):
+    return ("ok=", _TIMING, "C1 live timing: LiveTimingTests." + test)
+
+
+# Every C2c collection assertion, polarity by its claim: positives and stable
+# restorations are pos; drift, spoofing, corruption and strict-read refusals neg.
+_C2C_ASSERTIONS = [
+    ('pos', 'C2c P01 真实 UUID tasks API、严格冻结采集与同字节重复评价正例'),
+    ('pos', 'C2c P02 同对象过时 state 缓存不影响 fresh 磁盘任务采集'),
+    ('neg', 'C2c 冻结后磁盘变化不能混入原评价，重验独立拒绝'),
+    ('neg', 'C2c A1 旧代次关闭不能关闭新代次，保守 unknown'),
+    ('pos', 'C2c C01 单批多 live 目标全部事件先于共同采集，立即/fresh progress 稳定'),
+    ('pos', 'C2c-2 完整内容正例包含 ignored/MANIFEST/local/pycache、state/log/未跟踪文件及旧证据'),
+    ('neg', 'C2c-2 输入漂移 PROJECT 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 PROJECT 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 ignored-tool 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 ignored-tool 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 MANIFEST 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 MANIFEST 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 tool-local 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 tool-local 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 tool-pycache 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 tool-pycache 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 untracked-project 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 untracked-project 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 transcript 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 transcript 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 historical-evidence 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 historical-evidence 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 project-Git-config-same-HEAD 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 project-Git-config-same-HEAD 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 tool-Git-config-same-HEAD 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 tool-Git-config-same-HEAD 重新重验稳定'),
+    ('neg', 'C2c-2 项目新成员重新枚举拒绝'),
+    ('pos', 'C2c-2 删除本次新增成员后稳定恢复'),
+    ('neg', 'C2c-2 输入漂移 untouched-result-slot 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 untouched-result-slot 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 live-evidence 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 live-evidence 重新重验稳定'),
+    ('neg', 'C2c-2 输入漂移 mechanical-evidence 正常 progress 拒绝'),
+    ('pos', 'C2c-2 输入恢复 mechanical-evidence 重新重验稳定'),
+    ('neg', 'C2c-2 输出欺骗 granted-self-report 拒绝'),
+    ('pos', 'C2c-2 输出恢复 granted-self-report 稳定正例'),
+    ('neg', 'C2c-2 输出欺骗 null-hash 拒绝'),
+    ('pos', 'C2c-2 输出恢复 null-hash 稳定正例'),
+    ('neg', 'C2c-2 输出欺骗 missing-closure 拒绝'),
+    ('pos', 'C2c-2 输出恢复 missing-closure 稳定正例'),
+    ('neg', 'C2c-2 输出欺骗 arbitrary-output-payload 拒绝'),
+    ('pos', 'C2c-2 输出恢复 arbitrary-output-payload 稳定正例'),
+    ('neg', 'C2c-2 输出欺骗 peer-slot 拒绝'),
+    ('pos', 'C2c-2 输出恢复 peer-slot 稳定正例'),
+    ('neg', 'C2c-2 输出欺骗 output-path-injection 拒绝'),
+    ('pos', 'C2c-2 输出恢复 output-path-injection 稳定正例'),
+    ('neg', 'C2c-2 输出欺骗 legacy-complete-looking-self-report 拒绝'),
+    ('pos', 'C2c-2 输出恢复 legacy-complete-looking-self-report 稳定正例'),
+    ('neg', 'C2c-2 自报 summary 与证据同时重hash仍被真实输入重新评价拒绝'),
+    ('pos', 'C2c-2 自报欺骗恢复后稳定正例'),
+    ('neg', 'C2c-2 项目符号链接具名 unsupported'),
+    ('pos', 'C2c-2 unsupported 来源移除后稳定恢复'),
+    ('neg', 'C2c-2 精确输出元数据 goals-state-mode 由协议单独校验'),
+    ('pos', 'C2c-2 精确输出元数据 goals-state-mode 恢复稳定'),
+    ('neg', 'C2c-2 精确输出元数据 live-proof-mode 由协议单独校验'),
+    ('pos', 'C2c-2 精确输出元数据 live-proof-mode 恢复稳定'),
+    ('neg', 'C2c-2 C02 子进程 barrier 完整项目扫描漂移由正常progress拒绝'),
+    ('pos', 'C2c-2 C02 并发写入恢复后的正常progress稳定'),
+    ('neg', 'C2c-2 损坏结果存储 b\'{"LC1":\' 无traceback且拒绝覆盖历史'),
+    ('neg', 'C2c-2 损坏结果存储 b\'{"LC1":{},"LC1":{}}\' 无traceback且拒绝覆盖历史'),
+    ('neg', 'C2c-2 损坏结果存储 b\'{"LC1":[]}\' 无traceback且拒绝覆盖历史'),
+    ('neg', "C2c-2 损坏结果存储 b'\\xff' 无traceback且拒绝覆盖历史"),
+    ('pos', 'C2c-2 损坏结果存储恢复后的正常progress稳定'),
+    ('neg', 'C2c Mac 根路径规范化仍拒绝真正 transport 文件 symlink'),
+    ('pos', 'C2c transport 恢复原普通文件后严格消费稳定'),
+    ('neg', 'C2c 后续 goal_check 使旧采集闭包失效'),
+    ('neg', 'C2c C02 子进程 barrier 冻结中日志漂移拒绝，不混配旧报告与新 hash'),
+    ('neg', 'C2c 严读负例 events 坏 JSONL 定位 corrupt/来源'),
+    ('neg', 'C2c 严读负例 turns 坏 JSONL 定位 corrupt/来源'),
+    ('neg', 'C2c 严读负例 adapter 坏 JSONL 定位 corrupt/来源'),
+    ('neg', 'C2c 严读负例 sync 坏 JSONL 定位 corrupt/来源'),
+    ('neg', 'C2c 严读负例 notes 坏 JSONL 定位 corrupt/来源'),
+    ('neg', "C2c JSONL strict shape/encoding b'[]\\n'"),
+    ('neg', 'C2c JSONL strict shape/encoding b\'{"x":1,"x":2}\\n\''),
+    ('neg', 'C2c JSONL strict shape/encoding b\'{"x":NaN}\\n\''),
+    ('neg', 'C2c JSONL strict shape/encoding b\'{"x":1e999}\\n\''),
+    ('neg', "C2c JSONL strict shape/encoding b'\\xff\\n'"),
+    ('neg', "C2c JSONL strict shape/encoding b'\\n'"),
+    ('pos', 'C2c 合法无尾 LF JSONL 正例'),
+    ('neg', 'C2c 读取失败保守 unreadable'),
+    ('neg', 'C2c Git 读取失败 rc 非零保守 unknown'),
+]
+
+_READER_CASES = [
+    ("pos", "C5 reader: explicit missing file and selector are frozen"),
+    ("pos", "C5 reader: binary historical blob is preserved byte for byte"),
+    ("pos", "C5 reader: full historical commit and NUL tree replies are captured"),
+    ("pos", "C5 reader: replay uses captured object replies after current HEAD changes"),
+    ("neg", "C5 reader: uncollected bytes, selectors and Git replies fail closed"),
+    ("neg", "C5 reader: HEAD, abbreviated IDs, config and write queries are forbidden"),
+    ("pos", "C5 reader: repeated query retains a single deterministic envelope"),
+    ("pos", "C5 reader: changing current HEAD alone leaves historical envelope stable"),
+    ("pos", "C5 reader: missing historical object keeps the original failure reply"),
+    ("neg", "C5 reader: changed repository configuration rejects capture"),
+    ("neg", "C5 reader: newly installed replacement refs reject revalidation"),
+    ("neg", "C5 reader: a real symlink root remains unsupported"),
+    ("neg", "C5 reader: status binds index and ignore/attribute bytes even when clean output is unchanged"),
+    ("neg", "C5 reader: controlled status disables repository fsmonitor execution"),
+    ("neg", "C5 reader: status rejects external filter configuration before execution"),
+    ("neg", "C5 reader: config includes are rejected before provider object reads"),
+    ("pos", "C5 reader: frozen construction, queries and historical HEAD use no filesystem resolution"),
+    ("neg", "C5 reader: frozen reply survives current root becoming a symlink while fresh capture rejects it"),
+]
+
+C1_MAP.update({
+    "5-window-inputs":
+        [(f"c2c-{i:02d}", polarity, ("ok=", _C2C, name)) for i, (polarity, name) in enumerate(_C2C_ASSERTIONS)]
+        + [(f"reader-{i:02d}", polarity, ("ok=", _READER, name)) for i, (polarity, name) in enumerate(_READER_CASES)]
+        + [("synthetic-history-replays-and-is-not-granted", "neg",
+            _integ_case("test_goal_progress_replays_and_cannot_grant_synthetic")),
+           ("post-read-barrier-rejects-mixed-snapshot", "neg",
+            _integ_case("test_post_read_mutation_barrier_rejects_mixed_snapshot")),
+           ("precommit-closure-drift-persisted-denied", "neg",
+            _integ_case("test_precommit_closure_drift_is_persisted_as_denied")),
+           ("pure-legacy-window-collected-unauthorized", "neg",
+            _trust_case("LegacyEntryTests.test_pure_legacy_window_goes_through_history_capture")),
+           ("ordinary-window-lists-execless-failed-tx", "neg",
+            _trust_case("ExeclessWindowTests.test_ordinary_window_lists_execless_failed_transaction")),
+           ("direct-check-zero-exec-equals-snapshot", "neg",
+            _trust_case("ExeclessWindowTests.test_direct_check_zero_exec_window_lists_execless_transaction")),
+           ("direct-check-true-only-equals-snapshot", "neg",
+            _trust_case("ExeclessWindowTests.test_direct_check_true_only_window_lists_execless_transaction")),
+           ("direct-check-pure-legacy-window", "neg",
+            _trust_case("ExeclessWindowTests.test_direct_check_pure_legacy_window")),
+           ("route-recheck-tx-before-capture", "neg",
+            _trust_case("ExeclessWindowTests.test_capture_failure_rechecks_route_when_tx_appears_before_capture")),
+           ("route-recheck-tx-during-fallback", "neg",
+            _trust_case("ExeclessWindowTests.test_capture_failure_rechecks_route_when_tx_appears_during_fallback")),
+           ("store-and-record-faults-explicit", "neg",
+            _trust_case("ExeclessWindowTests.test_store_and_record_faults_are_explicit"))],
+    "6a-live-timing": [
+        ("actual-chain-frozen-timing-synthetic-flagged", "pos", _integ_case("test_actual_chain_frozen_timing_and_synthetic")),
+        ("previous-day-review-valid-at-install-start", "pos", _history_case("test_real_exec_previous_day_review")),
+        ("expiry-evaluated-at-install-start", "pos", _history_case("test_expiry_is_evaluated_at_install_start")),
+        ("review-six-days-before-install-valid", "pos", _timing_case("test_review_valid_at_install_start_after_six_days")),
+        ("tool-install-same-history-protocol", "pos", _history_case("test_tool_install_uses_same_history_protocol")),
+        ("same-package-two-invocations-distinct", "pos", _history_case("test_same_package_same_target_two_invocations")),
+        ("uncalled-function-not-an-install", "pos", _trust_case("LegacyEntryTests.test_uncalled_function_definition_is_not_an_install")),
+        ("classifier-agrees-with-real-bash", "pos", _trust_case("LegacyEntryTests.test_classifier_agrees_with_real_bash_argv_trace")),
+        ("scope-table-agrees-with-real-bash", "pos", _trust_case("LegacyEntryTests.test_scope_table_agrees_with_real_bash_argv_trace")),
+        ("review-expired-at-install-start-refused", "neg",
+         _timing_case("test_review_expired_at_install_start_is_refused_and_stays_unknown")),
+        ("late-registration-cannot-authorize", "neg", _history_case("test_late_registration_cannot_authorize_history")),
+        ("late-block-after-install-invalidates", "neg", _history_case("test_current_block_registered_after_install_invalidates")),
+        ("late-real-block-invalidates-frozen-progress", "neg", _integ_case("test_later_real_block_invalidates_frozen_progress")),
+        ("failed-install-cannot-be-hidden", "neg", _history_case("test_failed_install_cannot_be_hidden")),
+        ("failed-project-not-hidden-by-tool", "neg", _integ_case("test_failed_project_install_is_not_hidden_by_successful_tool")),
+        ("missing-corrupt-symlink-history", "neg", _integ_case("test_missing_corrupt_and_symlink_history")),
+        ("started-only-corrupt-blob-index", "neg", _history_case("test_started_only_corrupt_blob_and_index")),
+        ("unsuccessful-unreferenced-exec-unknown", "neg", _integ_case("test_unsuccessful_unreferenced_exec_stays_unknown")),
+        ("wrong-reference-and-nonce", "neg", _history_case("test_exact_reference_and_nonce")),
+        ("event-reference-cannot-replace-receipt", "neg", _integ_case("test_event_reference_cannot_replace_actual_receipt")),
+        ("receipt-metadata-and-raw-drift", "neg", _integ_case("test_receipt_metadata_and_raw_drift")),
+        ("changed-raw-review-material", "neg", _integ_case("test_changed_raw_material")),
+        ("raw-and-current-trust-drift", "neg", _history_case("test_raw_and_current_trust_invalidate")),
+        ("rules-and-lanes-drift", "neg", _history_case("test_current_lanes_and_rules_are_rechecked")),
+        ("frozen-package-drift", "neg", _timing_case("test_frozen_package_drift_invalidates_history")),
+        ("baseline-base-drift", "neg", _timing_case("test_baseline_drift_invalidates_history")),
+        ("request-base-config-drift", "neg", _timing_case("test_request_base_config_drift_invalidates_history")),
+        ("installed-config-drift", "neg", _timing_case("test_installed_config_drift_invalidates_history")),
+        ("execless-failed-tx-blocks", "neg", _trust_case("TransactionInventoryTests.test_execless_failed_transaction_blocks_and_counts")),
+        ("store-record-attribution-restore-corrupt", "neg",
+         _trust_case("TransactionInventoryTests.test_store_records_attribution_restore_and_corrupt")),
+        ("tx-record-shapes-validated", "neg", _trust_case("TransactionProtocolTests.test_record_shapes_are_validated_not_crashing")),
+        ("legacy-execs-without-receipt-unknown", "neg", _trust_case("LegacyEntryTests.test_real_legacy_execs_without_receipt_are_unknown")),
+        ("drill-parent-exec-unknown", "neg", _trust_case("LegacyEntryTests.test_real_drill_review_parent_exec_is_unknown")),
+        ("pre-receipt-events-unknown", "neg", _trust_case("LegacyEntryTests.test_pre_receipt_events_and_classifier")),
+    ],
+})
+
+
+def _t_install_history_suite(_ok):
+    """Real exec + protected install + review chains through B's history provider (synthetic verifier)."""
+    from .selftest_install_history import HistoryTests
+    _delegate(_ok, "C5 install history", [HistoryTests])
+
+
+def _t_c1_live_timing_suite(_ok):
+    """C1 6a focused real chains: expiry at install start, package/base/config drift."""
+    from .selftest_c1_live_timing import LiveTimingTests
+    _delegate(_ok, "C1 live timing", [LiveTimingTests])
+
+
+def _c1_guard():
+    """Run only in an isolated local/ (same rule as lane A): never on the tool's real local/."""
+    from .core import LOCAL, WF_HOME
+    if not os.environ.get("WF_LOCAL_DIR"):
+        return "WF_LOCAL_DIR is not set: refusing to run C1 providers against the real local/"
+    if Path(LOCAL).resolve() == (WF_HOME / "local").resolve():
+        return "WF_LOCAL_DIR points at the tool's own local/: refusing to run"
+    return ""
+
+
+def _c1_case(source):
+    """(ran, ok, detail) of one recorded assertion or sub-assertion; any doubt fails closed.
+
+    A group that did not complete cleanly (any error, a timeout, a refusal, or
+    no enforced deadline) yields no evidence: every case it backs is
+    ran=False/ok=False, including assertions recorded as ok before the failure.
+    """
+    kind, fn_name, key = source
+    entry = next(((name, fn) for name, fn in TESTS if fn.__name__ == fn_name), None)
+    if entry is None:
+        return False, False, f"{fn_name}: not a lane C group"
+    record = _run_group(*entry)
+    if record["timed_out"]:
+        return False, False, f"{fn_name}: group timed out ({record['error']})"
+    if record["error"] is not None:
+        return False, False, f"{fn_name}: group error, recorded assertions are not evidence ({record['error']})"
+    if record["deadline_enforced"] is not True or record["executed"] is not True:
+        return False, False, f"{fn_name}: group not executed under an enforced deadline"
+    if kind == "sub":
+        sub = record["subs"].get(key)
+        if sub is None:
+            return False, False, f"{fn_name}/{key}: sub-assertion not recorded"
+        return sub["ran"], sub["ok"], f"{fn_name}/{key}" + (f" :: {sub['detail']}" if sub["detail"] else "")
+    hits = [a for a in record["asserts"] if (a["name"] == key if kind == "ok=" else a["name"].startswith(key))]
+    if len(hits) != 1:
+        return False, False, f"{fn_name}: {len(hits)} assertions match {key!r}"
+    hit = hits[0]
+    detail = f"{hit['id']}: {hit['name'][:200]}"
+    return True, hit["ok"], detail if hit["ok"] is True else f"{detail} :: {str(hit['detail'])[:600]}"
+
+
+def _c1_provider(category):
+    def provider():
+        out = {"category": category, "provider": "C", "schema": "c1-provider/1", "cases": [], "error": None,
+               "card": "C-C1-SIX-PROVIDERS"}
+        guard = _c1_guard()
+        for case, polarity, source in C1_MAP[category]:
+            if guard:
+                ran, ok, detail = False, False, guard
+            else:
+                try:
+                    ran, ok, detail = _c1_case(source)
+                except Exception as exc:   # noqa: BLE001 - fail closed
+                    ran, ok, detail = False, False, f"{type(exc).__name__}: {exc}"
+            if type(ran) is not bool or type(ok) is not bool:
+                ran, ok, detail = False, False, f"non-bool ran/ok from {source!r}"
+            out["cases"].append({"name": f"{category}/{case}", "polarity": polarity, "ran": ran, "ok": ok,
+                                 "detail": str(detail)})
+        problems = [guard] if guard else []
+        for fn_name in dict.fromkeys(source[1] for _, _, source in C1_MAP[category]):
+            record = _GROUP_RECORDS.get(fn_name)
+            if record is not None and (record["error"] is not None or record["timed_out"]
+                                       or record["deadline_enforced"] is not True):
+                problems.append(f"group {fn_name} did not complete cleanly: {record['error']}")
+        bad = [c["name"] for c in out["cases"] if not (c["ran"] is True and c["ok"] is True)]
+        if bad:
+            problems.append(f"{len(bad)} case(s) not ran+ok: " + ", ".join(bad[:8]))
+        for polarity in ("pos", "neg"):
+            if not any(c["polarity"] == polarity for c in out["cases"]):
+                problems.append(f"no {polarity} case")
+        out["error"] = "; ".join(problems) or None
+        return out
+    provider.__name__ = "provider_" + category.replace("-", "_")
+    return provider
+
+
+C1_PROVIDERS = {category: _c1_provider(category) for category in C1_MAP}
+
+
+def _t_c1_providers(_ok):
+    """Each C provider: c1-provider/1 shape, pos+neg from this process's recorded real assertions, all ran and ok."""
+    for category, provider in C1_PROVIDERS.items():
+        r = provider()
+        cases = r.get("cases") or []
+        bad = [(c["name"], c["detail"][:300]) for c in cases if not (c["ran"] is True and c["ok"] is True)]
+        good = (r.get("schema") == "c1-provider/1" and r.get("provider") == "C" and r.get("category") == category
+                and r.get("error") is None and not bad
+                and any(c["polarity"] == "pos" for c in cases) and any(c["polarity"] == "neg" for c in cases))
+        _ok(f"C1 提供方 {category}：c1-provider/1，正反例都来自本进程已记录的真实断言，全部 ran 且 ok"
+            f"（pos {sum(c['polarity'] == 'pos' for c in cases)} / neg {sum(c['polarity'] == 'neg' for c in cases)}）",
+            good, json.dumps({"error": r.get("error"), "bad": bad[:6]}, ensure_ascii=False))
+
+
 TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景测量结构", _t_live_struct), ("verified 绑定", _t_verified),
          ("工具摘要规则", _t_manifest_rule), ("目标骨架 C1", _t_default_goals), ("指标 C3", _t_metrics),
          ("指标真实 API C3", _t_metrics_real_api),
@@ -2486,16 +3121,23 @@ TESTS = [("证据分层兼容", _t_compat), ("不适用四项", _t_na), ("实景
          ("禁用 distutils 模板 C2b FIX4", _t_mech_disabled_pth),
          ("严格冻结采集与共同周期 C2c-1", _t_c2c_collection),
          ("只读安装历史材料 C5", _t_c5_materials), ("冻结历史 reader C5", _t_c5_reader),
-         ("真实执行与安装历史 C5", _t_c5_integration)]
+         ("真实执行与安装历史 C5", _t_c5_integration),
+         ("C5 生产信任与事务 unittest", _t_c5_trust_suite),
+         ("C5 安装历史 unittest", _t_install_history_suite),
+         ("C1 实景时序 unittest", _t_c1_live_timing_suite),
+         ("C1 提供方", _t_c1_providers)]
 
 
 def run_lane_c(_ok) -> None:
-    """聚合器入口：调用方负责隔离（它自己的子进程、临时 local/、WF_NOTIFY=0）。一组出错只记这一组失败。"""
+    """聚合器入口：调用方负责隔离（它自己的子进程、临时 local/、WF_NOTIFY=0）。一组出错只记这一组失败。
+    每组在本进程里只运行一次（_run_group），这里按原顺序重放其 _ok 调用；C1_PROVIDERS 消费同一份记录。
+    条件不是真 bool 的断言记为不通过；无法强制截止（非主线程、嵌套截止、无 setitimer）时该组不运行、记为出错。"""
     for name, fn in TESTS:
-        try:
-            fn(_ok)
-        except Exception as e:   # noqa: BLE001
-            _ok(f"B1-C 检查组「{name}」运行出错", False, f"{type(e).__name__}: {e}")
+        record = _run_group(name, fn)
+        for item in record["asserts"]:
+            _ok(item["name"], item["ok"], item["detail"])
+        if record["error"] is not None:
+            _ok(f"B1-C 检查组「{name}」运行出错", False, record["error"])
 
 
 def _child_main() -> int:
