@@ -1487,11 +1487,12 @@ TESTS = [("阶段目标", _t_phase_goals), ("待办取消", _t_tasks_close), ("N
 
 PROBE_DEPTH_ENV = "WF_PROBE_DEPTH"
 GATE_GROUP = "真实默认门禁"
-BASELINE_GROUP = "门禁基线"          # reserved for the future strict 21-category aggregate; not registered here
+BASELINE_GROUP = "门禁基线"          # strict 21-category C1 aggregate (selftest_c1_aggregate), depth 0 only
 NESTED_EXCLUDED = frozenset({GATE_GROUP, BASELINE_GROUP})
 GATE_CATEGORY = "1-init-gates-real"
 GATE_CASES = (("G0-default-gates", "pos"), ("G1-manifest-drift", "neg"), ("G2-NO_REF-consumer", "neg"))
-PROVIDER_BUDGET_S = 420              # whole provider; it runs inside the 600 s probe child
+PROVIDER_BUDGET_S = 420              # whole provider; at depth 0 it runs inside the strict aggregate job child
+PROBES_CHILD_BUDGET_S = {0: 600 + 1500, 1: 600}   # 43 legacy groups (600 s, unchanged) + the aggregate job cap
 STEP_TIMEOUT_S = 180                 # one setup command, one gate, one driver call
 _DRIVER_SRC = r'''import json, sys, time
 from pathlib import Path
@@ -1531,8 +1532,9 @@ def probe_depth(env=None) -> int:
 
 
 def active_groups(depth: int) -> list:
-    """One selector for probes_main and run_v18: depth 1 excludes the gate groups by explicit identity."""
-    groups = list(TESTS) + [(GATE_GROUP, _t_real_default_gates)]
+    """One selector for probes_main, run_v18 and the nested-count check in _gate_case: depth 1 excludes the
+    gate group and the strict 21-category baseline by explicit identity (neither runs nor counts there)."""
+    groups = list(TESTS) + [(GATE_GROUP, _t_real_default_gates), (BASELINE_GROUP, _t_strict21_baseline)]
     return [g for g in groups if depth == 0 or g[0] not in NESTED_EXCLUDED]
 
 
@@ -1641,6 +1643,7 @@ def _probe_lines(text: str) -> dict:
     lines = [ln for ln in text.splitlines() if ln.startswith("探针 ")]
     return {"groups": len(lines), "failed": [ln for ln in lines if "：未通过" in ln],
             "gate_group_present": any(ln.startswith(f"探针 {GATE_GROUP}：") for ln in lines),
+            "baseline_group_present": any(ln.startswith(f"探针 {BASELINE_GROUP}：") for ln in lines),
             "total": next((ln for ln in text.splitlines() if ln.startswith("探针结果：")), None)}
 
 
@@ -1733,11 +1736,13 @@ def _gate_case(case_id: str, work: Path, deadline: float) -> tuple:
     sec = _self_check_sections(gates[0]["stdout"])
     probe = _probe_lines(gates[1]["stdout"])
     detail["gate1_manifest_sections"], detail["gate2_probe"] = sec, probe
-    nested_ok = probe["total"] is not None and not probe["gate_group_present"] and probe["groups"] == len(TESTS)
+    nested_n = len(active_groups(1))   # the copy's depth-1 probes use this same selector
+    nested_ok = probe["total"] is not None and not probe["gate_group_present"] and not probe["baseline_group_present"] \
+        and probe["groups"] == nested_n
     if case_id.startswith("G0"):
         checks["gate1_manifest_clean"] = sec == {}
         checks["gate2_nested_all_pass"] = nested_ok and not probe["failed"] and \
-            probe["total"] == f"探针结果：{len(TESTS)} / {len(TESTS)} 通过"
+            probe["total"] == f"探针结果：{nested_n} / {nested_n} 通过"
         checks["no_ref_consumer_awaits_user"] = consumer == {"returned": "user", "state": "AWAITING_USER",
                                                              "await_rule": "NO_REF", "rule_action": "await_user"}
     elif case_id.startswith("G1"):
@@ -1748,7 +1753,7 @@ def _gate_case(case_id: str, work: Path, deadline: float) -> tuple:
         line = probe["failed"][0] if len(probe["failed"]) == 1 else ""
         checks["gate2_fails_only_in_NO_REF_group"] = nested_ok and line.startswith("探针 NO_REF：未通过") \
             and not any(x in line for x in ("ImportError", "ModuleNotFoundError", "Timeout", "超时")) \
-            and probe["total"] == f"探针结果：{len(TESTS) - 1} / {len(TESTS)} 通过"
+            and probe["total"] == f"探针结果：{nested_n - 1} / {nested_n} 通过"
         # Causation through the real consumer in this copy: the mutated rule now blocks instead of awaiting.
         checks["no_ref_consumer_now_blocks"] = isinstance(consumer, dict) and consumer.get("state") == "BLOCKED" \
             and consumer.get("rule_action") == "block"
@@ -1832,12 +1837,39 @@ def provider_problems(res, category=GATE_CATEGORY) -> list:
 
 
 def _t_real_default_gates(_ok):
-    res = C1_PROVIDERS[GATE_CATEGORY]()
+    """Inside a run (selftest / probes child) the gate result is the one the strict aggregate's single
+    provider call produced, so the Gate group and the 门禁基线 group read one execution. Outside a run (a
+    direct call) the provider runs here once, as before."""
+    from . import selftest_c1_aggregate as agg
+    run = agg.current_run()
+    state = None
+    if run is None:
+        res = C1_PROVIDERS[GATE_CATEGORY]()
+    else:
+        rec = run.ensure()
+        cat = rec["categories"].get(GATE_CATEGORY) or {}
+        res, state = cat.get("raw"), {k: cat.get(k) for k in ("state", "calls", "seconds", "problems")} or None
+        if not cat:
+            state = {"state": "not-recorded", "problems": rec["problems"][:5]}
     problems = provider_problems(res)
+    if state is not None and state.get("state") != "passed":
+        problems.append(f"strict aggregate state {state.get('state')}: {str(state.get('problems'))[:400]}")
     summary = "；".join(f"{c.get('name')} {c.get('polarity')} ran={c.get('ran')} ok={c.get('ok')}"
                        for c in (res.get("cases") or []) if isinstance(c, dict)) or "no cases"
     _ok(f"{GATE_GROUP}：{summary}", not problems,
-        json.dumps({"problems": problems, "error": res.get("error") if isinstance(res, dict) else None}, ensure_ascii=False))
+        json.dumps({"problems": problems, "error": res.get("error") if isinstance(res, dict) else None,
+                    "aggregate": state}, ensure_ascii=False))
+
+
+def _t_strict21_baseline(_ok):
+    """门禁基线: one assertion for the strict 21-category aggregate of this run (depth 0 only)."""
+    from . import selftest_c1_aggregate as agg
+    with agg.ensure_scope(lane_c=False) as run:
+        rec = run.ensure()
+    _ok(f"{BASELINE_GROUP}：C1 严格 21 类聚合（合同 21 类、每类恰调用一次、正反例全部 ran 且 ok、无结构问题）",
+        rec["all_pass"] is True,
+        json.dumps({"passed": rec["passed"], "required": rec["required"], "lines": agg.summary_lines(rec)},
+                   ensure_ascii=False))
 
 
 def run_v18(_ok) -> None:
@@ -1847,11 +1879,13 @@ def run_v18(_ok) -> None:
     except ProbeDepthError as e:
         _ok(f"1.8.2 检查未运行：{e}", False, str(e))
         return
-    for name, fn in active_groups(depth):
-        try:
-            fn(_ok)
-        except Exception as e:   # 一组检查出错只记这一组失败，不中断整个自检
-            _ok(f"1.8.2 检查组「{name}」运行出错", False, f"{type(e).__name__}: {e}")
+    from . import selftest_c1_aggregate as agg
+    with agg.ensure_scope(lane_c=False):   # reuses the selftest run when there is one
+        for name, fn in active_groups(depth):
+            try:
+                fn(_ok)
+            except Exception as e:   # 一组检查出错只记这一组失败，不中断整个自检
+                _ok(f"1.8.2 检查组「{name}」运行出错", False, f"{type(e).__name__}: {e}")
 
 
 def probes_main() -> int:
@@ -1867,16 +1901,24 @@ def probes_main() -> int:
         with tempfile.TemporaryDirectory(prefix="wf-probes-") as td:
             env = {**os.environ, "WF_LOCAL_DIR": str(Path(td) / "local"), "WF_PROBE_CHILD": "1", "WF_NOTIFY": "0"}
             env.pop("VIRTUAL_ENV", None)
-            r = subprocess.run([sys.executable, str(WF_HOME / "wf.py"), "self-check", "--probes"], env=env, cwd=td,
-                               capture_output=True, text=True, timeout=600)
-            sys.stdout.write(r.stdout)
-            if r.returncode != 0 and r.stderr:
-                sys.stdout.write(r.stderr[-1500:])
-            return r.returncode
+            from .selftest_c1_aggregate import run_bounded
+            budget = PROBES_CHILD_BUDGET_S[depth]
+            r = run_bounded([sys.executable, str(WF_HOME / "wf.py"), "self-check", "--probes"], env=env, cwd=td,
+                            timeout=budget, capture=True)
+            sys.stdout.write(r["stdout"])
+            if r["timed_out"]:   # the whole process tree was stopped and killed; nothing keeps writing
+                print(f"探针子进程超过 {budget} 秒没有结束，已结束整个进程树，按未通过处理", flush=True)
+                return 1
+            if r["rc"] != 0 and r["stderr"]:
+                sys.stdout.write(r["stderr"][-1500:])
+            return r["rc"]
     groups = active_groups(depth)
     print(f"collab-wf {(WF_HOME / 'VERSION').read_text().strip()} 行为探针（临时 local/，不碰本机状态）")
     print(f"探针深度：{depth}；本次组数：{len(groups)}")
     passed = 0
+    from . import selftest_c1_aggregate as agg
+    scope = agg.run_scope(lane_c=False)
+    run = scope.__enter__()   # one run for this probes child: Gate and 门禁基线 read one aggregation
     for name, fn in groups:
         res = []
 
@@ -1894,5 +1936,9 @@ def probes_main() -> int:
         print(f"探针 {name}：{'通过' if good else '未通过'}" + ("" if good else f"（{why[:400]}）"), flush=True)
         if name == GATE_GROUP and res:
             print(f"  {GATE_GROUP} 实际结果：{res[0][1].split('：', 1)[-1]}", flush=True)
+        if name == BASELINE_GROUP and run.record is not None:
+            for line in agg.summary_lines(run.record):
+                print(f"  {BASELINE_GROUP} {line}", flush=True)
+    scope.__exit__(None, None, None)
     print(f"探针结果：{passed} / {len(groups)} 通过")
     return 0 if passed == len(groups) else 1
